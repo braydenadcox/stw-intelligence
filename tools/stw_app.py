@@ -155,16 +155,32 @@ class ApiApplication:
                     HTTPStatus.OK, activity_overview(connection, mission_node_id)
                 )
             if parsed.path == "/api/recommendation/current":
-                raw_node = parse_qs(parsed.query).get("mission_node", [None])[0]
+                query = parse_qs(parsed.query)
+                raw_node = query.get("mission_node", [None])[0]
                 try:
                     mission_node_id = int(raw_node) if raw_node is not None else None
                 except ValueError:
                     return self._json(
                         HTTPStatus.BAD_REQUEST, {"error": "invalid mission node"}
                     )
-                return self._json(
-                    HTTPStatus.OK, recommendation_overview(connection, mission_node_id)
-                )
+                raw_at = query.get("at", [None])[0]
+                try:
+                    at = (
+                        datetime.fromisoformat(raw_at.replace("Z", "+00:00"))
+                        if raw_at
+                        else None
+                    )
+                except ValueError:
+                    return self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid at"})
+                settings = get_settings(connection)
+                timezone_name = query.get("timezone", [settings["timezone"]])[0]
+                try:
+                    result = recommendation_overview(
+                        connection, mission_node_id, at, timezone_name
+                    )
+                except ValueError as error:
+                    return self._json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
+                return self._json(HTTPStatus.OK, result)
             if parsed.path == "/api/settings":
                 return self._json(
                     HTTPStatus.OK,

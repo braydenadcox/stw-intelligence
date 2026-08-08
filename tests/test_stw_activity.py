@@ -11,7 +11,12 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
-from stw_activity import activity_overview, recommend_region, refresh_activity  # noqa: E402
+from stw_activity import (  # noqa: E402
+    activity_overview,
+    recommend_region,
+    recommendation_overview,
+    refresh_activity,
+)
 from stw_app import ApiApplication  # noqa: E402
 from stw_pipeline import connect  # noqa: E402
 
@@ -168,6 +173,86 @@ class ActivityScoreTests(unittest.TestCase):
         self.assertEqual(1.0, oce["coverage_60"])
         self.assertIn("not regional population", overview["definition"])
 
+    def test_refresh_deduplicates_attempts_reimported_from_a_growing_log(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "activity.sqlite3"
+            connection = connect(database)
+            try:
+                self._seed(connection)
+                connection.execute(
+                    """
+                    INSERT INTO capture_files(
+                        content_sha256, source_path, size_bytes, modified_ns, attempt_count
+                    ) VALUES ('later-capture', 'controlled-grown.log', 2, 2, 3)
+                    """
+                )
+                capture_id = connection.execute(
+                    "SELECT id FROM capture_files WHERE content_sha256='later-capture'"
+                ).fetchone()[0]
+                connection.execute(
+                    """
+                    INSERT INTO mission_attempts(
+                        capture_id, source_attempt_index, source_line_start,
+                        source_line_end, mission_node_id, requested_region_id,
+                        stw_type, fill_mode, party_size, started_at, ended_at,
+                        outcome, observation_seconds, build_id, link_code, platform,
+                        input_type, objective_hint, objective_evidence,
+                        internal_difficulty, power_level, team_size_at_start,
+                        team_size_15s, team_size_30s, team_size_60s,
+                        first_teammate_seconds, full_team_seconds
+                    )
+                    SELECT ?, source_attempt_index, source_line_start, source_line_end,
+                           mission_node_id, requested_region_id, stw_type, fill_mode,
+                           party_size, started_at, ended_at, outcome, observation_seconds,
+                           build_id, link_code, platform, input_type, objective_hint,
+                           objective_evidence, internal_difficulty, power_level,
+                           team_size_at_start, team_size_15s, team_size_30s,
+                           team_size_60s, first_teammate_seconds, full_team_seconds
+                    FROM mission_attempts
+                    WHERE requested_region_id=(SELECT id FROM regions WHERE code='OCE')
+                      AND build_id='current-build'
+                    """,
+                    (capture_id,),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO assignments(
+                        attempt_id, source_line, assigned_at,
+                        assignment_latency_seconds, datacenter_id,
+                        lobby_session_id, match_identifier
+                    )
+                    SELECT copy.id, original_assignment.source_line,
+                           original_assignment.assigned_at,
+                           original_assignment.assignment_latency_seconds,
+                           original_assignment.datacenter_id,
+                           original_assignment.lobby_session_id,
+                           original_assignment.match_identifier
+                    FROM mission_attempts copy
+                    JOIN mission_attempts original
+                      ON original.started_at=copy.started_at
+                     AND original.capture_id<>copy.capture_id
+                    JOIN assignments original_assignment
+                      ON original_assignment.attempt_id=original.id
+                    WHERE copy.capture_id=?
+                    """,
+                    (capture_id,),
+                )
+                connection.commit()
+                result = refresh_activity(
+                    connection, datetime(2026, 8, 8, 20, tzinfo=timezone.utc)
+                )
+                oce_samples = connection.execute(
+                    """
+                    SELECT sample_count FROM regional_activity ra
+                    JOIN regions r ON r.id=ra.region_id WHERE r.code='OCE'
+                    """
+                ).fetchone()[0]
+            finally:
+                connection.close()
+
+        self.assertEqual(6, result["attempts_scored"])
+        self.assertEqual(3, oce_samples)
+
     def test_activity_api_and_invalid_mission_node(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             database = Path(directory) / "activity.sqlite3"
@@ -183,7 +268,8 @@ class ActivityScoreTests(unittest.TestCase):
             api = ApiApplication(database)
             status, _, body = api.dispatch("GET", "/api/activity/current")
             recommendation_status, _, recommendation_body = api.dispatch(
-                "GET", "/api/recommendation/current"
+                "GET",
+                "/api/recommendation/current?at=2026-08-08T20:00:00Z&timezone=UTC",
             )
             invalid, _, _ = api.dispatch(
                 "GET", "/api/activity/current?mission_node=not-a-number"
@@ -197,7 +283,55 @@ class ActivityScoreTests(unittest.TestCase):
         self.assertEqual(
             "NAE", recommendation["recommendation"]["region"]
         )
+        self.assertEqual("time_specific", recommendation["time_context"]["status"])
+        self.assertEqual(6, recommendation["time_context"]["samples_in_band"])
         self.assertEqual(400, invalid)
+
+    def test_time_aware_recommendation_uses_band_and_falls_back(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "activity.sqlite3"
+            connection = connect(database)
+            try:
+                self._seed(connection)
+                refresh_activity(
+                    connection, datetime(2026, 8, 8, 20, tzinfo=timezone.utc)
+                )
+                matching = recommendation_overview(
+                    connection,
+                    at=datetime(2026, 8, 8, 20, tzinfo=timezone.utc),
+                    timezone_name="UTC",
+                )
+                fallback = recommendation_overview(
+                    connection,
+                    at=datetime(2026, 8, 8, 21, 30, tzinfo=timezone.utc),
+                    timezone_name="UTC",
+                )
+            finally:
+                connection.close()
+
+        self.assertEqual("18:00-20:59", matching["time_context"]["band_label"])
+        self.assertEqual("time_specific", matching["time_context"]["status"])
+        self.assertEqual("NAE", matching["recommendation"]["region"])
+        self.assertEqual("fallback", fallback["time_context"]["status"])
+        self.assertEqual(0, fallback["time_context"]["samples_in_band"])
+        self.assertEqual("NAE", fallback["recommendation"]["region"])
+        self.assertIn("overall recent ranking", fallback["recommendation"]["summary"])
+
+    def test_recommendation_api_rejects_invalid_time_and_timezone(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "activity.sqlite3"
+            connection = connect(database)
+            connection.close()
+            api = ApiApplication(database)
+            bad_time, _, _ = api.dispatch(
+                "GET", "/api/recommendation/current?at=yesterday"
+            )
+            bad_zone, _, _ = api.dispatch(
+                "GET", "/api/recommendation/current?timezone=Not/AZone"
+            )
+
+        self.assertEqual(400, bad_time)
+        self.assertEqual(400, bad_zone)
 
     def test_recommendation_abstains_for_insufficient_evidence_and_ties(self) -> None:
         def region(code: str, score: float, confidence: str, samples: int) -> dict:

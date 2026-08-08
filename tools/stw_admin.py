@@ -10,6 +10,7 @@ import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from sanitize_logs import sanitize_file
 
@@ -20,6 +21,7 @@ DEFAULTS: dict[str, Any] = {
     "history_retention_days": 0,
     "backup_keep": 7,
     "auto_backup_on_start": True,
+    "timezone": "America/Los_Angeles",
 }
 
 
@@ -148,6 +150,15 @@ def update_settings(
         if not isinstance(value, bool):
             raise ValueError("auto_backup_on_start must be true or false")
         normalized["auto_backup_on_start"] = value
+    if "timezone" in changes:
+        value = changes["timezone"]
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("timezone must be an IANA timezone name")
+        try:
+            ZoneInfo(value.strip())
+        except ZoneInfoNotFoundError as error:
+            raise ValueError(f"unknown timezone: {value.strip()}") from error
+        normalized["timezone"] = value.strip()
     with connection:
         connection.executemany(
             """

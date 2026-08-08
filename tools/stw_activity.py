@@ -12,12 +12,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from statistics import median
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
 SCORE_VERSION = "observed-activity-v1"
 WINDOW_SECONDS = 60
 RECENCY_HALF_LIFE_HOURS = 6.0
 RECOMMENDATION_VERSION = "activity-ranking-v1"
+TIME_CONTEXT_VERSION = "local-time-band-v1"
+TIME_BAND_HOURS = 3
 SCORE_TIE_EPSILON = 0.01
 
 
@@ -313,11 +316,37 @@ def refresh_activity(
     latest_build_by_node: dict[int, str | None] = {}
     for attempt in all_attempts:
         latest_build_by_node[attempt["mission_node_id"]] = attempt["build_id"]
-    attempts = [
+    latest_build_attempts = [
         attempt
         for attempt in all_attempts
         if attempt["build_id"] == latest_build_by_node[attempt["mission_node_id"]]
     ]
+    # A growing Fortnite log can be imported as more than one capture. The same
+    # attempt then has a different capture_id but identical observational identity.
+    # Count it once, preferring the most complete copy, so evidence is not inflated.
+    deduplicated: dict[tuple[Any, ...], sqlite3.Row] = {}
+    for attempt in latest_build_attempts:
+        identity = (
+            attempt["mission_node_id"],
+            attempt["requested_region_id"],
+            attempt["started_at"],
+            attempt["build_id"],
+        )
+        current = deduplicated.get(identity)
+        quality = (
+            attempt["observation_seconds"] or -1,
+            attempt["source_line_end"] or -1,
+            attempt["id"],
+        )
+        if current is None or quality > (
+            current["observation_seconds"] or -1,
+            current["source_line_end"] or -1,
+            current["id"],
+        ):
+            deduplicated[identity] = attempt
+    attempts = sorted(
+        deduplicated.values(), key=lambda attempt: (attempt["started_at"], attempt["id"])
+    )
     scored = [
         score
         for attempt in attempts
@@ -579,13 +608,136 @@ def activity_overview(
 
 
 def recommendation_overview(
-    connection: sqlite3.Connection, mission_node_id: int | None = None
+    connection: sqlite3.Connection,
+    mission_node_id: int | None = None,
+    at: datetime | None = None,
+    timezone_name: str = "America/Los_Angeles",
 ) -> dict[str, Any]:
     overview = activity_overview(connection, mission_node_id)
+    instant = _now(at)
+    try:
+        local_zone = ZoneInfo(timezone_name)
+    except ZoneInfoNotFoundError as error:
+        raise ValueError(f"unknown timezone: {timezone_name}") from error
+    local_at = instant.astimezone(local_zone)
+    band_start = local_at.hour // TIME_BAND_HOURS * TIME_BAND_HOURS
+    band_end = band_start + TIME_BAND_HOURS - 1
+    context = {
+        "version": TIME_CONTEXT_VERSION,
+        "timezone": timezone_name,
+        "target_at": _iso(instant),
+        "local_at": local_at.isoformat(),
+        "local_day": local_at.strftime("%A"),
+        "band_start_hour": band_start,
+        "band_end_hour": band_end,
+        "band_label": f"{band_start:02d}:00-{band_end:02d}:59",
+        "minimum_samples_per_region": 3,
+        "samples_in_band": 0,
+        "regions_with_sufficient_data": 0,
+        "status": "fallback",
+        "fallback_reason": None,
+    }
+    node_id = overview["mission"]["mission_node_id"] if overview["mission"] else None
+    time_regions: list[dict[str, Any]] = []
+    if node_id is not None:
+        rows = connection.execute(
+            """
+            SELECT r.code AS region, ma.ended_at, ma.started_at,
+                   aas.score, aas.arrival_score, aas.concurrency_score,
+                   aas.breadth_score, aas.retention_score, aas.assignment_score,
+                   a.assignment_latency_seconds
+            FROM attempt_activity_scores aas
+            JOIN mission_attempts ma ON ma.id=aas.attempt_id
+            JOIN regions r ON r.id=ma.requested_region_id
+            LEFT JOIN assignments a ON a.attempt_id=ma.id
+            WHERE ma.mission_node_id=? AND aas.score_version=?
+              AND aas.window_seconds=?
+            ORDER BY COALESCE(ma.ended_at, ma.started_at), ma.id
+            """,
+            (node_id, SCORE_VERSION, WINDOW_SECONDS),
+        ).fetchall()
+        grouped: dict[str, list[tuple[sqlite3.Row, datetime]]] = defaultdict(list)
+        for row in rows:
+            sample_at = _parse_time(row["ended_at"] or row["started_at"])
+            if sample_at > instant:
+                continue
+            local_sample = sample_at.astimezone(local_zone)
+            if local_sample.hour // TIME_BAND_HOURS * TIME_BAND_HOURS == band_start:
+                grouped[row["region"]].append((row, sample_at))
+        context["samples_in_band"] = sum(len(samples) for samples in grouped.values())
+        for region, samples in grouped.items():
+            weights = [
+                2.0
+                ** (
+                    -max(0.0, (instant - sampled_at).total_seconds() / 3600.0)
+                    / RECENCY_HALF_LIFE_HOURS
+                )
+                for _, sampled_at in samples
+            ]
+            weight_sum = sum(weights)
+            effective_size = weight_sum * weight_sum / sum(w * w for w in weights)
+
+            def weighted(field: str) -> float:
+                return sum(
+                    weight * float(row[field])
+                    for weight, (row, _) in zip(weights, samples)
+                ) / weight_sum
+
+            latencies = [
+                float(row["assignment_latency_seconds"])
+                for row, _ in samples
+                if row["assignment_latency_seconds"] is not None
+            ]
+            time_regions.append(
+                {
+                    "region": region,
+                    "score": round(weighted("score"), 2),
+                    "components": {
+                        name: round(weighted(f"{name}_score"), 2)
+                        for name in (
+                            "arrival",
+                            "concurrency",
+                            "breadth",
+                            "retention",
+                            "assignment",
+                        )
+                    },
+                    "sample_count": len(samples),
+                    "effective_sample_size": round(effective_size, 2),
+                    "confidence": _confidence(len(samples), effective_size),
+                    "median_assignment_latency_seconds": (
+                        median(latencies) if latencies else None
+                    ),
+                }
+            )
+    time_regions.sort(key=lambda row: (-row["score"], row["region"]))
+    sufficient_regions = [
+        row for row in time_regions if row["confidence"] != "insufficient"
+    ]
+    context["regions_with_sufficient_data"] = len(sufficient_regions)
+    base_recommendation = overview["recommendation"]
+    if len(sufficient_regions) >= 2:
+        context["status"] = "time_specific"
+        recommendation = recommend_region(time_regions)
+        recommendation["summary"] += (
+            f" This uses observations from the local {context['band_label']} time band."
+        )
+    else:
+        context["fallback_reason"] = (
+            "Fewer than two regions have three complete samples in this local time band."
+        )
+        recommendation = dict(base_recommendation)
+        recommendation["summary"] = (
+            recommendation["summary"]
+            + " Time-specific evidence is not sufficient, so this is the overall recent ranking."
+        )
     return {
         "definition": overview["definition"],
         "mission": overview["mission"],
-        "recommendation": overview["recommendation"],
+        "recommendation": recommendation,
+        "base_recommendation": base_recommendation,
+        "time_context": context,
+        "time_regions": time_regions,
     }
 
 
@@ -600,6 +752,8 @@ def main() -> int:
         "recommend", help="print the current evidence-based region recommendation"
     )
     recommend.add_argument("--mission-node", type=int)
+    recommend.add_argument("--at", help="recommendation time (ISO-8601, defaults to now)")
+    recommend.add_argument("--timezone", default="America/Los_Angeles")
     args = parser.parse_args()
 
     from stw_pipeline import connect
@@ -613,7 +767,13 @@ def main() -> int:
         else:
             print(
                 json.dumps(
-                    recommendation_overview(connection, args.mission_node), indent=2
+                    recommendation_overview(
+                        connection,
+                        args.mission_node,
+                        _parse_time(args.at) if args.at else None,
+                        args.timezone,
+                    ),
+                    indent=2,
                 )
             )
         return 0

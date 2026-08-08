@@ -88,6 +88,11 @@ score, component evidence, sample count, effective sample size, coverage, and co
 The score is local evidence only: it is not a player population, queue depth, or CCU
 estimate. Recompute or inspect it from the command line with:
 
+Recommendations compare observations in the same three-hour local-time band. The
+default timezone is `America/Los_Angeles` and can be changed in Settings. A
+time-specific result requires three complete samples in each of at least two regions;
+otherwise the app visibly falls back to the overall recent ranking.
+
 ```powershell
 python tools/stw_activity.py refresh
 python tools/stw_activity.py report

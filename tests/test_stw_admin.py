@@ -54,6 +54,7 @@ class AdminTests(unittest.TestCase):
                         "history_retention_days": 90,
                         "backup_keep": 3,
                         "auto_backup_on_start": False,
+                        "timezone": "America/Los_Angeles",
                     },
                     active_log,
                 )
@@ -62,6 +63,8 @@ class AdminTests(unittest.TestCase):
                     update_settings(connection, {"backup_keep": 0})
                 with self.assertRaises(ValueError):
                     update_settings(connection, {"unknown": True})
+                with self.assertRaises(ValueError):
+                    update_settings(connection, {"timezone": "Not/AZone"})
             finally:
                 connection.close()
 
@@ -69,6 +72,7 @@ class AdminTests(unittest.TestCase):
         self.assertEqual(90, settings["history_retention_days"])
         self.assertEqual(3, settings["backup_keep"])
         self.assertFalse(settings["auto_backup_on_start"])
+        self.assertEqual("America/Los_Angeles", settings["timezone"])
         self.assertFalse(settings["privacy"]["raw_participant_identifiers_in_database"])
 
     def test_verified_backup_and_confirmed_restore(self) -> None:

@@ -47,6 +47,9 @@ QOS_RECOMMENDATION_RE = re.compile(
     r"Best region is '([^']+)', recommended subregion is '([^']+)'"
 )
 LEGACY_STATE_RE = re.compile(r"Matchmaking state change (.+?) -> (.+)$")
+SERVICE_STATE_RE = re.compile(
+    r"Matchmaking Service State Changed From ([A-Za-z]+) to ([A-Za-z]+)"
+)
 
 ATTRIBUTES = {
     "region": "/Fortnite.com/Matchmaking:Region",
@@ -112,6 +115,27 @@ def _participant_hash(value: str, privacy_salt: bytes | None) -> str | None:
     return hmac.new(privacy_salt, value.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
+def _append_state_event(
+    events: list[dict[str, object]],
+    line: int,
+    timestamp: str | None,
+    state: str,
+    reason: str,
+    attempt: dict[str, object] | None,
+) -> None:
+    if events and events[-1]["state"] == state:
+        return
+    events.append(
+        {
+            "line": line,
+            "timestamp": timestamp,
+            "state": state,
+            "reason": reason,
+            "attempt_line": attempt.get("line") if attempt else None,
+        }
+    )
+
+
 def analyze(path: Path, privacy_salt: bytes | None = None) -> dict[str, object]:
     registrations: list[dict[str, object]] = []
     difficulties: list[dict[str, object]] = []
@@ -125,6 +149,7 @@ def analyze(path: Path, privacy_salt: bytes | None = None) -> dict[str, object]:
     qos_available_datacenters: dict[str, int] = {}
     qos_recommendations: list[dict[str, object]] = []
     legacy_session_searches: list[dict[str, object]] = []
+    state_events: list[dict[str, object]] = []
     current_legacy_search: dict[str, object] | None = None
     note: str | None = None
     current_attempt: dict[str, object] | None = None
@@ -182,6 +207,35 @@ def analyze(path: Path, privacy_salt: bytes | None = None) -> dict[str, object]:
                 )
                 current_phase = "lobby"
                 membership_slots = {"lobby": {}, "zone": {}}
+                _append_state_event(
+                    state_events,
+                    line_number,
+                    _timestamp(line),
+                    "Registering",
+                    "matchmaking_registration",
+                    current_attempt,
+                )
+
+            service_state_match = SERVICE_STATE_RE.search(line)
+            if service_state_match and _timestamp(line) is not None:
+                service_state = {
+                    "Registering": "Registering",
+                    "Registered": "Searching",
+                    "Assigned": "Assigned",
+                    "Cancelled": "Cancelled",
+                    "Canceled": "Cancelled",
+                    "Failed": "Failed",
+                    "Failure": "Failed",
+                }.get(service_state_match.group(2))
+                if service_state:
+                    _append_state_event(
+                        state_events,
+                        line_number,
+                        _timestamp(line),
+                        service_state,
+                        f"service_{service_state_match.group(2).lower()}",
+                        current_attempt,
+                    )
 
             assignment_match = ASSIGNMENT_RE.search(line)
             if current_attempt is not None and assignment_match:
@@ -202,6 +256,14 @@ def analyze(path: Path, privacy_salt: bytes | None = None) -> dict[str, object]:
                     session_id in assigned_session_ids
                 )
                 assigned_session_ids.add(session_id)
+                _append_state_event(
+                    state_events,
+                    line_number,
+                    assigned_timestamp,
+                    "Assigned",
+                    "match_assigned",
+                    current_attempt,
+                )
 
             if (
                 current_attempt is not None
@@ -231,6 +293,14 @@ def analyze(path: Path, privacy_salt: bytes | None = None) -> dict[str, object]:
                         current_attempt["party_size"] or 1,  # type: ignore[operator]
                         current_attempt["observed_team_size"] or 1,  # type: ignore[operator]
                     )
+                    _append_state_event(
+                        state_events,
+                        line_number,
+                        _timestamp(line),
+                        "In Mission",
+                        "pve_world_ready",
+                        current_attempt,
+                    )
 
             map_match = LOAD_MAP_RE.search(line)
             if map_match:
@@ -246,6 +316,23 @@ def analyze(path: Path, privacy_salt: bytes | None = None) -> dict[str, object]:
                     current_attempt["map_events"].append(event)  # type: ignore[union-attr]
                     if map_path != "/Game/Maps/Frontend":
                         current_phase = "zone"
+                        _append_state_event(
+                            state_events,
+                            line_number,
+                            _timestamp(line),
+                            "Joining",
+                            "mission_map_load",
+                            current_attempt,
+                        )
+                    elif current_attempt.get("internal_difficulty") is not None:
+                        _append_state_event(
+                            state_events,
+                            line_number,
+                            _timestamp(line),
+                            "Idle",
+                            "frontend_map_load",
+                            current_attempt,
+                        )
 
             team_added_match = TEAM_ADDED_RE.search(line)
             team_match = team_added_match or TEAM_MEMBER_RE.search(line)
@@ -258,6 +345,15 @@ def analyze(path: Path, privacy_salt: bytes | None = None) -> dict[str, object]:
                     current_attempt is not None
                     and current_attempt["assigned_timestamp"] is not None
                 ):
+                    if current_phase == "lobby":
+                        _append_state_event(
+                            state_events,
+                            line_number,
+                            _timestamp(line),
+                            "In Lobby",
+                            "human_campaign_presence",
+                            current_attempt,
+                        )
                     size = index + 1
                     previous_size = current_attempt["observed_team_size"]
                     if previous_size is None or size > previous_size:  # type: ignore[operator]
@@ -338,6 +434,22 @@ def analyze(path: Path, privacy_salt: bytes | None = None) -> dict[str, object]:
                         }
                     )
                     break
+
+            if (
+                current_attempt is not None
+                and (
+                    "FortPC::ReturnToMainMenu()" in line
+                    or "ClientReturnToMainMenuWithTextReason" in line
+                )
+            ):
+                _append_state_event(
+                    state_events,
+                    line_number,
+                    _timestamp(line),
+                    "Leaving",
+                    "return_to_main_menu",
+                    current_attempt,
+                )
 
             qos_match = QOS_DATACENTER_RE.search(line)
             if qos_match:
@@ -468,6 +580,7 @@ def analyze(path: Path, privacy_salt: bytes | None = None) -> dict[str, object]:
             "recommendations": qos_recommendations,
         },
         "legacy_session_searches": legacy_session_searches,
+        "state_events": state_events,
     }
     if note:
         result["note"] = note

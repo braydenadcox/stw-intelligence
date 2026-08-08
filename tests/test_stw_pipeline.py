@@ -149,7 +149,7 @@ class StwPipelineTests(unittest.TestCase):
         self.assertNotIn(replacement, dump)
         self.assertNotIn("private-owner", dump)
         self.assertNotIn("private-token", dump)
-        self.assertEqual(2, version)
+        self.assertEqual(3, version)
 
     def test_daily_reset_creates_distinct_nodes_sessions_and_maps(self) -> None:
         captures = [

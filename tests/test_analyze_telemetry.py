@@ -124,6 +124,27 @@ class AnalyzeTelemetryTests(unittest.TestCase):
         )
         self.assertEqual(1.25, result["legacy_session_searches"][0]["search_latency_seconds"])
 
+    def test_extracts_cancelled_and_failed_live_states(self) -> None:
+        lines = [
+            "[2026.08.08-01.00.00:000][1]LogMatchmaking: "
+            "[FMatchmakingClient::Register] PlayerAttributes={}",
+            "[2026.08.08-01.00.01:000][2]MatchmakingLog: "
+            "Matchmaking Service State Changed From Registered to Failed",
+            "[2026.08.08-01.01.00:000][3]LogMatchmaking: "
+            "[FMatchmakingClient::Register] PlayerAttributes={}",
+            "[2026.08.08-01.01.01:000][4]MatchmakingLog: "
+            "Matchmaking Service State Changed From Registered to Cancelled",
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "capture.log"
+            path.write_text("\n".join(lines), encoding="utf-8")
+            result = analyze(path)
+
+        self.assertEqual(
+            ["Registering", "Failed", "Registering", "Cancelled"],
+            [event["state"] for event in result["state_events"]],
+        )
+
 
 class SanitizeLogsTests(unittest.TestCase):
     def test_removes_credentials_and_preserves_stable_relationships(self) -> None:

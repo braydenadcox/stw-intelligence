@@ -265,6 +265,62 @@ MIGRATIONS = [
         rotation_id, theater_code, power_level, objective_id, biome_code
     );
     CREATE INDEX mission_matches_status_idx ON mission_matches (rotation_id, status);
+    """,
+    """
+    ALTER TABLE capture_files ADD COLUMN capture_kind TEXT NOT NULL DEFAULT 'batch'
+        CHECK (capture_kind IN ('batch', 'live'));
+    ALTER TABLE capture_files ADD COLUMN latest_content_sha256 TEXT;
+    CREATE TABLE log_watchers (
+        id INTEGER PRIMARY KEY,
+        source_path TEXT NOT NULL UNIQUE,
+        file_identity TEXT,
+        generation INTEGER NOT NULL DEFAULT 0,
+        byte_offset INTEGER NOT NULL DEFAULT 0,
+        partial_bytes BLOB NOT NULL DEFAULT X'',
+        tail_bytes BLOB NOT NULL DEFAULT X'',
+        spool_path TEXT NOT NULL,
+        spool_size INTEGER NOT NULL DEFAULT 0,
+        status TEXT NOT NULL DEFAULT 'starting'
+            CHECK (status IN ('starting', 'watching', 'missing', 'error', 'stopped')),
+        started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        checkpoint_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        last_event_at TEXT,
+        last_error TEXT
+    );
+    CREATE TABLE live_watch_generations (
+        watcher_id INTEGER NOT NULL REFERENCES log_watchers(id),
+        generation INTEGER NOT NULL,
+        capture_id INTEGER REFERENCES capture_files(id),
+        file_identity TEXT,
+        spool_path TEXT NOT NULL,
+        started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        ended_at TEXT,
+        PRIMARY KEY (watcher_id, generation),
+        UNIQUE (capture_id)
+    );
+    CREATE TABLE live_states (
+        watcher_id INTEGER PRIMARY KEY REFERENCES log_watchers(id),
+        generation INTEGER NOT NULL,
+        state TEXT NOT NULL,
+        attempt_id INTEGER REFERENCES mission_attempts(id),
+        occurred_at TEXT,
+        source_line INTEGER,
+        reason TEXT,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE TABLE live_state_events (
+        id INTEGER PRIMARY KEY,
+        watcher_id INTEGER NOT NULL REFERENCES log_watchers(id),
+        generation INTEGER NOT NULL,
+        attempt_id INTEGER REFERENCES mission_attempts(id),
+        occurred_at TEXT,
+        source_line INTEGER NOT NULL,
+        state TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        UNIQUE (watcher_id, generation, source_line, state, reason)
+    );
+    CREATE INDEX live_state_events_timeline_idx
+        ON live_state_events(watcher_id, generation, source_line, id);
     """
 ]
 
@@ -686,6 +742,387 @@ def _objective_hint(path: Path) -> str | None:
         ("resupply", "Resupply"),
     )
     return next((label for token, label in aliases if token in name), None)
+
+
+def ensure_live_capture(
+    connection: sqlite3.Connection,
+    watcher_id: int,
+    generation: int,
+    source_path: Path,
+    spool_path: Path,
+    file_identity: str | None,
+) -> int:
+    row = connection.execute(
+        """
+        SELECT capture_id FROM live_watch_generations
+        WHERE watcher_id=? AND generation=?
+        """,
+        (watcher_id, generation),
+    ).fetchone()
+    if row is not None and row["capture_id"] is not None:
+        return row["capture_id"]
+    identity_hash = hashlib.sha256(
+        f"live\0{watcher_id}\0{generation}\0{source_path.resolve()}".encode("utf-8")
+    ).hexdigest()
+    latest_hash = _file_sha256(spool_path)
+    stat = spool_path.stat()
+    with connection:
+        connection.execute(
+            """
+            INSERT INTO capture_files(
+                content_sha256, source_path, size_bytes, modified_ns, attempt_count,
+                capture_kind, latest_content_sha256
+            ) VALUES (?, ?, ?, ?, 0, 'live', ?)
+            ON CONFLICT(content_sha256) DO UPDATE SET
+                source_path=excluded.source_path,
+                size_bytes=excluded.size_bytes,
+                modified_ns=excluded.modified_ns,
+                latest_content_sha256=excluded.latest_content_sha256,
+                last_ingested_at=CURRENT_TIMESTAMP
+            """,
+            (
+                identity_hash,
+                str(source_path.resolve()),
+                stat.st_size,
+                stat.st_mtime_ns,
+                latest_hash,
+            ),
+        )
+        capture_id = connection.execute(
+            "SELECT id FROM capture_files WHERE content_sha256=?", (identity_hash,)
+        ).fetchone()["id"]
+        connection.execute(
+            """
+            INSERT INTO capture_sources(capture_id, source_path) VALUES (?, ?)
+            ON CONFLICT(capture_id, source_path) DO UPDATE SET last_seen_at=CURRENT_TIMESTAMP
+            """,
+            (capture_id, str(source_path.resolve())),
+        )
+        connection.execute(
+            """
+            INSERT INTO live_watch_generations(
+                watcher_id, generation, capture_id, file_identity, spool_path
+            ) VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(watcher_id, generation) DO UPDATE SET
+                capture_id=excluded.capture_id,
+                file_identity=excluded.file_identity,
+                spool_path=excluded.spool_path
+            """,
+            (watcher_id, generation, capture_id, file_identity, str(spool_path)),
+        )
+    return capture_id
+
+
+def persist_live_analysis(
+    connection: sqlite3.Connection,
+    capture_id: int,
+    source_path: Path,
+    spool_path: Path,
+    result: dict[str, Any],
+) -> dict[str, int]:
+    """Upsert one growing live-log generation using Phase 1 normalized tables."""
+    counters = {
+        "attempts_created": 0,
+        "attempts_updated": 0,
+        "assignments": 0,
+        "maps": 0,
+        "membership_events": 0,
+    }
+    objective_hint = _objective_hint(source_path)
+    attempts = result.get("attempts", [])
+    with connection:
+        for index, attempt in enumerate(attempts):
+            if not isinstance(attempt, dict):
+                continue
+            region_id = _lookup_id(connection, "regions", attempt.get("region"))
+            node_id, _ = _mission_node(
+                connection,
+                connection.execute(
+                    "SELECT content_sha256 FROM capture_files WHERE id=?", (capture_id,)
+                ).fetchone()["content_sha256"],
+                attempt,
+            )
+            existing = connection.execute(
+                """
+                SELECT id FROM mission_attempts
+                WHERE capture_id=? AND source_attempt_index=?
+                """,
+                (capture_id, index),
+            ).fetchone()
+            connection.execute(
+                """
+                INSERT INTO mission_attempts(
+                    capture_id, source_attempt_index, source_line_start, source_line_end,
+                    mission_node_id, requested_region_id, stw_type, fill_mode, party_size,
+                    started_at, ended_at, outcome, observation_seconds, build_id, link_code,
+                    platform, input_type, objective_hint, objective_evidence,
+                    internal_difficulty, power_level, team_size_at_start, team_size_15s,
+                    team_size_30s, team_size_60s, first_teammate_seconds, full_team_seconds
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(capture_id, source_attempt_index) DO UPDATE SET
+                    source_line_end=excluded.source_line_end,
+                    mission_node_id=COALESCE(excluded.mission_node_id, mission_attempts.mission_node_id),
+                    requested_region_id=COALESCE(excluded.requested_region_id, mission_attempts.requested_region_id),
+                    stw_type=COALESCE(excluded.stw_type, mission_attempts.stw_type),
+                    fill_mode=COALESCE(excluded.fill_mode, mission_attempts.fill_mode),
+                    party_size=COALESCE(excluded.party_size, mission_attempts.party_size),
+                    ended_at=excluded.ended_at,
+                    outcome=excluded.outcome,
+                    observation_seconds=excluded.observation_seconds,
+                    build_id=COALESCE(excluded.build_id, mission_attempts.build_id),
+                    link_code=COALESCE(excluded.link_code, mission_attempts.link_code),
+                    platform=COALESCE(excluded.platform, mission_attempts.platform),
+                    input_type=COALESCE(excluded.input_type, mission_attempts.input_type),
+                    objective_hint=COALESCE(excluded.objective_hint, mission_attempts.objective_hint),
+                    objective_evidence=COALESCE(excluded.objective_evidence, mission_attempts.objective_evidence),
+                    internal_difficulty=COALESCE(excluded.internal_difficulty, mission_attempts.internal_difficulty),
+                    power_level=COALESCE(excluded.power_level, mission_attempts.power_level),
+                    team_size_at_start=COALESCE(excluded.team_size_at_start, mission_attempts.team_size_at_start),
+                    team_size_15s=COALESCE(excluded.team_size_15s, mission_attempts.team_size_15s),
+                    team_size_30s=COALESCE(excluded.team_size_30s, mission_attempts.team_size_30s),
+                    team_size_60s=COALESCE(excluded.team_size_60s, mission_attempts.team_size_60s),
+                    first_teammate_seconds=COALESCE(excluded.first_teammate_seconds, mission_attempts.first_teammate_seconds),
+                    full_team_seconds=COALESCE(excluded.full_team_seconds, mission_attempts.full_team_seconds)
+                """,
+                (
+                    capture_id,
+                    index,
+                    attempt.get("line"),
+                    attempt.get("end_line"),
+                    node_id,
+                    region_id,
+                    attempt.get("stw_type"),
+                    attempt.get("fill"),
+                    attempt.get("party_size"),
+                    attempt.get("timestamp"),
+                    attempt.get("end_timestamp"),
+                    attempt.get("outcome"),
+                    attempt.get("post_assignment_observation_seconds"),
+                    attempt.get("build_id"),
+                    attempt.get("link_code"),
+                    attempt.get("platform"),
+                    attempt.get("input_type"),
+                    objective_hint,
+                    "capture_filename" if objective_hint else None,
+                    attempt.get("internal_difficulty"),
+                    _power_level(attempt.get("internal_difficulty")),
+                    attempt.get("observed_team_size_at_match_start"),
+                    attempt.get("largest_team_size_within_15_seconds"),
+                    attempt.get("largest_team_size_within_30_seconds"),
+                    attempt.get("largest_team_size_within_60_seconds"),
+                    attempt.get("time_to_first_teammate_seconds"),
+                    attempt.get("time_to_full_team_seconds"),
+                ),
+            )
+            counters["attempts_created" if existing is None else "attempts_updated"] += 1
+            attempt_id = connection.execute(
+                """
+                SELECT id FROM mission_attempts
+                WHERE capture_id=? AND source_attempt_index=?
+                """,
+                (capture_id, index),
+            ).fetchone()["id"]
+            lobby_id, _ = _lobby_session(connection, attempt)
+            datacenter_id = _lookup_id(
+                connection, "datacenters", attempt.get("assigned_subregion")
+            )
+            if attempt.get("assigned_line") is not None:
+                assignment_existing = connection.execute(
+                    "SELECT id FROM assignments WHERE attempt_id=?", (attempt_id,)
+                ).fetchone()
+                connection.execute(
+                    """
+                    INSERT INTO assignments(
+                        attempt_id, source_line, assigned_at, assignment_latency_seconds,
+                        datacenter_id, lobby_session_id, match_identifier
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(attempt_id) DO UPDATE SET
+                        source_line=excluded.source_line,
+                        assigned_at=excluded.assigned_at,
+                        assignment_latency_seconds=excluded.assignment_latency_seconds,
+                        datacenter_id=COALESCE(excluded.datacenter_id, assignments.datacenter_id),
+                        lobby_session_id=COALESCE(excluded.lobby_session_id, assignments.lobby_session_id),
+                        match_identifier=COALESCE(excluded.match_identifier, assignments.match_identifier)
+                    """,
+                    (
+                        attempt_id,
+                        attempt.get("assigned_line"),
+                        attempt.get("assigned_timestamp"),
+                        attempt.get("assignment_latency_seconds"),
+                        datacenter_id,
+                        lobby_id,
+                        attempt.get("assigned_match_id"),
+                    ),
+                )
+                counters["assignments"] += int(assignment_existing is None)
+            if datacenter_id and region_id and attempt.get("assigned_line"):
+                connection.execute(
+                    """
+                    INSERT OR IGNORE INTO datacenter_region_observations(
+                        datacenter_id, region_id, capture_id, source_line,
+                        observed_at, evidence_type
+                    ) VALUES (?, ?, ?, ?, ?, 'assignment')
+                    """,
+                    (
+                        datacenter_id,
+                        region_id,
+                        capture_id,
+                        attempt.get("assigned_line"),
+                        attempt.get("assigned_timestamp"),
+                    ),
+                )
+            for event in attempt.get("map_events", []):
+                cursor = connection.execute(
+                    """
+                    INSERT OR IGNORE INTO attempt_maps(
+                        attempt_id, source_line, observed_at, map_path
+                    ) VALUES (?, ?, ?, ?)
+                    """,
+                    (attempt_id, event["line"], event["timestamp"], event["map"]),
+                )
+                counters["maps"] += cursor.rowcount
+            for event in attempt.get("membership_events", []):
+                cursor = connection.execute(
+                    """
+                    INSERT OR IGNORE INTO membership_events(
+                        attempt_id, lobby_session_id, source_line, occurred_at, phase,
+                        event_type, participant_hash, replaced_participant_hash, slot,
+                        team_size_after
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        attempt_id,
+                        lobby_id,
+                        event["line"],
+                        event["timestamp"],
+                        event["phase"],
+                        event["event_type"],
+                        event["participant_hash"],
+                        event["replaced_participant_hash"],
+                        event["slot"],
+                        event["team_size_after"],
+                    ),
+                )
+                counters["membership_events"] += cursor.rowcount
+        for observation in result.get("qos", {}).get("datacenter_results", []):
+            dc_id = _lookup_id(connection, "datacenters", observation["subregion"])
+            region_id = _lookup_id(connection, "regions", observation["region"])
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO datacenter_region_observations(
+                    datacenter_id, region_id, capture_id, source_line,
+                    observed_at, evidence_type
+                ) VALUES (?, ?, ?, ?, ?, 'qos')
+                """,
+                (
+                    dc_id,
+                    region_id,
+                    capture_id,
+                    observation["line"],
+                    observation["timestamp"],
+                ),
+            )
+        stat = spool_path.stat()
+        connection.execute(
+            """
+            UPDATE capture_files SET
+                size_bytes=?, modified_ns=?, attempt_count=?,
+                latest_content_sha256=?, last_ingested_at=CURRENT_TIMESTAMP
+            WHERE id=?
+            """,
+            (
+                stat.st_size,
+                stat.st_mtime_ns,
+                len(attempts),
+                _file_sha256(spool_path),
+                capture_id,
+            ),
+        )
+    return counters
+
+
+def persist_live_state_events(
+    connection: sqlite3.Connection,
+    watcher_id: int,
+    generation: int,
+    capture_id: int,
+    result: dict[str, Any],
+) -> int:
+    created = 0
+    events = result.get("state_events", [])
+    with connection:
+        for event in events:
+            attempt_id = None
+            if event.get("attempt_line") is not None:
+                row = connection.execute(
+                    """
+                    SELECT id FROM mission_attempts
+                    WHERE capture_id=? AND source_line_start=?
+                    """,
+                    (capture_id, event["attempt_line"]),
+                ).fetchone()
+                attempt_id = row["id"] if row else None
+            cursor = connection.execute(
+                """
+                INSERT OR IGNORE INTO live_state_events(
+                    watcher_id, generation, attempt_id, occurred_at,
+                    source_line, state, reason
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    watcher_id,
+                    generation,
+                    attempt_id,
+                    event.get("timestamp"),
+                    event["line"],
+                    event["state"],
+                    event["reason"],
+                ),
+            )
+            created += cursor.rowcount
+        if events:
+            event = events[-1]
+            row = connection.execute(
+                """
+                SELECT attempt_id FROM live_state_events
+                WHERE watcher_id=? AND generation=? AND source_line=?
+                  AND state=? AND reason=?
+                """,
+                (
+                    watcher_id,
+                    generation,
+                    event["line"],
+                    event["state"],
+                    event["reason"],
+                ),
+            ).fetchone()
+            attempt_id = None if event["state"] == "Idle" else row["attempt_id"]
+            connection.execute(
+                """
+                INSERT INTO live_states(
+                    watcher_id, generation, state, attempt_id, occurred_at,
+                    source_line, reason
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(watcher_id) DO UPDATE SET
+                    generation=excluded.generation,
+                    state=excluded.state,
+                    attempt_id=excluded.attempt_id,
+                    occurred_at=excluded.occurred_at,
+                    source_line=excluded.source_line,
+                    reason=excluded.reason,
+                    updated_at=CURRENT_TIMESTAMP
+                """,
+                (
+                    watcher_id,
+                    generation,
+                    event["state"],
+                    attempt_id,
+                    event.get("timestamp"),
+                    event["line"],
+                    event["reason"],
+                ),
+            )
+    return created
 
 
 def fetch_metrics(interval: str) -> dict[str, Any]:

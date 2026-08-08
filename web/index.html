@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>STW Intelligence</title>
+  <style>
+    :root { color-scheme: dark; --bg:#0c1018; --card:#151c29; --line:#283348; --muted:#91a0b7; --accent:#6fd3ff; }
+    * { box-sizing:border-box; } body { margin:0; font:15px/1.45 system-ui,sans-serif; background:var(--bg); color:#edf4ff; }
+    header { padding:20px max(20px,5vw); border-bottom:1px solid var(--line); display:flex; gap:22px; align-items:center; flex-wrap:wrap; }
+    h1 { font-size:20px; margin:0 auto 0 0; } nav button { color:#d9e7fb; background:transparent; border:1px solid var(--line); padding:8px 14px; cursor:pointer; }
+    nav button.active { border-color:var(--accent); color:var(--accent); } main { max-width:1180px; margin:auto; padding:28px 20px; }
+    .banner { color:#111827; background:#ffd166; padding:9px 12px; border-radius:6px; margin-bottom:16px; }
+    .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:12px; }
+    .card { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:16px; }
+    .label { color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.08em; }
+    .value { font-size:20px; margin-top:4px; overflow-wrap:anywhere; } .muted { color:var(--muted); }
+    table { border-collapse:collapse; width:100%; background:var(--card); } th,td { padding:10px; border-bottom:1px solid var(--line); text-align:left; }
+    tbody tr { cursor:pointer; } tbody tr:hover { background:#1b2535; } .timeline { list-style:none; padding:0; }
+    .timeline li { padding:9px 0; border-bottom:1px solid var(--line); } .mission { margin-bottom:12px; }
+    code { color:#9ee6ff; } button { border-radius:5px; } #health { font-size:12px; color:var(--muted); }
+    @media(max-width:700px){ table { font-size:12px; } th:nth-child(2),td:nth-child(2){display:none;} }
+  </style>
+</head>
+<body>
+  <header><h1>STW Intelligence</h1><nav>
+    <button data-view="live" class="active">Live</button>
+    <button data-view="history">History</button>
+    <button data-view="missions">Missions</button>
+  </nav><span id="health">starting…</span></header>
+  <main id="content"></main>
+  <script>
+    const content=document.querySelector('#content'), health=document.querySelector('#health'); let view='live', selected=null;
+    const esc=v=>String(v??'Unknown').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+    const fmt=v=>v==null?'Unknown':esc(v), secs=v=>v==null?'Unknown':`${Number(v).toFixed(2)}s`;
+    async function api(path){const r=await fetch(path); if(!r.ok)throw new Error(`${r.status}`); return r.json();}
+    document.querySelectorAll('nav button').forEach(b=>b.onclick=()=>{view=b.dataset.view;selected=null;document.querySelectorAll('nav button').forEach(x=>x.classList.toggle('active',x===b));render();});
+    function timeline(events=[]){return events.length?`<ul class="timeline">${events.map(e=>`<li><b>${fmt(e.event_type||e.state)}</b> ${fmt(e.occurred_at)} · ${fmt(e.participant||e.reason)} · team ${fmt(e.team_size_after)}</li>`).join('')}</ul>`:'<p class="muted">No events observed yet.</p>';}
+    async function live(){const d=await api('/api/current'),a=d.attempt; content.innerHTML=`<div class="grid">
+      <section class="card"><div class="label">State</div><div class="value">${fmt(d.state)}</div><div class="muted">${fmt(d.reason)}</div></section>
+      <section class="card"><div class="label">Mission</div><div class="value">${a?`${fmt(a.theater)} · PL${fmt(a.power_level)} ${fmt(a.objective)}`:'Unknown'}</div></section>
+      <section class="card"><div class="label">Route</div><div class="value">${a?`${fmt(a.requested_region)} → ${fmt(a.datacenter)}`:'Unknown'}</div><div class="muted">Fill: ${a?fmt(a.fill_mode):'Unknown'}</div></section>
+      <section class="card"><div class="label">${a?.assignment_latency_seconds==null?'Assignment timer':'Assignment latency'}</div><div class="value">${a?secs(a.assignment_elapsed_seconds):'Unknown'}</div><div class="muted">Session: ${a?fmt(a.session_fingerprint):'Unknown'}</div></section>
+      <section class="card"><div class="label">Lobby size</div><div class="value">${a?fmt(a.current_team_size):'Unknown'}</div></section>
+      </div><section class="card" style="margin-top:12px"><h2>Teammate timeline</h2>${timeline(a?.membership_events)}</section>`;}
+    async function history(){if(selected){const a=await api(`/api/attempts/${selected}`);content.innerHTML=`<button onclick="selected=null;render()">← Back</button><h2>${fmt(a.theater)} · PL${fmt(a.power_level)} ${fmt(a.objective)}</h2><div class="grid"><div class="card"><span class="label">Outcome</span><div class="value">${fmt(a.outcome)}</div></div><div class="card"><span class="label">Route</span><div class="value">${fmt(a.requested_region)} → ${fmt(a.datacenter)}</div></div><div class="card"><span class="label">Latency</span><div class="value">${secs(a.assignment_latency_seconds)}</div></div><div class="card"><span class="label">Final team</span><div class="value">${fmt(a.current_team_size)}</div></div></div><section class="card" style="margin-top:12px"><h3>State</h3>${timeline(a.state_events)}<h3>Membership</h3>${timeline(a.membership_events)}</section>`;return;} const d=await api('/api/attempts?limit=50');content.innerHTML=`<h2>Attempt history</h2><table><thead><tr><th>Time</th><th>Mission</th><th>Route</th><th>Latency</th><th>Team</th><th>Outcome</th></tr></thead><tbody>${d.attempts.map(a=>`<tr onclick="selected=${a.id};render()"><td>${fmt(a.started_at)}</td><td>PL${fmt(a.power_level)} ${fmt(a.objective)}</td><td>${fmt(a.requested_region)} → ${fmt(a.datacenter)}</td><td>${secs(a.assignment_latency_seconds)}</td><td>${fmt(a.current_team_size)}</td><td>${fmt(a.outcome)}</td></tr>`).join('')}</tbody></table>`;}
+    async function missions(){const d=await api('/api/missions/current'),r=d.rotation;content.innerHTML=`${r&&(r.is_fixture||r.freshness!=='current')?`<div class="banner">${r.is_fixture?'Fixture provider data. ':''}Freshness: ${fmt(r.freshness)}. Valid through ${fmt(r.valid_until)}.</div>`:''}<h2>Current missions</h2>${d.missions.map(m=>`<section class="card mission"><h3>${fmt(m.theater_name||m.theater_code)} · PL${fmt(m.power_level)} ${fmt(m.objective)}</h3><p>Biome: ${fmt(m.biome_name||m.biome_code)} · Four-player: ${m.is_four_player?'Yes':'No'} · Alert: ${fmt(m.alert_type)}</p><p><b>Rewards:</b> ${m.rewards.map(x=>`${fmt(x.quantity)}× ${fmt(x.display_name)}`).join(', ')||'None supplied'}</p><p><b>Modifiers:</b> ${m.modifiers.map(x=>fmt(x.display_name)).join(', ')||'None supplied'}</p></section>`).join('')||'<p class="muted">No provider rotation loaded.</p>'}`;}
+    async function render(){try{if(view==='live')await live();else if(view==='history')await history();else await missions();const h=await api('/api/health');health.textContent=`watcher: ${h.watchers[0]?.status||'not configured'} · provider: ${h.provider?.freshness||'none'}`;}catch(e){health.textContent=`error: ${e.message}`;}}
+    render(); setInterval(()=>{if(!selected)render()},1000);
+  </script>
+</body>
+</html>

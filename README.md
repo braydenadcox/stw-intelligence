@@ -52,3 +52,27 @@ Run the test suite with:
 ```powershell
 python -m unittest discover -s tests -v
 ```
+
+## Live local application
+
+On Windows, the default command watches Fortnite's standard log location, loads the
+permission-safe mission fixture, and serves the dashboard and API on localhost:
+
+```powershell
+python tools/stw_app.py
+```
+
+Open <http://127.0.0.1:8765>. Start the application before queueing a mission; a new
+watch starts at the current end of the log so historical Fortnite output is not replayed.
+The byte checkpoint, incomplete-line buffer, and live parsing spool are persisted beneath
+`data/`, so restarting the application continues from the last committed position.
+
+Use explicit paths when Fortnite or the database is elsewhere:
+
+```powershell
+python tools/stw_app.py --log "C:\path\to\FortniteGame.log" --db data/stw-intelligence.sqlite3
+```
+
+For a deliberate one-time replay of an existing log, add `--from-start`. The local API
+provides `/api/current`, `/api/attempts`, `/api/attempts/<id>`,
+`/api/missions/current`, `/api/correlation/current`, and `/api/health`.

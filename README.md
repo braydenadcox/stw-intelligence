@@ -66,6 +66,14 @@ For the easiest Windows launch, double-click `start-stw.cmd`. It starts the app 
 the dashboard automatically. Backup, recovery, diagnostics, privacy, and retention
 instructions are in [the operations guide](docs/operations.md).
 
+To have a lightweight monitor start STW Intelligence only while Fortnite is running,
+double-click `enable-stw-auto-start.cmd` once. It installs a per-user Windows Startup
+shortcut and starts the monitor immediately. The full watcher/dashboard starts when
+`FortniteClient-Win64-Shipping.exe` appears and shuts down cleanly when that process
+exits. Double-click `disable-stw-auto-start.cmd` to disable it. Windows exposes one
+Fortnite client process, so this activation covers the full Fortnite session; the
+telemetry parser still records only recognized STW activity.
+
 Open <http://127.0.0.1:8765>. Start the application before queueing a mission; a new
 watch starts at the current end of the log so historical Fortnite output is not replayed.
 The byte checkpoint, incomplete-line buffer, and live parsing spool are persisted beneath

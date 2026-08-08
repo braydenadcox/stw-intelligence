@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import ctypes
 import json
 import os
 import sqlite3
@@ -49,6 +50,77 @@ from stw_queries import (
 ROOT = Path(__file__).resolve().parents[1]
 DASHBOARD = ROOT / "web" / "index.html"
 DEFAULT_FIXTURE = ROOT / "fixtures" / "current-mission-rotation.json"
+
+
+def process_exists(pid: int) -> bool:
+    """Check a process without requiring third-party packages."""
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        process_query_limited_information = 0x1000
+        still_active = 259
+        kernel32 = ctypes.windll.kernel32
+        kernel32.OpenProcess.argtypes = [
+            ctypes.c_ulong,
+            ctypes.c_int,
+            ctypes.c_ulong,
+        ]
+        kernel32.OpenProcess.restype = ctypes.c_void_p
+        kernel32.GetExitCodeProcess.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_ulong),
+        ]
+        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+        handle = kernel32.OpenProcess(
+            process_query_limited_information, False, pid
+        )
+        if not handle:
+            return kernel32.GetLastError() == 5  # Access denied means it exists.
+        try:
+            exit_code = ctypes.c_ulong()
+            return bool(kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code))) and (
+                exit_code.value == still_active
+            )
+        finally:
+            kernel32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+        return True
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+
+class ProcessLifetimeMonitor:
+    def __init__(
+        self,
+        pid: int,
+        on_exit: Callable[[], None],
+        checker: Callable[[int], bool] = process_exists,
+        poll_interval: float = 1.0,
+    ):
+        self.pid = pid
+        self.on_exit = on_exit
+        self.checker = checker
+        self.poll_interval = poll_interval
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self) -> None:
+        while not self._stop.wait(self.poll_interval):
+            if not self.checker(self.pid):
+                self.on_exit()
+                return
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread and self._thread is not threading.current_thread():
+            self._thread.join(timeout=self.poll_interval + 1.0)
 
 
 class ApiApplication:
@@ -384,6 +456,12 @@ def main() -> int:
         action="store_true",
         help="process an existing log from byte zero on its first watch",
     )
+    parser.add_argument(
+        "--exit-when-process-exits",
+        type=int,
+        metavar="PID",
+        help=argparse.SUPPRESS,
+    )
     args = parser.parse_args()
     instance_lock = ApplicationLock(args.db.parent / "stw_app.lock")
     try:
@@ -488,6 +566,12 @@ def main() -> int:
         start_at_end=not args.from_start,
     )
     watcher.start()
+    lifetime_monitor = None
+    if args.exit_when_process_exits is not None:
+        lifetime_monitor = ProcessLifetimeMonitor(
+            args.exit_when_process_exits, server.shutdown
+        )
+        lifetime_monitor.start()
     print(f"STW Intelligence: http://{args.host}:{args.port}")
     print(f"Watching: {log_path.resolve()}")
     try:
@@ -498,6 +582,8 @@ def main() -> int:
         server.shutdown()
         server.server_close()
         watcher.stop()
+        if lifetime_monitor is not None:
+            lifetime_monitor.stop()
         if provider_loop is not None:
             provider_loop.stop()
     return 0

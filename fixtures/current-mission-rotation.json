@@ -1,0 +1,88 @@
+{
+  "provider": {
+    "code": "local_fixture",
+    "display_name": "Permission-safe STW mission fixture",
+    "adapter_version": "1"
+  },
+  "rotation": {
+    "key": "fixture-2026-08-08",
+    "valid_from": "2026-08-08T00:00:00Z",
+    "valid_until": "2026-08-09T00:00:00Z",
+    "source_timestamp": "2026-08-08T00:05:00Z"
+  },
+  "missions": [
+    {
+      "provider_mission_key": "fixture-twine-rtl-160",
+      "theater": {
+        "code": "twine_peaks",
+        "name": "Twine Peaks"
+      },
+      "objective": {
+        "code": "ride_the_lightning",
+        "name": "Ride the Lightning"
+      },
+      "power_level": 160,
+      "husk_power_level": 250,
+      "biome": {
+        "code": "arid_wild_west",
+        "name": "Arid wild west"
+      },
+      "is_four_player": true,
+      "alert_type": "mini_boss",
+      "rewards": [
+        {
+          "kind": "alert",
+          "item_code": "legendary_survivor",
+          "display_name": "Legendary Survivor",
+          "rarity": "legendary",
+          "quantity": 1
+        },
+        {
+          "kind": "repeatable",
+          "item_code": "storm_shard",
+          "display_name": "Storm Shard",
+          "quantity": 4
+        }
+      ],
+      "modifiers": [
+        {
+          "modifier_code": "water_storm",
+          "display_name": "Water Storm",
+          "element": "water"
+        },
+        {
+          "modifier_code": "wall_weakening",
+          "display_name": "Wall Weakening"
+        }
+      ]
+    },
+    {
+      "provider_mission_key": "fixture-twine-rtd-160",
+      "theater": {
+        "code": "twine_peaks",
+        "name": "Twine Peaks"
+      },
+      "objective": {
+        "code": "retrieve_the_data",
+        "name": "Retrieve the Data"
+      },
+      "power_level": 160,
+      "husk_power_level": 250,
+      "biome": {
+        "code": "autumn_lake",
+        "name": "Autumn lake"
+      },
+      "is_four_player": false,
+      "alert_type": "storm",
+      "rewards": [
+        {
+          "kind": "base",
+          "item_code": "schematic_xp",
+          "display_name": "Schematic XP",
+          "quantity": 45000
+        }
+      ],
+      "modifiers": []
+    }
+  ]
+}

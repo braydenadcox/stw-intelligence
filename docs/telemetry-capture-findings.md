@@ -77,6 +77,10 @@ It emits JSON and deliberately excludes display names, server hosts, local accou
 
 The `attempts` collection correlates each registration with its assignment timestamp, assignment latency, newly observed session ID, map loads, team-size high-water mark, and internal difficulty. Outcomes are conservative: `joined` requires a PvE difficulty snapshot, `assigned_not_joined` means the service assigned a session but no world-load confirmation followed, and `registered_not_assigned` means no assignment was observed before the next attempt or end of file.
 
+The extractor now also records the assigned physical subregion, matchmaking bucket fields, party size, QoS datacenter results, standardized team snapshots, teammate arrival timing, assigned-session reuse, and legacy existing-session search outcomes. See the [regional population signal investigation](regional-population-signal-investigation.md) for the population-specific interpretation and limitations.
+
+The five-region PL160 Retrieve the Data capture further confirms that one mission UUID survives switches across NAE, NAC, NAW, EU, and OCE. The assigned sites were VA, IA, OR, FR, and SYD respectively, and all five joins received distinct session IDs.
+
 This distinction recovers the action sequence in the annotated PL comparison without relying on the note: the second PL160 attempt was assigned after 10.601 seconds but not joined; the first PL140 attempt was assigned after 11.181 seconds but not joined; and the following PL140 attempt joined with internal difficulty 50. The two same-mission Repair the Shelter samples both joined full four-player lobbies, with different session IDs and assignment latencies of 2.666 and 2.457 seconds.
 
 ## Next highest-value tests

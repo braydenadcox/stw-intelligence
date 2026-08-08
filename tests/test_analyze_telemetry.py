@@ -17,11 +17,19 @@ class AnalyzeTelemetryTests(unittest.TestCase):
         lines = [
             "[2026.08.07-05.00.00:000][1]LogMatchmaking: "
             "[FMatchmakingClient::Register] AccountId=secret-account "
-            "PlayerAttributes={/Fortnite.com/Matchmaking:Region:NAW, "
+            "PartyMemberAccountIds=one,two PlayerAttributes="
+            "{/Fortnite.com/Matchmaking:Region:NAW, "
+            "/Fortnite.com/Matchmaking:BuildId:123, "
+            "/Fortnite.com/Matchmaking:LinkCode:campaign, "
+            "/Fortnite.com/Matchmaking:SubRegionPings:{OR:31, NCAL:45}, "
             "/Fortnite.com/Matchmaking:MatchFill:Public, "
             "/Epic@Fortnite.com/SaveTheWorld/Matchmaking:Mission:mission-uuid, "
             "/Epic@Fortnite.com/SaveTheWorld/Matchmaking:Theater:theater-uuid, "
             "/Epic@Fortnite.com/SaveTheWorld/Matchmaking:Type:Mission}",
+            "[2026.08.07-05.00.02:500][2]LogMatchmaking: "
+            "[FMatchmakingClient::OnClientMatchAssigned] "
+            "ServerAttributes={/Fortnite.com/Matchmaking:SubRegion:OR, "
+            "sessionId:0123456789abcdef0123456789abcdef}",
             "[2026.08.07-05.00.02:500][2]MatchmakingLog: "
             "Matchmaking Service State Changed From Registered to Assigned",
             "Session [Session Id [0123456789abcdef0123456789abcdef]]",
@@ -32,6 +40,7 @@ class AnalyzeTelemetryTests(unittest.TestCase):
             "1.2.3.4:9000/STW_Zones/Maps/Zones/Test?EncryptionToken=secret-token",
             "[2026.08.07-05.00.05:000][5]LogHealthSnapshot: "
             "======= Snapshot: Waiting to Start (FortGameStatePvE, Difficulty 50.00) =======",
+            "[2026.08.07-05.00.33:000][6]LogTest: observation window complete",
         ]
 
         with tempfile.TemporaryDirectory() as directory:
@@ -42,7 +51,24 @@ class AnalyzeTelemetryTests(unittest.TestCase):
         attempt = result["attempts"][0]
         self.assertEqual("NAW", attempt["region"])
         self.assertEqual(2.5, attempt["assignment_latency_seconds"])
+        self.assertEqual(2, attempt["party_size"])
+        self.assertEqual("123", attempt["build_id"])
+        self.assertEqual("campaign", attempt["link_code"])
+        self.assertEqual({"OR": 31, "NCAL": 45}, attempt["subregion_pings_ms"])
+        self.assertEqual("OR", attempt["assigned_subregion"])
+        self.assertEqual(
+            "0123456789abcdef0123456789abcdef", attempt["assigned_session_id"]
+        )
+        self.assertFalse(attempt["assigned_session_reused_in_file"])
         self.assertEqual(4, attempt["observed_team_size"])
+        self.assertEqual(4, attempt["observed_team_size_at_match_start"])
+        self.assertEqual(4, attempt["largest_team_size_within_15_seconds"])
+        self.assertEqual(4, attempt["largest_team_size_within_30_seconds"])
+        self.assertIsNone(attempt["largest_team_size_within_60_seconds"])
+        self.assertEqual({"15": 4, "30": 4}, attempt["largest_team_size_within_seconds"])
+        self.assertEqual(30.5, attempt["post_assignment_observation_seconds"])
+        self.assertEqual(0.5, attempt["time_to_first_teammate_seconds"])
+        self.assertEqual(0.5, attempt["time_to_full_team_seconds"])
         self.assertEqual(50.0, attempt["internal_difficulty"])
         self.assertEqual("joined", attempt["outcome"])
         self.assertEqual(["STW_Zones/Maps/Zones/Test"], attempt["maps"])
@@ -69,6 +95,34 @@ class AnalyzeTelemetryTests(unittest.TestCase):
             result = analyze(path)
 
         self.assertEqual("assigned_not_joined", result["attempts"][0]["outcome"])
+
+    def test_extracts_qos_session_reuse_and_legacy_search_outcomes(self) -> None:
+        lines = [
+            "[2026.08.07-05.00.00:000][1]LogQos: Display: AutoRegion NAW: 2 datacenters available",
+            "[2026.08.07-05.00.00:100][2]LogQos: Verbose: OR (NAW): 4/4 queries succeeded, average ping: 29ms (adj: 31ms)",
+            "[2026.08.07-05.00.00:200][3]LogQos: Best region is 'NAW', recommended subregion is 'OR'",
+            "[2026.08.07-05.00.01:000][4]LogMatchmaking: [FMatchmakingClient::Register] PlayerAttributes={}",
+            "[2026.08.07-05.00.02:000][5]LogMatchmaking: [FMatchmakingClient::OnClientMatchAssigned] ServerAttributes={/Fortnite.com/Matchmaking:SubRegion:OR, sessionId:0123456789abcdef0123456789abcdef}",
+            "[2026.08.07-05.00.03:000][6]LogMatchmaking: [FMatchmakingClient::Register] PlayerAttributes={}",
+            "[2026.08.07-05.00.04:000][7]LogMatchmaking: [FMatchmakingClient::OnClientMatchAssigned] ServerAttributes={/Fortnite.com/Matchmaking:SubRegion:OR, sessionId:0123456789abcdef0123456789abcdef}",
+            "[2026.08.07-05.00.05:000][8]LogOnlineGame: Matchmaking state change Not Matchmaking -> Finding Existing Session",
+            "[2026.08.07-05.00.06:250][9]LogOnlineGame: Matchmaking state change Testing Existing Sessions -> Joining Existing Session",
+        ]
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "capture.log"
+            path.write_text("\n".join(lines), encoding="utf-8")
+            result = analyze(path)
+
+        self.assertEqual({"NAW": 2}, result["qos"]["available_datacenters_by_region"])
+        self.assertEqual(29, result["qos"]["datacenter_results"][0]["average_ping_ms"])
+        self.assertEqual("OR", result["qos"]["recommendations"][0]["recommended_subregion"])
+        self.assertFalse(result["attempts"][0]["assigned_session_reused_in_file"])
+        self.assertTrue(result["attempts"][1]["assigned_session_reused_in_file"])
+        self.assertEqual(
+            "existing_session_found", result["legacy_session_searches"][0]["outcome"]
+        )
+        self.assertEqual(1.25, result["legacy_session_searches"][0]["search_latency_seconds"])
 
 
 class SanitizeLogsTests(unittest.TestCase):

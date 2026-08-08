@@ -5,3 +5,5 @@ logs/
 data/*.sqlite3
 data/*.sqlite3-*
 data/live/
+data/backups/
+data/*.lock

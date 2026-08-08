@@ -209,7 +209,15 @@ class LiveWatcherTests(unittest.TestCase):
                     1, connection.execute("SELECT COUNT(*) FROM mission_matches WHERE status='accepted'").fetchone()[0]
                 )
                 dump = "\n".join(connection.iterdump())
+                spool_path = Path(
+                    connection.execute(
+                        "SELECT spool_path FROM log_watchers"
+                    ).fetchone()[0]
+                )
                 self.assertNotIn("private-live-member", dump)
+                self.assertNotIn(
+                    "private-live-member", spool_path.read_text(encoding="utf-8")
+                )
             finally:
                 connection.close()
 
@@ -232,6 +240,8 @@ class LiveWatcherTests(unittest.TestCase):
                 "/api/correlation/current",
                 "/api/activity/current",
                 "/api/recommendation/current",
+                "/api/settings",
+                "/api/diagnostics",
                 "/api/health",
             ):
                 response_status, _, response_body = api.dispatch("GET", endpoint)

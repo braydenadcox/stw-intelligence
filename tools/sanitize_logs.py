@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import os
 import re
 from pathlib import Path
 
@@ -74,9 +75,16 @@ def sanitize_text(text: str) -> str:
 
 
 def sanitize_file(path: Path) -> None:
-    original = path.read_text(encoding="utf-8", errors="replace")
-    sanitized = sanitize_text(original)
-    path.write_text(sanitized, encoding="utf-8", newline="")
+    temporary = path.with_suffix(path.suffix + ".sanitizing")
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as source:
+            with temporary.open("w", encoding="utf-8", newline="") as output:
+                for line in source:
+                    output.write(sanitize_text(line))
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
 
 
 def main() -> int:

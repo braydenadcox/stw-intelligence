@@ -62,6 +62,10 @@ permission-safe mission fixture, and serves the dashboard and API on localhost:
 python tools/stw_app.py
 ```
 
+For the easiest Windows launch, double-click `start-stw.cmd`. It starts the app and opens
+the dashboard automatically. Backup, recovery, diagnostics, privacy, and retention
+instructions are in [the operations guide](docs/operations.md).
+
 Open <http://127.0.0.1:8765>. Start the application before queueing a mission; a new
 watch starts at the current end of the log so historical Fortnite output is not replayed.
 The byte checkpoint, incomplete-line buffer, and live parsing spool are persisted beneath
@@ -76,7 +80,7 @@ python tools/stw_app.py --log "C:\path\to\FortniteGame.log" --db data/stw-intell
 For a deliberate one-time replay of an existing log, add `--from-start`. The local API
 provides `/api/current`, `/api/attempts`, `/api/attempts/<id>`,
 `/api/missions/current`, `/api/correlation/current`, `/api/activity/current`,
-`/api/recommendation/current`, and `/api/health`.
+`/api/recommendation/current`, `/api/settings`, `/api/diagnostics`, and `/api/health`.
 
 The Activity view compares complete, solo, Public Fill observations for the same
 rotation-scoped mission. It reports a versioned 0-100 observed matchmaking activity

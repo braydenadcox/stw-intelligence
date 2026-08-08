@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from analyze_telemetry import analyze
+from sanitize_logs import sanitize_text
 from stw_activity import refresh_activity
 from stw_pipeline import (
     _privacy_salt,
@@ -248,8 +249,11 @@ class LogWatcher:
             complete = combined[: newline + 1] if newline >= 0 else b""
             partial = combined[newline + 1 :] if newline >= 0 else combined
             if complete:
+                sanitized_complete = sanitize_text(
+                    complete.decode("utf-8", errors="replace")
+                ).encode("utf-8")
                 with spool.open("ab") as output:
-                    output.write(complete)
+                    output.write(sanitized_complete)
                     output.flush()
                 result = analyze(spool, privacy_salt=_privacy_salt(connection))
                 capture_id = ensure_live_capture(

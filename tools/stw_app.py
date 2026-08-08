@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 import json
 import os
+import sqlite3
 import threading
 from datetime import datetime, timezone
 from http import HTTPStatus
@@ -14,6 +16,16 @@ from pathlib import Path
 from typing import Callable
 from urllib.parse import parse_qs, urlparse
 
+from stw_admin import (
+    ApplicationLock,
+    backup_database,
+    diagnostics,
+    get_settings,
+    preflight_settings,
+    prune_history,
+    sanitize_live_spools,
+    update_settings,
+)
 from stw_activity import activity_overview, recommendation_overview, refresh_activity
 from stw_live import LogWatcher
 from stw_pipeline import connect
@@ -45,19 +57,67 @@ class ApiApplication:
         database: Path,
         dashboard: Path = DASHBOARD,
         provider_status: Callable[[], dict[str, object]] | None = None,
+        active_log: Path | None = None,
     ):
         self.database = database.resolve()
         self.dashboard = dashboard
         self.provider_status = provider_status
+        self.active_log = active_log.resolve() if active_log else None
 
-    def dispatch(self, method: str, target: str) -> tuple[int, str, bytes]:
-        if method != "GET":
-            return self._json(HTTPStatus.METHOD_NOT_ALLOWED, {"error": "GET only"})
+    def dispatch(
+        self, method: str, target: str, body: bytes = b""
+    ) -> tuple[int, str, bytes]:
+        if method not in ("GET", "POST"):
+            return self._json(HTTPStatus.METHOD_NOT_ALLOWED, {"error": "unsupported method"})
         parsed = urlparse(target)
-        if parsed.path == "/":
+        if method == "GET" and parsed.path == "/":
             return HTTPStatus.OK, "text/html; charset=utf-8", self.dashboard.read_bytes()
         connection = connect(self.database)
         try:
+            if method == "POST":
+                try:
+                    payload = json.loads(body or b"{}")
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    return self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid JSON"})
+                if not isinstance(payload, dict):
+                    return self._json(HTTPStatus.BAD_REQUEST, {"error": "JSON object required"})
+                if parsed.path == "/api/settings":
+                    try:
+                        result = update_settings(connection, payload, self.active_log)
+                    except ValueError as error:
+                        return self._json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
+                    return self._json(
+                        HTTPStatus.OK,
+                        {
+                            **result,
+                            "settings": get_settings(
+                                connection, self.database, self.active_log
+                            ),
+                        },
+                    )
+                if parsed.path == "/api/admin/backup":
+                    settings = get_settings(connection)
+                    result = backup_database(
+                        self.database,
+                        self.database.parent / "backups",
+                        settings["backup_keep"],
+                    )
+                    return self._json(HTTPStatus.OK, result)
+                if parsed.path == "/api/admin/retention":
+                    if payload.get("confirm") is not True:
+                        return self._json(
+                            HTTPStatus.BAD_REQUEST,
+                            {"error": "retention cleanup requires confirmation"},
+                        )
+                    settings = get_settings(connection)
+                    result = prune_history(
+                        connection,
+                        settings["history_retention_days"],
+                        confirmed=True,
+                    )
+                    refresh_activity(connection)
+                    return self._json(HTTPStatus.OK, result)
+                return self._json(HTTPStatus.NOT_FOUND, {"error": "not found"})
             if parsed.path == "/api/current":
                 return self._json(HTTPStatus.OK, current_state(connection))
             if parsed.path == "/api/attempts":
@@ -105,6 +165,23 @@ class ApiApplication:
                 return self._json(
                     HTTPStatus.OK, recommendation_overview(connection, mission_node_id)
                 )
+            if parsed.path == "/api/settings":
+                return self._json(
+                    HTTPStatus.OK,
+                    get_settings(connection, self.database, self.active_log),
+                )
+            if parsed.path == "/api/diagnostics":
+                runtime = self.provider_status() if self.provider_status else None
+                return self._json(
+                    HTTPStatus.OK,
+                    diagnostics(
+                        connection,
+                        self.database,
+                        self.active_log,
+                        self.dashboard,
+                        runtime,
+                    ),
+                )
             if parsed.path == "/api/health":
                 health = application_health(connection)
                 if self.provider_status is not None:
@@ -126,7 +203,37 @@ class ApiApplication:
 def handler_for(application: ApiApplication) -> type[BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:  # noqa: N802
-            status, content_type, body = application.dispatch("GET", self.path)
+            status, content_type, body = self._dispatch("GET")
+            self._send(status, content_type, body)
+
+        def do_POST(self) -> None:  # noqa: N802
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                length = 0
+            if length > 65536:
+                status, content_type, body = application._json(
+                    HTTPStatus.REQUEST_ENTITY_TOO_LARGE, {"error": "request too large"}
+                )
+            else:
+                status, content_type, body = self._dispatch(
+                    "POST", self.rfile.read(length)
+                )
+            self._send(status, content_type, body)
+
+        def _dispatch(
+            self, method: str, body: bytes = b""
+        ) -> tuple[int, str, bytes]:
+            try:
+                return application.dispatch(method, self.path, body)
+            except Exception as error:
+                print(f"API error: {type(error).__name__}: {error}")
+                return application._json(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    {"error": "local application error; check diagnostics"},
+                )
+
+        def _send(self, status: int, content_type: str, body: bytes) -> None:
             self.send_response(status)
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(body)))
@@ -240,7 +347,7 @@ class ProviderRefreshLoop:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--db", type=Path, default=Path("data/stw-intelligence.sqlite3"))
-    parser.add_argument("--log", type=Path, default=_default_log())
+    parser.add_argument("--log", type=Path)
     parser.add_argument("--fixture", type=Path, default=DEFAULT_FIXTURE)
     parser.add_argument("--provider-url", help="approved normalized mission feed URL")
     parser.add_argument("--provider-code", default="configured_http_feed")
@@ -262,7 +369,50 @@ def main() -> int:
         help="process an existing log from byte zero on its first watch",
     )
     args = parser.parse_args()
-    if args.log is None:
+    instance_lock = ApplicationLock(args.db.parent / "stw_app.lock")
+    try:
+        instance_lock.acquire()
+    except RuntimeError as error:
+        print(error)
+        print("Use the existing dashboard window or stop it with Ctrl+C first.")
+        return 2
+    atexit.register(instance_lock.release)
+    before_connect = preflight_settings(args.db)
+    if before_connect["auto_backup_on_start"]:
+        try:
+            backup = backup_database(
+                args.db, args.db.parent / "backups", before_connect["backup_keep"]
+            )
+            if backup["status"] == "created":
+                print(f"Database backup: {backup['path']}")
+        except (OSError, sqlite3.Error) as error:
+            print(f"Database backup warning: {error}")
+
+    setup_connection = connect(args.db)
+    try:
+        stored = get_settings(setup_connection)
+        spool_result = sanitize_live_spools(setup_connection)
+        if spool_result["sanitized"]:
+            print(f"Sanitized {spool_result['sanitized']} local live spool(s).")
+        configured_log = stored["configured_log_path"]
+        log_path = args.log or (Path(configured_log) if configured_log else _default_log())
+        if args.log is not None:
+            update_settings(
+                setup_connection,
+                {"configured_log_path": str(args.log)},
+                args.log,
+            )
+        if stored["history_retention_days"] > 0:
+            cleanup = prune_history(
+                setup_connection,
+                stored["history_retention_days"],
+                confirmed=True,
+            )
+            if cleanup["deleted"]:
+                print(f"History retention removed {cleanup['deleted']} old attempt(s).")
+    finally:
+        setup_connection.close()
+    if log_path is None:
         parser.error("--log is required when LOCALAPPDATA is unavailable")
 
     provider_loop: ProviderRefreshLoop | None = None
@@ -300,19 +450,30 @@ def main() -> int:
             connection.close()
         provider_status = lambda: fixture_provider.health().__dict__
 
+    try:
+        server = ThreadingHTTPServer(
+            (args.host, args.port),
+            handler_for(
+                ApiApplication(
+                    args.db, provider_status=provider_status, active_log=log_path
+                )
+            ),
+        )
+    except OSError as error:
+        if provider_loop is not None:
+            provider_loop.stop()
+        print(f"Unable to start local server on {args.host}:{args.port}: {error}")
+        print("Close the other STW Intelligence window or choose a different --port.")
+        return 2
     watcher = LogWatcher(
         args.db,
-        args.log,
+        log_path,
         poll_interval=0.5,
         start_at_end=not args.from_start,
     )
     watcher.start()
-    server = ThreadingHTTPServer(
-        (args.host, args.port),
-        handler_for(ApiApplication(args.db, provider_status=provider_status)),
-    )
     print(f"STW Intelligence: http://{args.host}:{args.port}")
-    print(f"Watching: {args.log.resolve()}")
+    print(f"Watching: {log_path.resolve()}")
     try:
         server.serve_forever(poll_interval=0.5)
     except KeyboardInterrupt:

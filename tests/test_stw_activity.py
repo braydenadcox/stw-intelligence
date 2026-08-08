@@ -11,7 +11,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
-from stw_activity import activity_overview, refresh_activity  # noqa: E402
+from stw_activity import activity_overview, recommend_region, refresh_activity  # noqa: E402
 from stw_app import ApiApplication  # noqa: E402
 from stw_pipeline import connect  # noqa: E402
 
@@ -152,6 +152,11 @@ class ActivityScoreTests(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertEqual((6, 2), counts)
         self.assertEqual("NAE", overview["leader"]["region"])
+        self.assertEqual("recommended", overview["recommendation"]["status"])
+        self.assertEqual("NAE", overview["recommendation"]["region"])
+        self.assertFalse(
+            overview["recommendation"]["basis"]["network_ping_used"]
+        )
         self.assertEqual(100.0, overview["leader"]["score"])
         self.assertEqual("low", overview["leader"]["confidence"])
         self.assertEqual(3, overview["leader"]["sample_count"])
@@ -177,14 +182,68 @@ class ActivityScoreTests(unittest.TestCase):
 
             api = ApiApplication(database)
             status, _, body = api.dispatch("GET", "/api/activity/current")
+            recommendation_status, _, recommendation_body = api.dispatch(
+                "GET", "/api/recommendation/current"
+            )
             invalid, _, _ = api.dispatch(
                 "GET", "/api/activity/current?mission_node=not-a-number"
             )
             payload = json.loads(body)
+            recommendation = json.loads(recommendation_body)
 
         self.assertEqual(200, status)
         self.assertEqual(2, len(payload["regions"]))
+        self.assertEqual(200, recommendation_status)
+        self.assertEqual(
+            "NAE", recommendation["recommendation"]["region"]
+        )
         self.assertEqual(400, invalid)
+
+    def test_recommendation_abstains_for_insufficient_evidence_and_ties(self) -> None:
+        def region(code: str, score: float, confidence: str, samples: int) -> dict:
+            return {
+                "region": code,
+                "score": score,
+                "confidence": confidence,
+                "sample_count": samples,
+                "effective_sample_size": float(samples),
+                "components": {
+                    "arrival": 20.0,
+                    "concurrency": 10.0,
+                    "breadth": 5.0,
+                    "retention": 10.0,
+                    "assignment": 5.0,
+                },
+            }
+
+        insufficient = recommend_region(
+            [region("NAE", 80.0, "insufficient", 2)]
+        )
+        tied = recommend_region(
+            [
+                region("NAE", 70.0, "low", 3),
+                region("EU", 70.0, "low", 3),
+            ]
+        )
+
+        self.assertEqual("insufficient_data", insufficient["status"])
+        self.assertIsNone(insufficient["region"])
+        self.assertEqual("no_clear_leader", tied["status"])
+        self.assertIsNone(tied["region"])
+        self.assertIn("row order", tied["reasons"][1])
+
+    def test_empty_database_returns_an_insufficient_recommendation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "empty.sqlite3"
+            connection = connect(database)
+            connection.close()
+            status, _, body = ApiApplication(database).dispatch(
+                "GET", "/api/recommendation/current"
+            )
+            payload = json.loads(body)
+
+        self.assertEqual(200, status)
+        self.assertEqual("insufficient_data", payload["recommendation"]["status"])
 
 
 if __name__ == "__main__":

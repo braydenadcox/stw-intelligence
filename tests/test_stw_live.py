@@ -231,6 +231,7 @@ class LiveWatcherTests(unittest.TestCase):
                 "/api/missions/current",
                 "/api/correlation/current",
                 "/api/activity/current",
+                "/api/recommendation/current",
                 "/api/health",
             ):
                 response_status, _, response_body = api.dispatch("GET", endpoint)

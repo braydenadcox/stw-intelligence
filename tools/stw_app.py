@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Callable
 from urllib.parse import parse_qs, urlparse
 
-from stw_activity import activity_overview, refresh_activity
+from stw_activity import activity_overview, recommendation_overview, refresh_activity
 from stw_live import LogWatcher
 from stw_pipeline import connect
 from stw_providers import (
@@ -93,6 +93,17 @@ class ApiApplication:
                     )
                 return self._json(
                     HTTPStatus.OK, activity_overview(connection, mission_node_id)
+                )
+            if parsed.path == "/api/recommendation/current":
+                raw_node = parse_qs(parsed.query).get("mission_node", [None])[0]
+                try:
+                    mission_node_id = int(raw_node) if raw_node is not None else None
+                except ValueError:
+                    return self._json(
+                        HTTPStatus.BAD_REQUEST, {"error": "invalid mission node"}
+                    )
+                return self._json(
+                    HTTPStatus.OK, recommendation_overview(connection, mission_node_id)
                 )
             if parsed.path == "/api/health":
                 health = application_health(connection)

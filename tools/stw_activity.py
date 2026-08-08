@@ -17,6 +17,8 @@ from typing import Any
 SCORE_VERSION = "observed-activity-v1"
 WINDOW_SECONDS = 60
 RECENCY_HALF_LIFE_HOURS = 6.0
+RECOMMENDATION_VERSION = "activity-ranking-v1"
+SCORE_TIE_EPSILON = 0.01
 
 
 def _parse_time(value: str) -> datetime:
@@ -167,6 +169,127 @@ def _confidence(sample_count: int, effective_sample_size: float) -> str:
     if sample_count >= 8 and effective_sample_size >= 5:
         return "moderate"
     return "low"
+
+
+def recommend_region(regions: list[dict[str, Any]]) -> dict[str, Any]:
+    """Turn comparable regional activity into an explainable, abstaining decision."""
+    eligible = [row for row in regions if row["confidence"] != "insufficient"]
+    basis = {
+        "version": RECOMMENDATION_VERSION,
+        "ranking_key": "observed_matchmaking_activity_score",
+        "minimum_complete_samples": 3,
+        "network_ping_used": False,
+        "network_ping_status": "unknown",
+        "assignment_latency_note": (
+            "Assignment speed contributes at most 10 points to activity; median "
+            "assignment latency is also shown separately and is not network ping."
+        ),
+    }
+    if not eligible:
+        return {
+            "status": "insufficient_data",
+            "region": None,
+            "headline": "Not enough evidence yet",
+            "summary": "No region has three complete comparable attempts.",
+            "confidence": "insufficient",
+            "score": None,
+            "runner_up": None,
+            "alternatives": [],
+            "reasons": [
+                "Complete 60-second Public Fill observations are required.",
+                "The system abstains instead of guessing from incomplete regions.",
+            ],
+            "basis": basis,
+        }
+
+    ranked = sorted(
+        eligible,
+        key=lambda row: (-float(row["score"]), -int(row["sample_count"]), row["region"]),
+    )
+    winner = ranked[0]
+    runner = ranked[1] if len(ranked) > 1 else None
+    margin = float(winner["score"]) - float(runner["score"]) if runner else None
+    alternatives = [
+        {
+            "region": row["region"],
+            "score": row["score"],
+            "confidence": row["confidence"],
+        }
+        for row in ranked[1:4]
+    ]
+    if runner is not None and abs(margin or 0.0) <= SCORE_TIE_EPSILON:
+        return {
+            "status": "no_clear_leader",
+            "region": None,
+            "headline": "No clear regional leader",
+            "summary": (
+                f"{winner['region']} and {runner['region']} have effectively tied "
+                "observed activity scores."
+            ),
+            "confidence": "insufficient",
+            "score": winner["score"],
+            "runner_up": {
+                "region": runner["region"],
+                "score": runner["score"],
+                "margin": round(margin or 0.0, 2),
+            },
+            "alternatives": alternatives,
+            "reasons": [
+                "The leading scores are equal within 0.01 points.",
+                "The system abstains rather than breaking a tie by row order.",
+            ],
+            "basis": basis,
+        }
+
+    membership_points = sum(
+        float(winner["components"][name])
+        for name in ("arrival", "concurrency", "breadth", "retention")
+    )
+    if runner:
+        lead_reason = (
+            f"Its activity score leads {runner['region']} by {margin:.2f} points."
+        )
+        runner_up = {
+            "region": runner["region"],
+            "score": runner["score"],
+            "margin": round(margin, 2),
+        }
+    else:
+        lead_reason = "It is the only region with enough comparable evidence."
+        runner_up = None
+    return {
+        "status": "recommended",
+        "region": winner["region"],
+        "headline": f"Try {winner['region']}",
+        "summary": (
+            f"{winner['region']} has the strongest observed matchmaking activity "
+            f"for this exact mission, with {winner['confidence']} evidence confidence."
+        ),
+        "confidence": winner["confidence"],
+        "score": winner["score"],
+        "runner_up": runner_up,
+        "alternatives": alternatives,
+        "reasons": [
+            lead_reason,
+            (
+                f"Teammate arrival, concurrency, breadth, and retention contributed "
+                f"{membership_points:.2f} of 90 possible points."
+            ),
+            (
+                f"Assignment speed contributed "
+                f"{float(winner['components']['assignment']):.2f} of 10 possible points."
+            ),
+            (
+                f"Evidence: {winner['sample_count']} complete attempts, effective "
+                f"sample size {winner['effective_sample_size']:.2f}, "
+                f"{winner['confidence']} confidence."
+            ),
+            (
+                "Network ping was not observed and was not used in this recommendation."
+            ),
+        ],
+        "basis": basis,
+    }
 
 
 def refresh_activity(
@@ -350,6 +473,7 @@ def activity_overview(
         ).fetchone()
         mission_node_id = row["mission_node_id"] if row else None
     if mission_node_id is None:
+        recommendation = recommend_region([])
         return {
             "definition": "Observed activity from this client; not population or CCU.",
             "score_version": SCORE_VERSION,
@@ -357,6 +481,7 @@ def activity_overview(
             "mission": None,
             "regions": [],
             "leader": None,
+            "recommendation": recommendation,
         }
     rows = connection.execute(
         """
@@ -437,6 +562,7 @@ def activity_overview(
         else None
     )
     leader = regions[0] if regions and regions[0]["confidence"] != "insufficient" else None
+    recommendation = recommend_region(regions)
     return {
         "definition": (
             "Observed matchmaking activity from this client for one exact mission and "
@@ -448,6 +574,18 @@ def activity_overview(
         "mission": mission,
         "regions": regions,
         "leader": leader,
+        "recommendation": recommendation,
+    }
+
+
+def recommendation_overview(
+    connection: sqlite3.Connection, mission_node_id: int | None = None
+) -> dict[str, Any]:
+    overview = activity_overview(connection, mission_node_id)
+    return {
+        "definition": overview["definition"],
+        "mission": overview["mission"],
+        "recommendation": overview["recommendation"],
     }
 
 
@@ -458,6 +596,10 @@ def main() -> int:
     commands.add_parser("refresh", help="recompute attempt and regional activity scores")
     report = commands.add_parser("report", help="print the latest regional comparison")
     report.add_argument("--mission-node", type=int)
+    recommend = commands.add_parser(
+        "recommend", help="print the current evidence-based region recommendation"
+    )
+    recommend.add_argument("--mission-node", type=int)
     args = parser.parse_args()
 
     from stw_pipeline import connect
@@ -466,8 +608,14 @@ def main() -> int:
     try:
         if args.command == "refresh":
             print(json.dumps(refresh_activity(connection), indent=2))
-        else:
+        elif args.command == "report":
             print(json.dumps(activity_overview(connection, args.mission_node), indent=2))
+        else:
+            print(
+                json.dumps(
+                    recommendation_overview(connection, args.mission_node), indent=2
+                )
+            )
         return 0
     finally:
         connection.close()

@@ -35,7 +35,9 @@ LEFT JOIN lobby_sessions AS ls ON ls.id = a.lobby_session_id
 
 def list_attempts(connection: sqlite3.Connection, limit: int) -> list[sqlite3.Row]:
     return connection.execute(
-        ATTEMPT_QUERY + " ORDER BY ma.started_at DESC, ma.id DESC LIMIT ?", (limit,)
+        ATTEMPT_QUERY
+        + " WHERE ma.stw_type='Mission' ORDER BY ma.started_at DESC, ma.id DESC LIMIT ?",
+        (limit,),
     ).fetchall()
 
 

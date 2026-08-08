@@ -16,6 +16,60 @@ CAPTURES = Path(__file__).resolve().parents[1] / "logs" / "telemetry-captures"
 
 
 class StwPipelineTests(unittest.TestCase):
+    def test_replays_migration_after_legacy_index_name_collision(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "prototype.sqlite3"
+            prototype = sqlite3.connect(database)
+            prototype.execute(
+                """
+                CREATE TABLE capture_files(
+                    source_file TEXT PRIMARY KEY, size_bytes INTEGER,
+                    modified_ns INTEGER, attempt_count INTEGER, ingested_at TEXT
+                )
+                """
+            )
+            prototype.execute(
+                """
+                CREATE TABLE matchmaking_attempts(
+                    source_file TEXT, attempt_index INTEGER, mission_id TEXT,
+                    theater_id TEXT, internal_difficulty REAL, fill_mode TEXT,
+                    party_size INTEGER, region TEXT
+                )
+                """
+            )
+            prototype.execute(
+                """
+                CREATE INDEX attempts_cohort_idx ON matchmaking_attempts(
+                    mission_id, theater_id, internal_difficulty,
+                    fill_mode, party_size, region
+                )
+                """
+            )
+            prototype.execute(
+                "INSERT INTO capture_files VALUES ('preserved.log', 10, 20, 1, 'now')"
+            )
+            prototype.commit()
+            prototype.close()
+
+            connection = connect(database)
+            try:
+                version = connection.execute("PRAGMA user_version").fetchone()[0]
+                index_table = connection.execute(
+                    """
+                    SELECT tbl_name FROM sqlite_master
+                    WHERE type='index' AND name='attempts_cohort_idx'
+                    """
+                ).fetchone()[0]
+                preserved = connection.execute(
+                    "SELECT source_file FROM legacy_capture_files_v0"
+                ).fetchone()[0]
+            finally:
+                connection.close()
+
+        self.assertEqual(3, version)
+        self.assertEqual("mission_attempts", index_table)
+        self.assertEqual("preserved.log", preserved)
+
     def test_migrates_a_legacy_database_without_discarding_it(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             database = Path(directory) / "legacy.sqlite3"
@@ -266,7 +320,7 @@ class StwPipelineTests(unittest.TestCase):
         self.assertEqual(before, after)
         self.assertTrue({"NAE", "NAC", "NAW", "EU", "OCE"}.issubset(regions))
         self.assertTrue({"Public", "Private"}.issubset(fills))
-        self.assertTrue({"left", "slot_reused"}.issubset(event_types))
+        self.assertTrue({"left", "joined"}.issubset(event_types))
         self.assertEqual(5, multi_region)
         self.assertEqual(2, same_node_lobbies)
         self.assertEqual(2, resupply_regions)

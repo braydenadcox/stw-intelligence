@@ -87,7 +87,8 @@ def _attempt_summary(connection: sqlite3.Connection, row: sqlite3.Row) -> dict[s
 
 def recent_attempts(connection: sqlite3.Connection, limit: int = 20) -> list[dict[str, Any]]:
     rows = connection.execute(
-        ATTEMPT_SELECT + " ORDER BY ma.started_at DESC, ma.id DESC LIMIT ?",
+        ATTEMPT_SELECT
+        + " WHERE ma.stw_type='Mission' ORDER BY ma.started_at DESC, ma.id DESC LIMIT ?",
         (max(1, min(limit, 200)),),
     ).fetchall()
     return [_attempt_summary(connection, row) for row in rows]

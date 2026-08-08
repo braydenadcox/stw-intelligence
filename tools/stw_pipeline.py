@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
 import secrets
 import sqlite3
 import sys
@@ -267,9 +268,6 @@ MIGRATIONS = [
     CREATE INDEX mission_matches_status_idx ON mission_matches (rotation_id, status);
     """,
     """
-    ALTER TABLE capture_files ADD COLUMN capture_kind TEXT NOT NULL DEFAULT 'batch'
-        CHECK (capture_kind IN ('batch', 'live'));
-    ALTER TABLE capture_files ADD COLUMN latest_content_sha256 TEXT;
     CREATE TABLE log_watchers (
         id INTEGER PRIMARY KEY,
         source_path TEXT NOT NULL UNIQUE,
@@ -344,13 +342,65 @@ def connect(path: Path) -> sqlite3.Connection:
     for version, migration in enumerate(MIGRATIONS, 1):
         if version in applied:
             continue
+        if version == 1:
+            _remove_legacy_index_conflicts(connection)
+        if version == 3:
+            _ensure_live_capture_columns(connection)
         with connection:
-            connection.executescript(migration)
+            connection.executescript(_replay_safe_migration(migration))
             connection.execute(
                 "INSERT INTO schema_migrations(version) VALUES (?)", (version,)
             )
             connection.execute(f"PRAGMA user_version = {version}")
     return connection
+
+
+def _replay_safe_migration(migration: str) -> str:
+    migration = re.sub(
+        r"CREATE TABLE (?!IF NOT EXISTS )",
+        "CREATE TABLE IF NOT EXISTS ",
+        migration,
+    )
+    return re.sub(
+        r"CREATE (UNIQUE )?INDEX (?!IF NOT EXISTS )",
+        lambda match: f"CREATE {match.group(1) or ''}INDEX IF NOT EXISTS ",
+        migration,
+    )
+
+
+def _remove_legacy_index_conflicts(connection: sqlite3.Connection) -> None:
+    expected_tables = {
+        "mission_nodes_lookup_idx": "mission_nodes",
+        "attempts_history_idx": "mission_attempts",
+        "attempts_cohort_idx": "mission_attempts",
+        "membership_timeline_idx": "membership_events",
+    }
+    with connection:
+        for name, expected_table in expected_tables.items():
+            row = connection.execute(
+                "SELECT tbl_name FROM sqlite_master WHERE type='index' AND name=?",
+                (name,),
+            ).fetchone()
+            if row is not None and row["tbl_name"] != expected_table:
+                connection.execute(f'DROP INDEX "{name}"')
+
+
+def _ensure_live_capture_columns(connection: sqlite3.Connection) -> None:
+    columns = {
+        row["name"] for row in connection.execute("PRAGMA table_info(capture_files)")
+    }
+    with connection:
+        if "capture_kind" not in columns:
+            connection.execute(
+                """
+                ALTER TABLE capture_files ADD COLUMN capture_kind TEXT NOT NULL DEFAULT 'batch'
+                    CHECK (capture_kind IN ('batch', 'live'))
+                """
+            )
+        if "latest_content_sha256" not in columns:
+            connection.execute(
+                "ALTER TABLE capture_files ADD COLUMN latest_content_sha256 TEXT"
+            )
 
 
 def _prepare_legacy_schema(connection: sqlite3.Connection) -> None:
@@ -922,6 +972,12 @@ def persist_live_analysis(
                 """,
                 (capture_id, index),
             ).fetchone()["id"]
+            # A growing live spool is re-analyzed from the beginning. Replace its
+            # derived roster timeline so parser improvements and late lines cannot
+            # leave obsolete inferred events behind.
+            connection.execute(
+                "DELETE FROM membership_events WHERE attempt_id=?", (attempt_id,)
+            )
             lobby_id, _ = _lobby_session(connection, attempt)
             datacenter_id = _lookup_id(
                 connection, "datacenters", attempt.get("assigned_subregion")
@@ -1051,6 +1107,10 @@ def persist_live_state_events(
     created = 0
     events = result.get("state_events", [])
     with connection:
+        connection.execute(
+            "DELETE FROM live_state_events WHERE watcher_id=? AND generation=?",
+            (watcher_id, generation),
+        )
         for event in events:
             attempt_id = None
             if event.get("attempt_line") is not None:

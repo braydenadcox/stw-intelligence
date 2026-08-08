@@ -28,6 +28,9 @@ TEAM_ADDED_RE = re.compile(
     r"at index \[(\d+)]"
 )
 CLIENT_LEFT_RE = re.compile(r"LogLobbyBeacon: ClientPlayerLeft (?:MCP|EOS):([^\s]+)")
+TEAM_REMOVED_RE = re.compile(
+    r"Removing \[[^]]*] Id \[(?:MCP|EOS):([^]]+)] from \[[^]]*]'s team"
+)
 SESSION_RE = re.compile(r"Session Id \[([0-9a-fA-F]{32})]")
 ASSIGNED_MARKER = "Matchmaking Service State Changed From Registered to Assigned"
 ASSIGNMENT_RE = re.compile(
@@ -123,6 +126,12 @@ def _append_state_event(
     reason: str,
     attempt: dict[str, object] | None,
 ) -> None:
+    if attempt is not None and attempt.get("stw_type") not in (None, "Mission"):
+        if reason != "matchmaking_registration":
+            return
+        state = "Idle"
+        reason = "non_mission_session"
+        attempt = None
     if events and events[-1]["state"] == state:
         return
     events.append(
@@ -155,6 +164,7 @@ def analyze(path: Path, privacy_salt: bytes | None = None) -> dict[str, object]:
     current_attempt: dict[str, object] | None = None
     current_phase = "lobby"
     membership_slots: dict[str, dict[int, str]] = {"lobby": {}, "zone": {}}
+    membership_members: dict[str, set[str]] = {"lobby": set(), "zone": set()}
     last_timestamp: str | None = None
     last_line_number = 0
 
@@ -207,6 +217,7 @@ def analyze(path: Path, privacy_salt: bytes | None = None) -> dict[str, object]:
                 )
                 current_phase = "lobby"
                 membership_slots = {"lobby": {}, "zone": {}}
+                membership_members = {"lobby": set(), "zone": set()}
                 _append_state_event(
                     state_events,
                     line_number,
@@ -383,42 +394,64 @@ def analyze(path: Path, privacy_salt: bytes | None = None) -> dict[str, object]:
 
                     if index > 0:
                         slots = membership_slots[current_phase]
+                        members = membership_members[current_phase]
+                        existing_slot = next(
+                            (slot for slot, member in slots.items() if member == participant_id),
+                            None,
+                        )
+                        if existing_slot is not None and existing_slot != index:
+                            del slots[existing_slot]
                         previous_participant = slots.get(index)
-                        if previous_participant != participant_id:
-                            slots[index] = participant_id
+                        is_new_participant = participant_id not in members
+                        replaced_participant = None
+                        if (
+                            is_new_participant
+                            and team_added_match
+                            and previous_participant is not None
+                            and previous_participant in members
+                            and len(members) >= 3
+                        ):
+                            replaced_participant = previous_participant
+                            members.remove(previous_participant)
+                        slots[index] = participant_id
+                        if is_new_participant:
+                            members.add(participant_id)
                             current_attempt["membership_events"].append(  # type: ignore[union-attr]
                                 {
                                     "line": line_number,
                                     "timestamp": _timestamp(line),
                                     "phase": current_phase,
                                     "event_type": "slot_reused"
-                                    if previous_participant is not None
+                                    if replaced_participant is not None
                                     else ("joined" if team_added_match else "present"),
                                     "participant_hash": _participant_hash(
                                         participant_id, privacy_salt
                                     ),
                                     "replaced_participant_hash": _participant_hash(
-                                        previous_participant, privacy_salt
+                                        replaced_participant, privacy_salt
                                     )
-                                    if previous_participant is not None
+                                    if replaced_participant is not None
                                     else None,
                                     "slot": index,
-                                    "team_size_after": 1 + len(slots),
+                                    "team_size_after": 1 + len(members),
                                 }
                             )
 
-            left_match = CLIENT_LEFT_RE.search(line)
+            left_match = CLIENT_LEFT_RE.search(line) or TEAM_REMOVED_RE.search(line)
             if left_match and current_attempt is not None:
                 participant_id = left_match.group(1)
                 for phase in dict.fromkeys((current_phase, "lobby", "zone")):
                     slots = membership_slots[phase]
+                    members = membership_members[phase]
                     matching_slot = next(
                         (slot for slot, member in slots.items() if member == participant_id),
                         None,
                     )
-                    if matching_slot is None:
+                    if participant_id not in members:
                         continue
-                    del slots[matching_slot]
+                    members.remove(participant_id)
+                    if matching_slot is not None:
+                        del slots[matching_slot]
                     current_attempt["membership_events"].append(  # type: ignore[union-attr]
                         {
                             "line": line_number,
@@ -430,7 +463,7 @@ def analyze(path: Path, privacy_salt: bytes | None = None) -> dict[str, object]:
                             ),
                             "replaced_participant_hash": None,
                             "slot": matching_slot,
-                            "team_size_after": 1 + len(slots),
+                            "team_size_after": 1 + len(members),
                         }
                     )
                     break

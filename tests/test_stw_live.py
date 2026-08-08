@@ -13,6 +13,7 @@ from stw_app import ApiApplication  # noqa: E402
 from stw_live import LogWatcher  # noqa: E402
 from stw_pipeline import connect  # noqa: E402
 from stw_providers import FixtureProvider, ingest_provider_rotation  # noqa: E402
+from stw_queries import recent_attempts  # noqa: E402
 
 
 FIXTURE = ROOT / "fixtures" / "current-mission-rotation.json"
@@ -211,6 +212,23 @@ class LiveWatcherTests(unittest.TestCase):
                 ],
                 transitions,
             )
+
+            homebase = registration().replace(
+                "01.00.00:000", "01.01.02:000"
+            ).replace("Type:Mission", "Type:StormShield")
+            append(source, homebase + "\n")
+            restarted.poll_once()
+            connection = connect(database)
+            try:
+                self.assertEqual(
+                    "Idle", connection.execute("SELECT state FROM live_states").fetchone()[0]
+                )
+                self.assertEqual(
+                    2, connection.execute("SELECT COUNT(*) FROM mission_attempts").fetchone()[0]
+                )
+                self.assertEqual(1, len(recent_attempts(connection)))
+            finally:
+                connection.close()
 
     def test_truncation_and_rotation_start_new_generations(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

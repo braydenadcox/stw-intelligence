@@ -145,6 +145,60 @@ class AnalyzeTelemetryTests(unittest.TestCase):
             [event["state"] for event in result["state_events"]],
         )
 
+    def test_tracks_leave_replacement_across_roster_slot_reordering(self) -> None:
+        lines = [
+            "[2026.08.08-02.00.00:000][1]LogMatchmaking: "
+            "[FMatchmakingClient::Register] PlayerAttributes={"
+            "/Epic@Fortnite.com/SaveTheWorld/Matchmaking:Type:Mission}",
+            "[2026.08.08-02.00.01:000][2]LogMatchmaking: "
+            "[FMatchmakingClient::OnClientMatchAssigned] "
+            "ServerAttributes={/Fortnite.com/Matchmaking:SubRegion:OH, "
+            "sessionId:0123456789abcdef0123456789abcdef}",
+            "[2026.08.08-02.00.02:000][3]LogLoad: LoadMap: STW_Zones/Test",
+            "[2026.08.08-02.00.03:000][4]LogParty: [A] Id [MCP:member-a] "
+            "added to team [HumanCampaign] at index [1]",
+            "[2026.08.08-02.00.03:100][5]LogParty: [B] Id [MCP:member-b] "
+            "added to team [HumanCampaign] at index [2]",
+            "[2026.08.08-02.00.03:200][6]LogParty: [C] Id [MCP:member-c] "
+            "added to team [HumanCampaign] at index [3]",
+            "[2026.08.08-02.05.00:000][7]LogParty: Removing [A] Id "
+            "[MCP:member-a] from [local]'s team.",
+            "[2026.08.08-02.05.00:100][8]LogParty: [B] Id [MCP:member-b] "
+            "team member data updated, team [HumanCampaign] at index [1]",
+            "[2026.08.08-02.05.00:200][9]LogParty: [C] Id [MCP:member-c] "
+            "team member data updated, team [HumanCampaign] at index [2]",
+            "[2026.08.08-02.06.00:000][10]LogParty: [D] Id [MCP:member-d] "
+            "added to team [HumanCampaign] at index [3]",
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "capture.log"
+            path.write_text("\n".join(lines), encoding="utf-8")
+            attempt = analyze(path, privacy_salt=b"test-salt")["attempts"][0]
+
+        events = attempt["membership_events"]
+        self.assertEqual(
+            ["joined", "joined", "joined", "left", "joined"],
+            [event["event_type"] for event in events],
+        )
+        self.assertEqual([2, 3, 4, 3, 4], [event["team_size_after"] for event in events])
+
+    def test_treats_homebase_matchmaking_as_idle_live_state(self) -> None:
+        lines = [
+            "[2026.08.08-03.00.00:000][1]LogMatchmaking: "
+            "[FMatchmakingClient::Register] PlayerAttributes={"
+            "/Epic@Fortnite.com/SaveTheWorld/Matchmaking:Type:StormShield}",
+            "[2026.08.08-03.00.01:000][2]MatchmakingLog: "
+            "Matchmaking Service State Changed From Registering to Registered",
+            "[2026.08.08-03.00.02:000][3]LogLoad: LoadMap: STW_HestiaBeauty/World/Zone",
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "capture.log"
+            path.write_text("\n".join(lines), encoding="utf-8")
+            result = analyze(path)
+
+        self.assertEqual(["Idle"], [event["state"] for event in result["state_events"]])
+        self.assertEqual("non_mission_session", result["state_events"][0]["reason"])
+
 
 class SanitizeLogsTests(unittest.TestCase):
     def test_removes_credentials_and_preserves_stable_relationships(self) -> None:

@@ -24,7 +24,7 @@ from stw_providers import (  # noqa: E402
 
 
 ROOT = Path(__file__).resolve().parents[1]
-CAPTURES = ROOT / "logs" / "telemetry-captures"
+CAPTURES = ROOT / "logs" / "manual-telemetry-captures"
 FIXTURE = ROOT / "fixtures" / "current-mission-rotation.json"
 NOW = datetime(2026, 8, 8, 12, tzinfo=timezone.utc)
 
@@ -170,7 +170,7 @@ class StwProviderTests(unittest.TestCase):
             finally:
                 connection.close()
 
-        self.assertEqual(3, version)
+        self.assertEqual(5, version)
         self.assertIn("mission_attempts", tables)
         self.assertIn("provider_snapshots", tables)
         self.assertIn("mission_matches", tables)

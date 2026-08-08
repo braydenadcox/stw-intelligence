@@ -12,7 +12,7 @@ from stw_history import get_attempt, list_attempts, theater_name  # noqa: E402
 from stw_pipeline import activity_report, connect, ingest_logs, store_metrics  # noqa: E402
 
 
-CAPTURES = Path(__file__).resolve().parents[1] / "logs" / "telemetry-captures"
+CAPTURES = Path(__file__).resolve().parents[1] / "logs" / "manual-telemetry-captures"
 
 
 class StwPipelineTests(unittest.TestCase):
@@ -66,7 +66,7 @@ class StwPipelineTests(unittest.TestCase):
             finally:
                 connection.close()
 
-        self.assertEqual(3, version)
+        self.assertEqual(5, version)
         self.assertEqual("mission_attempts", index_table)
         self.assertEqual("preserved.log", preserved)
 
@@ -203,7 +203,7 @@ class StwPipelineTests(unittest.TestCase):
         self.assertNotIn(replacement, dump)
         self.assertNotIn("private-owner", dump)
         self.assertNotIn("private-token", dump)
-        self.assertEqual(3, version)
+        self.assertEqual(5, version)
 
     def test_daily_reset_creates_distinct_nodes_sessions_and_maps(self) -> None:
         captures = [

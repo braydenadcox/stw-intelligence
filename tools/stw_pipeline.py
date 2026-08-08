@@ -319,6 +319,61 @@ MIGRATIONS = [
     );
     CREATE INDEX live_state_events_timeline_idx
         ON live_state_events(watcher_id, generation, source_line, id);
+    """,
+    """
+    CREATE TABLE attempt_activity_scores (
+        id INTEGER PRIMARY KEY,
+        attempt_id INTEGER NOT NULL REFERENCES mission_attempts(id),
+        score_version TEXT NOT NULL,
+        window_seconds INTEGER NOT NULL,
+        score REAL NOT NULL,
+        arrival_score REAL NOT NULL,
+        concurrency_score REAL NOT NULL,
+        breadth_score REAL NOT NULL,
+        retention_score REAL NOT NULL,
+        assignment_score REAL NOT NULL,
+        max_concurrent_remote INTEGER NOT NULL,
+        unique_remote INTEGER NOT NULL,
+        retained_teammate_seconds REAL NOT NULL,
+        possible_teammate_seconds REAL NOT NULL,
+        evidence_json TEXT NOT NULL,
+        calculated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE (attempt_id, score_version, window_seconds)
+    );
+    CREATE TABLE regional_activity (
+        id INTEGER PRIMARY KEY,
+        mission_node_id INTEGER NOT NULL REFERENCES mission_nodes(id),
+        external_mission_id INTEGER REFERENCES external_missions(id),
+        region_id INTEGER NOT NULL REFERENCES regions(id),
+        window_start TEXT NOT NULL,
+        window_end TEXT NOT NULL,
+        score_version TEXT NOT NULL,
+        window_seconds INTEGER NOT NULL,
+        score REAL NOT NULL,
+        arrival_score REAL NOT NULL,
+        concurrency_score REAL NOT NULL,
+        breadth_score REAL NOT NULL,
+        retention_score REAL NOT NULL,
+        assignment_score REAL NOT NULL,
+        sample_count INTEGER NOT NULL,
+        effective_sample_size REAL NOT NULL,
+        latest_sample_at TEXT NOT NULL,
+        coverage REAL NOT NULL,
+        confidence_band TEXT NOT NULL
+            CHECK (confidence_band IN ('insufficient', 'low', 'moderate', 'higher')),
+        median_assignment_latency_seconds REAL,
+        assignment_join_completion_rate REAL NOT NULL,
+        evidence_json TEXT NOT NULL,
+        calculated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE (mission_node_id, region_id, score_version, window_seconds)
+    );
+    CREATE INDEX regional_activity_lookup_idx
+        ON regional_activity(mission_node_id, score_version, score DESC);
+    """,
+    """
+    ALTER TABLE regional_activity ADD COLUMN coverage_15 REAL NOT NULL DEFAULT 0;
+    ALTER TABLE regional_activity ADD COLUMN coverage_30 REAL NOT NULL DEFAULT 0;
+    ALTER TABLE regional_activity ADD COLUMN coverage_60 REAL NOT NULL DEFAULT 0;
     """
 ]
 

@@ -75,7 +75,19 @@ python tools/stw_app.py --log "C:\path\to\FortniteGame.log" --db data/stw-intell
 
 For a deliberate one-time replay of an existing log, add `--from-start`. The local API
 provides `/api/current`, `/api/attempts`, `/api/attempts/<id>`,
-`/api/missions/current`, `/api/correlation/current`, and `/api/health`.
+`/api/missions/current`, `/api/correlation/current`, `/api/activity/current`, and
+`/api/health`.
+
+The Activity view compares complete, solo, Public Fill observations for the same
+rotation-scoped mission. It reports a versioned 0-100 observed matchmaking activity
+score, component evidence, sample count, effective sample size, coverage, and confidence.
+The score is local evidence only: it is not a player population, queue depth, or CCU
+estimate. Recompute or inspect it from the command line with:
+
+```powershell
+python tools/stw_activity.py refresh
+python tools/stw_activity.py report
+```
 
 ## Approved live mission feed
 

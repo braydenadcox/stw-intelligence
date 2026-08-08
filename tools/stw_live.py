@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from analyze_telemetry import analyze
+from stw_activity import refresh_activity
 from stw_pipeline import (
     _privacy_salt,
     connect,
@@ -272,6 +273,7 @@ class LogWatcher:
                 rotation_id = latest_rotation_id(connection)
                 if rotation_id is not None:
                     match_rotation(connection, rotation_id)
+                refresh_activity(connection)
             else:
                 persistence = {}
                 state_events = 0

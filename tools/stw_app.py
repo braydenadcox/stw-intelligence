@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Callable
 from urllib.parse import parse_qs, urlparse
 
+from stw_activity import activity_overview, refresh_activity
 from stw_live import LogWatcher
 from stw_pipeline import connect
 from stw_providers import (
@@ -81,6 +82,17 @@ class ApiApplication:
             if parsed.path == "/api/correlation/current":
                 return self._json(
                     HTTPStatus.OK, {"correlations": current_correlations(connection)}
+                )
+            if parsed.path == "/api/activity/current":
+                raw_node = parse_qs(parsed.query).get("mission_node", [None])[0]
+                try:
+                    mission_node_id = int(raw_node) if raw_node is not None else None
+                except ValueError:
+                    return self._json(
+                        HTTPStatus.BAD_REQUEST, {"error": "invalid mission node"}
+                    )
+                return self._json(
+                    HTTPStatus.OK, activity_overview(connection, mission_node_id)
                 )
             if parsed.path == "/api/health":
                 health = application_health(connection)
@@ -152,6 +164,7 @@ class ProviderRefreshLoop:
         try:
             ingestion = ingest_provider_rotation(connection, self.provider)
             matching = match_rotation(connection, ingestion["rotation_id"])
+            activity = refresh_activity(connection)
             health = self.provider.health()
             status: dict[str, object] = {
                 **health.__dict__,
@@ -160,6 +173,7 @@ class ProviderRefreshLoop:
                 "rotation_id": ingestion["rotation_id"],
                 "ingestion": ingestion,
                 "matching": matching,
+                "activity": activity,
             }
         except Exception as error:  # keep the last good database rotation available
             health = self.provider.health()
@@ -270,6 +284,7 @@ def main() -> int:
             if args.fixture and args.fixture.exists():
                 ingestion = ingest_provider_rotation(connection, fixture_provider)
                 match_rotation(connection, ingestion["rotation_id"])
+            refresh_activity(connection)
         finally:
             connection.close()
         provider_status = lambda: fixture_provider.health().__dict__

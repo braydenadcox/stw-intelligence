@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import copy
 import json
+import os
 import sqlite3
 import sys
 import tempfile
+import threading
 import unittest
 from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 
@@ -14,6 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 from stw_pipeline import MIGRATIONS, connect, ingest_logs  # noqa: E402
 from stw_providers import (  # noqa: E402
     FixtureProvider,
+    HttpMissionProvider,
     ingest_provider_rotation,
     match_rotation,
 )
@@ -47,6 +51,100 @@ def write_unmatched_capture(path: Path) -> None:
 
 
 class StwProviderTests(unittest.TestCase):
+    def test_http_provider_uses_environment_key_and_conditional_requests(self) -> None:
+        payload = FIXTURE.read_bytes()
+        requests: list[dict[str, str | None]] = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:  # noqa: N802
+                requests.append(
+                    {
+                        "api_key": self.headers.get("X-Test-Key"),
+                        "if_none_match": self.headers.get("If-None-Match"),
+                    }
+                )
+                if self.headers.get("If-None-Match") == '"rotation-v1"':
+                    self.send_response(304)
+                    self.send_header("ETag", '"rotation-v1"')
+                    self.end_headers()
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.send_header("ETag", '"rotation-v1"')
+                self.send_header("Last-Modified", "Sat, 08 Aug 2026 00:05:00 GMT")
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, format: str, *args: object) -> None:
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        previous_key = os.environ.get("STW_TEST_PROVIDER_KEY")
+        os.environ["STW_TEST_PROVIDER_KEY"] = "test-key-value"
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                connection = connect(Path(directory) / "http-provider.sqlite3")
+                try:
+                    provider = HttpMissionProvider(
+                        f"http://127.0.0.1:{server.server_port}/rotation",
+                        code="test_live_feed",
+                        display_name="Test live feed",
+                        api_key_env="STW_TEST_PROVIDER_KEY",
+                        api_key_header="X-Test-Key",
+                        allow_insecure_http=True,
+                    )
+                    first = ingest_provider_rotation(connection, provider, NOW)
+                    second = ingest_provider_rotation(connection, provider, NOW)
+                    counts = {
+                        table: connection.execute(
+                            f"SELECT COUNT(*) FROM {table}"
+                        ).fetchone()[0]
+                        for table in (
+                            "provider_snapshots", "mission_rotations", "external_missions"
+                        )
+                    }
+                finally:
+                    connection.close()
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+            if previous_key is None:
+                os.environ.pop("STW_TEST_PROVIDER_KEY", None)
+            else:
+                os.environ["STW_TEST_PROVIDER_KEY"] = previous_key
+
+        self.assertEqual(1, first["snapshots"])
+        self.assertEqual(0, second["snapshots"])
+        self.assertEqual(
+            {"provider_snapshots": 1, "mission_rotations": 1, "external_missions": 2},
+            counts,
+        )
+        self.assertEqual("test-key-value", requests[0]["api_key"])
+        self.assertEqual('"rotation-v1"', requests[1]["if_none_match"])
+        self.assertEqual("healthy", provider.health(NOW).status)
+        self.assertEqual("current", provider.health(NOW).freshness)
+
+    def test_http_provider_requires_https_and_configured_environment_key(self) -> None:
+        with self.assertRaisesRegex(ValueError, "HTTPS"):
+            HttpMissionProvider(
+                "http://example.test/rotation",
+                code="unsafe",
+                display_name="Unsafe",
+            )
+        provider = HttpMissionProvider(
+            "https://example.test/rotation",
+            code="missing_key",
+            display_name="Missing key",
+            api_key_env="STW_TEST_MISSING_KEY",
+        )
+        os.environ.pop("STW_TEST_MISSING_KEY", None)
+        with self.assertRaisesRegex(ValueError, "STW_TEST_MISSING_KEY"):
+            provider.fetch_rotation(NOW)
+
     def test_upgrades_an_existing_phase_one_database(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             database = Path(directory) / "phase-one.sqlite3"

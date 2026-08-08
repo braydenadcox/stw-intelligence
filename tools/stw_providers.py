@@ -5,16 +5,26 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import sqlite3
+import urllib.error
+import urllib.request
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 
 MATCHER_VERSION = "rotation-fields-v1"
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        del req, fp, code, msg, headers, newurl
+        return None
 
 THEATER_UUID_CODES = {
     "33A2311D4AE64B361CCE27BC9F313C8B": "stonewood",
@@ -332,6 +342,170 @@ class FixtureProvider(MissionProvider):
         return ProviderHealth("healthy", freshness, rotation.valid_until, str(self.path))
 
 
+class HttpMissionProvider(FixtureProvider):
+    """HTTPS provider for an approved feed using the normalized fixture envelope."""
+
+    def __init__(
+        self,
+        url: str,
+        *,
+        code: str,
+        display_name: str,
+        adapter_version: str = "http-json-v1",
+        terms_url: str | None = None,
+        api_key_env: str | None = None,
+        api_key_header: str = "API-Key",
+        timeout_seconds: float = 20.0,
+        max_response_bytes: int = 5 * 1024 * 1024,
+        allow_insecure_http: bool = False,
+    ) -> None:
+        parsed = urlsplit(url)
+        allowed_schemes = {"https", "http"} if allow_insecure_http else {"https"}
+        if parsed.scheme.lower() not in allowed_schemes:
+            raise ValueError("mission provider URL must use HTTPS")
+        if not parsed.hostname or parsed.username or parsed.password:
+            raise ValueError("mission provider URL must have a host and no embedded credentials")
+        if not code.strip():
+            raise ValueError("mission provider code is required")
+        normalized_code = _slug(code)
+        if not normalized_code:
+            raise ValueError("mission provider code must contain letters or numbers")
+        if not re.fullmatch(r"[A-Za-z0-9-]+", api_key_header):
+            raise ValueError("mission provider API key header is required")
+        if timeout_seconds <= 0 or max_response_bytes <= 0:
+            raise ValueError("mission provider timeout and response limit must be positive")
+        self.url = url
+        self.code = normalized_code
+        self.display_name = display_name.strip() or code
+        self.adapter_version = adapter_version
+        self.terms_url = terms_url
+        self.api_key_env = api_key_env
+        self.api_key_header = api_key_header
+        self.timeout_seconds = timeout_seconds
+        self.max_response_bytes = max_response_bytes
+        self._health = ProviderHealth(
+            "unknown", "unknown", None, f"not fetched: {self._safe_endpoint()}"
+        )
+
+    def _safe_endpoint(self) -> str:
+        parsed = urlsplit(self.url)
+        return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
+
+    def describe(self) -> ProviderCapabilities:
+        return ProviderCapabilities(
+            code=self.code,
+            display_name=self.display_name,
+            adapter_version=self.adapter_version,
+            terms_url=self.terms_url,
+            fields=(
+                "theater", "objective", "power_level", "husk_power_level", "biome",
+                "is_four_player", "alert_type", "rewards", "modifiers", "map_position",
+            ),
+        )
+
+    def fetch_rotation(
+        self, now: datetime | None = None, previous_snapshot: RawProviderSnapshot | None = None
+    ) -> RawProviderSnapshot:
+        headers = {
+            "Accept": "application/json",
+            "User-Agent": "stw-intelligence/0.1",
+        }
+        if self.api_key_env:
+            api_key = os.environ.get(self.api_key_env)
+            if not api_key:
+                error = f"required environment variable {self.api_key_env} is not set"
+                self._health = ProviderHealth("unhealthy", "unknown", None, error)
+                raise ValueError(error)
+            headers[self.api_key_header] = api_key
+        if previous_snapshot is not None:
+            if previous_snapshot.etag:
+                headers["If-None-Match"] = previous_snapshot.etag
+            if previous_snapshot.last_modified:
+                headers["If-Modified-Since"] = previous_snapshot.last_modified
+        request = urllib.request.Request(self.url, headers=headers)
+        try:
+            opener = urllib.request.build_opener(_NoRedirectHandler())
+            with opener.open(request, timeout=self.timeout_seconds) as response:
+                content_type = response.headers.get_content_type()
+                if content_type != "application/json" and not content_type.endswith("+json"):
+                    raise ValueError(f"mission provider returned {content_type}, expected JSON")
+                payload = response.read(self.max_response_bytes + 1)
+                if len(payload) > self.max_response_bytes:
+                    raise ValueError("mission provider response exceeds configured size limit")
+                raw = payload.decode("utf-8-sig")
+                snapshot = RawProviderSnapshot(
+                    raw_payload=raw,
+                    fetched_at=_now_iso(now),
+                    source_timestamp=_source_timestamp(raw),
+                    etag=response.headers.get("ETag"),
+                    last_modified=response.headers.get("Last-Modified"),
+                )
+        except urllib.error.HTTPError as error:
+            if error.code == 304 and previous_snapshot is not None:
+                snapshot = RawProviderSnapshot(
+                    raw_payload=previous_snapshot.raw_payload,
+                    fetched_at=_now_iso(now),
+                    source_timestamp=previous_snapshot.source_timestamp,
+                    etag=error.headers.get("ETag") or previous_snapshot.etag,
+                    last_modified=error.headers.get("Last-Modified")
+                    or previous_snapshot.last_modified,
+                )
+            else:
+                detail = f"mission provider HTTP {error.code}: {self._safe_endpoint()}"
+                self._health = ProviderHealth("unhealthy", "unknown", None, detail)
+                raise RuntimeError(detail) from error
+        except (OSError, UnicodeError, ValueError) as error:
+            detail = f"mission provider fetch failed: {type(error).__name__}: {error}"
+            self._health = ProviderHealth("unhealthy", "unknown", None, detail)
+            raise RuntimeError(detail) from error
+        try:
+            rotation = self.normalize(snapshot)
+        except (AttributeError, ValueError, KeyError, TypeError, json.JSONDecodeError) as error:
+            detail = f"mission provider payload is invalid: {error}"
+            self._health = ProviderHealth("unhealthy", "unknown", None, detail)
+            raise ValueError(detail) from error
+        self._health = _rotation_health(rotation, now, self._safe_endpoint())
+        return snapshot
+
+    def health(self, now: datetime | None = None) -> ProviderHealth:
+        if self._health.valid_until is None:
+            return self._health
+        freshness = _freshness(self._health.valid_until, now)
+        return ProviderHealth(
+            self._health.status,
+            freshness,
+            self._health.valid_until,
+            self._health.detail,
+        )
+
+
+def _source_timestamp(raw_payload: str) -> str | None:
+    document = json.loads(raw_payload)
+    rotation = document.get("rotation", {}) if isinstance(document, dict) else {}
+    return _optional_text(rotation.get("source_timestamp")) if isinstance(rotation, dict) else None
+
+
+def _freshness(valid_until: str, now: datetime | None = None) -> str:
+    instant = now or datetime.now(timezone.utc)
+    if instant.tzinfo is None:
+        instant = instant.replace(tzinfo=timezone.utc)
+    return "current" if instant < _parse_time(valid_until) else "stale"
+
+
+def _rotation_health(
+    rotation: NormalizedRotation, now: datetime | None, detail: str
+) -> ProviderHealth:
+    instant = now or datetime.now(timezone.utc)
+    if instant.tzinfo is None:
+        instant = instant.replace(tzinfo=timezone.utc)
+    freshness = (
+        "future" if instant < _parse_time(rotation.valid_from)
+        else "current" if instant < _parse_time(rotation.valid_until)
+        else "stale"
+    )
+    return ProviderHealth("healthy", freshness, rotation.valid_until, detail)
+
+
 def _optional_text(value: object) -> str | None:
     return str(value) if value is not None and str(value) else None
 
@@ -349,13 +523,38 @@ def _reward_kind(value: str) -> str:
     return kind if kind in {"alert", "repeatable", "base"} else "other"
 
 
+def latest_provider_snapshot(
+    connection: sqlite3.Connection, provider_code: str
+) -> RawProviderSnapshot | None:
+    row = connection.execute(
+        """
+        SELECT ps.* FROM provider_snapshots ps
+        JOIN providers p ON p.id=ps.provider_id
+        WHERE p.code=? AND ps.parse_status='parsed'
+        ORDER BY ps.fetched_at DESC, ps.id DESC LIMIT 1
+        """,
+        (provider_code,),
+    ).fetchone()
+    if row is None:
+        return None
+    return RawProviderSnapshot(
+        raw_payload=row["raw_payload"],
+        fetched_at=row["fetched_at"],
+        source_timestamp=row["source_timestamp"],
+        etag=row["etag"],
+        last_modified=row["last_modified"],
+    )
+
+
 def ingest_provider_rotation(
     connection: sqlite3.Connection,
     provider: MissionProvider,
     now: datetime | None = None,
 ) -> dict[str, int]:
     capabilities = provider.describe()
-    snapshot = provider.fetch_rotation(now)
+    snapshot = provider.fetch_rotation(
+        now, latest_provider_snapshot(connection, capabilities.code)
+    )
     rotation = provider.normalize(snapshot)
     payload_hash = hashlib.sha256(snapshot.raw_payload.encode("utf-8")).hexdigest()
     counters = {

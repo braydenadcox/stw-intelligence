@@ -11,6 +11,7 @@ from pathlib import Path
 from stw_pipeline import connect
 from stw_providers import (
     FixtureProvider,
+    HttpMissionProvider,
     ingest_provider_rotation,
     latest_rotation_id,
     match_rotation,
@@ -179,6 +180,18 @@ def main() -> int:
     commands = parser.add_subparsers(dest="command", required=True)
     ingest = commands.add_parser("ingest-fixture", help="ingest and correlate a local fixture")
     ingest.add_argument("fixture", type=Path)
+    ingest_url = commands.add_parser(
+        "ingest-url", help="ingest an approved normalized HTTPS mission feed"
+    )
+    ingest_url.add_argument("url")
+    ingest_url.add_argument("--provider-code", required=True)
+    ingest_url.add_argument("--provider-name", required=True)
+    ingest_url.add_argument("--terms-url")
+    ingest_url.add_argument("--api-key-env")
+    ingest_url.add_argument("--api-key-header", default="API-Key")
+    ingest_url.add_argument(
+        "--allow-http", action="store_true", help="local development only"
+    )
     rotation = commands.add_parser("rotation", help="show provider rotation provenance")
     rotation.add_argument("--rotation", type=int)
     missions = commands.add_parser("missions", help="list normalized external missions")
@@ -204,6 +217,28 @@ def main() -> int:
             ingestion = ingest_provider_rotation(connection, FixtureProvider(args.fixture))
             matching = match_rotation(connection, ingestion["rotation_id"])
             print(json.dumps({"ingestion": ingestion, "matching": matching}, indent=2))
+        elif args.command == "ingest-url":
+            provider = HttpMissionProvider(
+                args.url,
+                code=args.provider_code,
+                display_name=args.provider_name,
+                terms_url=args.terms_url,
+                api_key_env=args.api_key_env,
+                api_key_header=args.api_key_header,
+                allow_insecure_http=args.allow_http,
+            )
+            ingestion = ingest_provider_rotation(connection, provider)
+            matching = match_rotation(connection, ingestion["rotation_id"])
+            print(
+                json.dumps(
+                    {
+                        "ingestion": ingestion,
+                        "matching": matching,
+                        "health": provider.health().__dict__,
+                    },
+                    indent=2,
+                )
+            )
         elif args.command == "rotation":
             print_rotation(connection, _rotation_id(connection, args.rotation))
         elif args.command == "missions":
@@ -220,7 +255,7 @@ def main() -> int:
                 args.evidence,
             )
         return 0
-    except ValueError as error:
+    except (OSError, RuntimeError, ValueError) as error:
         parser.error(str(error))
     finally:
         connection.close()

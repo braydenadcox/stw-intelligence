@@ -76,3 +76,34 @@ python tools/stw_app.py --log "C:\path\to\FortniteGame.log" --db data/stw-intell
 For a deliberate one-time replay of an existing log, add `--from-start`. The local API
 provides `/api/current`, `/api/attempts`, `/api/attempts/<id>`,
 `/api/missions/current`, `/api/correlation/current`, and `/api/health`.
+
+## Approved live mission feed
+
+The bundled FortniteDB v1 API specification does not expose full current mission rows,
+so the application does not scrape FortniteDB or pretend its summary endpoint is a mission
+rotation. An approved HTTPS JSON feed can be connected without changing the database or
+matcher. Its payload must follow [the normalized feed contract](docs/provider-feed-contract.md).
+
+Keep credentials out of command history by storing the key in an environment variable:
+
+```powershell
+$env:STW_PROVIDER_API_KEY = "your-provider-key"
+python tools/stw_app.py `
+  --provider-url "https://provider.example/stw/rotation" `
+  --provider-code "approved_feed" `
+  --provider-name "Approved STW mission feed" `
+  --provider-api-key-env "STW_PROVIDER_API_KEY" `
+  --provider-api-key-header "API-Key"
+```
+
+The app caches a healthy feed through its `valid_until` time, refreshes just after expiry,
+uses `ETag`/`Last-Modified` validators when supplied, and keeps the last good rotation if
+a refresh fails. Failed refreshes retry every five minutes by default. Runtime fetch status
+is available from `/api/health`. To ingest once:
+
+```powershell
+python tools/stw_missions.py ingest-url "https://provider.example/stw/rotation" `
+  --provider-code "approved_feed" `
+  --provider-name "Approved STW mission feed" `
+  --api-key-env "STW_PROVIDER_API_KEY"
+```

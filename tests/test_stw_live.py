@@ -4,15 +4,20 @@ import json
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
-from stw_app import ApiApplication  # noqa: E402
+from stw_app import ApiApplication, ProviderRefreshLoop  # noqa: E402
 from stw_live import LogWatcher  # noqa: E402
 from stw_pipeline import connect  # noqa: E402
-from stw_providers import FixtureProvider, ingest_provider_rotation  # noqa: E402
+from stw_providers import (  # noqa: E402
+    FixtureProvider,
+    ProviderHealth,
+    ingest_provider_rotation,
+)
 from stw_queries import recent_attempts  # noqa: E402
 
 
@@ -71,6 +76,51 @@ def append(path: Path, text: str) -> None:
 
 
 class LiveWatcherTests(unittest.TestCase):
+    def test_provider_refresh_failure_keeps_last_good_rotation(self) -> None:
+        class ToggleProvider(FixtureProvider):
+            fail = False
+
+            def fetch_rotation(self, now=None, previous_snapshot=None):
+                if self.fail:
+                    raise RuntimeError("simulated provider outage")
+                return super().fetch_rotation(now, previous_snapshot)
+
+            def health(self, now=None):
+                if self.fail:
+                    return ProviderHealth(
+                        "unhealthy", "unknown", None, "simulated provider outage"
+                    )
+                return super().health(now)
+
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "provider-refresh.sqlite3"
+            provider = ToggleProvider(FIXTURE)
+            refresh = ProviderRefreshLoop(database, provider, refresh_seconds=5)
+            first = refresh.refresh_once()
+            next_wait = refresh._next_wait_seconds(
+                datetime(2026, 8, 8, 12, tzinfo=timezone.utc)
+            )
+            provider.fail = True
+            failed = refresh.refresh_once()
+            connection = connect(database)
+            try:
+                mission_count = connection.execute(
+                    "SELECT COUNT(*) FROM external_missions"
+                ).fetchone()[0]
+            finally:
+                connection.close()
+            status, _, body = ApiApplication(
+                database, provider_status=refresh.status
+            ).dispatch("GET", "/api/health")
+            health = json.loads(body)
+
+        self.assertEqual("healthy", first["status"])
+        self.assertEqual(43230.0, next_wait)
+        self.assertEqual("unhealthy", failed["status"])
+        self.assertEqual(2, mission_count)
+        self.assertEqual(200, status)
+        self.assertEqual("unhealthy", health["provider_runtime"]["status"])
+
     def test_append_buffer_restart_state_persistence_and_api(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

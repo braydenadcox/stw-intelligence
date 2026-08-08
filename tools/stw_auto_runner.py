@@ -78,11 +78,15 @@ def app_is_running(timeout: float = 0.5) -> bool:
 def open_dashboard_url(url: str) -> bool:
     """Open a URL through the interactive Windows shell, with a portable fallback."""
     if sys.platform == "win32":
-        result = ctypes.windll.shell32.ShellExecuteW(
-            None, "open", url, None, str(ROOT), 1
-        )
-        if int(result) > 32:
+        try:
+            subprocess.Popen(
+                ["explorer.exe", url],
+                cwd=ROOT,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
             return True
+        except OSError:
+            pass
     return bool(webbrowser.open(url))
 
 

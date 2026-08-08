@@ -1,16 +1,23 @@
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 import threading
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 from stw_app import ProcessLifetimeMonitor, process_exists  # noqa: E402
-from stw_auto_runner import DASHBOARD_URL, supervise_once  # noqa: E402
+from stw_auto_runner import (  # noqa: E402
+    DASHBOARD_URL,
+    ROOT as RUNNER_ROOT,
+    open_dashboard_url,
+    supervise_once,
+)
 
 
 class FakeChild:
@@ -31,6 +38,15 @@ class FakeChild:
 
 
 class AutoRunnerTests(unittest.TestCase):
+    @patch("stw_auto_runner.subprocess.Popen")
+    def test_browser_uses_interactive_windows_shell(self, popen) -> None:
+        self.assertTrue(open_dashboard_url(DASHBOARD_URL))
+        popen.assert_called_once_with(
+            ["explorer.exe", DASHBOARD_URL],
+            cwd=RUNNER_ROOT,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+
     def test_waits_without_launching_when_fortnite_is_closed(self) -> None:
         launched = []
         result = supervise_once(

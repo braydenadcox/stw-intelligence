@@ -764,6 +764,224 @@ MIGRATIONS = [
         attestation_text TEXT NOT NULL,
         recorded_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     );
+    """,
+    """
+    CREATE TABLE catalog_weapon_identities (
+        id INTEGER PRIMARY KEY,
+        snapshot_id INTEGER NOT NULL REFERENCES asset_snapshots(id) ON DELETE CASCADE,
+        identity_key TEXT NOT NULL,
+        display_name TEXT NOT NULL,
+        description TEXT,
+        weapon_kind TEXT NOT NULL CHECK (weapon_kind IN ('ranged', 'melee')),
+        identity_evidence TEXT NOT NULL
+            CHECK (identity_evidence IN ('localized_display_and_kind', 'variant_only')),
+        UNIQUE (snapshot_id, identity_key)
+    );
+    CREATE TABLE catalog_weapon_slot_loadouts (
+        id INTEGER PRIMARY KEY,
+        snapshot_id INTEGER NOT NULL REFERENCES asset_snapshots(id) ON DELETE CASCADE,
+        loadout_row_name TEXT NOT NULL,
+        source_data_row_id INTEGER REFERENCES catalog_data_rows(id),
+        interpretation_status TEXT NOT NULL
+            CHECK (interpretation_status IN ('supported', 'partial')),
+        UNIQUE (snapshot_id, loadout_row_name)
+    );
+    CREATE TABLE catalog_weapon_variants (
+        id INTEGER PRIMARY KEY,
+        snapshot_id INTEGER NOT NULL REFERENCES asset_snapshots(id) ON DELETE CASCADE,
+        identity_id INTEGER NOT NULL
+            REFERENCES catalog_weapon_identities(id) ON DELETE CASCADE,
+        source_object_id INTEGER NOT NULL UNIQUE REFERENCES asset_objects(id),
+        variant_key TEXT NOT NULL,
+        primary_asset_name TEXT NOT NULL,
+        package_path TEXT NOT NULL,
+        object_type TEXT NOT NULL,
+        rarity TEXT,
+        tier TEXT,
+        max_tier TEXT,
+        display_tier TEXT,
+        trigger_type TEXT,
+        weapon_actor_path TEXT,
+        stat_table_path TEXT,
+        stat_row_name TEXT,
+        stat_data_row_id INTEGER REFERENCES catalog_data_rows(id),
+        slot_loadout_row TEXT,
+        slot_loadout_id INTEGER REFERENCES catalog_weapon_slot_loadouts(id),
+        baseline_slot_loadout_row TEXT,
+        baseline_slot_loadout_id INTEGER REFERENCES catalog_weapon_slot_loadouts(id),
+        base_alteration_path TEXT,
+        primary_fire_ability_path TEXT,
+        ammo_data_path TEXT,
+        tags_json TEXT NOT NULL DEFAULT '[]',
+        traits_json TEXT NOT NULL DEFAULT '[]',
+        interpretation_status TEXT NOT NULL
+            CHECK (interpretation_status IN ('supported', 'partial')),
+        UNIQUE (snapshot_id, variant_key),
+        UNIQUE (snapshot_id, primary_asset_name)
+    );
+    CREATE INDEX catalog_weapon_variants_identity_idx
+        ON catalog_weapon_variants(identity_id, rarity, tier);
+    CREATE TABLE catalog_weapon_stats (
+        id INTEGER PRIMARY KEY,
+        weapon_variant_id INTEGER NOT NULL UNIQUE
+            REFERENCES catalog_weapon_variants(id) ON DELETE CASCADE,
+        source_data_row_id INTEGER NOT NULL REFERENCES catalog_data_rows(id),
+        base_level INTEGER,
+        named_weight_row TEXT,
+        damage_point_blank REAL,
+        damage_mid REAL,
+        damage_long REAL,
+        damage_max_range REAL,
+        environmental_damage REAL,
+        impact_damage REAL,
+        damage_scale REAL,
+        impact_scale REAL,
+        crit_chance REAL,
+        crit_damage_bonus REAL,
+        fire_rate REAL,
+        reload_time REAL,
+        magazine_size INTEGER,
+        durability_per_use REAL,
+        range_point_blank REAL,
+        range_mid REAL,
+        range_long REAL,
+        range_max REAL,
+        raw_stats_json TEXT NOT NULL
+    );
+    CREATE TABLE catalog_schematics (
+        id INTEGER PRIMARY KEY,
+        snapshot_id INTEGER NOT NULL REFERENCES asset_snapshots(id) ON DELETE CASCADE,
+        source_object_id INTEGER NOT NULL UNIQUE REFERENCES asset_objects(id),
+        schematic_key TEXT NOT NULL,
+        package_path TEXT NOT NULL,
+        crafting_table_path TEXT,
+        crafting_row_name TEXT,
+        crafting_data_row_id INTEGER REFERENCES catalog_data_rows(id),
+        result_asset_type TEXT,
+        result_primary_asset_name TEXT,
+        result_quantity INTEGER,
+        weapon_variant_id INTEGER REFERENCES catalog_weapon_variants(id) ON DELETE SET NULL,
+        link_status TEXT NOT NULL
+            CHECK (link_status IN ('resolved', 'unresolved', 'ambiguous', 'not_applicable')),
+        rarity TEXT,
+        tier TEXT,
+        max_tier TEXT,
+        rating_curve_path TEXT,
+        rating_row_name TEXT,
+        tags_json TEXT NOT NULL DEFAULT '[]',
+        traits_json TEXT NOT NULL DEFAULT '[]',
+        UNIQUE (snapshot_id, schematic_key)
+    );
+    CREATE INDEX catalog_schematics_result_idx
+        ON catalog_schematics(snapshot_id, result_asset_type, result_primary_asset_name);
+    CREATE TABLE catalog_schematic_costs (
+        id INTEGER PRIMARY KEY,
+        schematic_id INTEGER NOT NULL REFERENCES catalog_schematics(id) ON DELETE CASCADE,
+        cost_ordinal INTEGER NOT NULL,
+        item_asset_type TEXT NOT NULL,
+        item_primary_asset_name TEXT NOT NULL,
+        quantity INTEGER NOT NULL,
+        UNIQUE (schematic_id, cost_ordinal)
+    );
+    CREATE TABLE catalog_alterations (
+        id INTEGER PRIMARY KEY,
+        snapshot_id INTEGER NOT NULL REFERENCES asset_snapshots(id) ON DELETE CASCADE,
+        source_object_id INTEGER NOT NULL UNIQUE REFERENCES asset_objects(id),
+        alteration_key TEXT NOT NULL,
+        package_path TEXT NOT NULL,
+        display_name TEXT,
+        description TEXT,
+        rarity TEXT,
+        ability_set_path TEXT,
+        ability_kit_id INTEGER REFERENCES catalog_ability_kits(id),
+        tags_json TEXT NOT NULL DEFAULT '[]',
+        semantic_status TEXT NOT NULL
+            CHECK (semantic_status IN ('supported', 'partial', 'opaque')),
+        UNIQUE (snapshot_id, alteration_key)
+    );
+    CREATE TABLE catalog_weapon_slots (
+        id INTEGER PRIMARY KEY,
+        slot_loadout_id INTEGER NOT NULL
+            REFERENCES catalog_weapon_slot_loadouts(id) ON DELETE CASCADE,
+        slot_ordinal INTEGER NOT NULL,
+        unlock_level INTEGER,
+        unlock_rarity TEXT,
+        slot_definition_row TEXT,
+        alteration_group_row TEXT,
+        respeccable INTEGER,
+        initial_rarity_min TEXT,
+        initial_rarity_max TEXT,
+        interpretation_status TEXT NOT NULL
+            CHECK (interpretation_status IN ('supported', 'partial')),
+        UNIQUE (slot_loadout_id, slot_ordinal)
+    );
+    CREATE TABLE catalog_weapon_slot_options (
+        id INTEGER PRIMARY KEY,
+        weapon_slot_id INTEGER NOT NULL REFERENCES catalog_weapon_slots(id) ON DELETE CASCADE,
+        option_ordinal INTEGER NOT NULL,
+        perk_rarity TEXT NOT NULL,
+        alteration_primary_asset_name TEXT NOT NULL,
+        alteration_id INTEGER REFERENCES catalog_alterations(id) ON DELETE SET NULL,
+        initial_roll_weight INTEGER,
+        exclusion_names_json TEXT NOT NULL DEFAULT '[]',
+        UNIQUE (weapon_slot_id, perk_rarity, option_ordinal)
+    );
+    """,
+    """
+    CREATE INDEX catalog_ability_kit_grants_kit_idx
+        ON catalog_ability_kit_grants(ability_kit_id);
+    CREATE INDEX catalog_ability_kit_grants_ability_idx
+        ON catalog_ability_kit_grants(ability_id);
+    CREATE INDEX catalog_ability_kit_grants_effect_idx
+        ON catalog_ability_kit_grants(gameplay_effect_id);
+    CREATE INDEX catalog_ability_kits_snapshot_idx
+        ON catalog_ability_kits(snapshot_id);
+    CREATE INDEX catalog_ability_links_target_idx
+        ON catalog_ability_links(target_ability_id);
+    CREATE INDEX catalog_alterations_ability_kit_idx
+        ON catalog_alterations(ability_kit_id);
+    CREATE INDEX catalog_effect_modifiers_magnitude_idx
+        ON catalog_effect_modifiers(magnitude_id);
+    CREATE INDEX catalog_effect_modifiers_curve_idx
+        ON catalog_effect_modifiers(curve_row_id);
+    CREATE INDEX catalog_gameplay_effects_snapshot_idx
+        ON catalog_gameplay_effects(snapshot_id);
+    CREATE INDEX catalog_gameplay_tag_occurrences_object_idx
+        ON catalog_gameplay_tag_occurrences(source_object_id);
+    CREATE INDEX catalog_hero_abilities_ability_kit_idx
+        ON catalog_hero_abilities(ability_kit_id);
+    CREATE INDEX catalog_hero_class_kits_ability_kit_idx
+        ON catalog_hero_class_kits(ability_kit_id);
+    CREATE INDEX catalog_hero_perks_perk_idx
+        ON catalog_hero_perks(perk_id);
+    CREATE INDEX catalog_heroes_class_idx
+        ON catalog_heroes(hero_class_id);
+    CREATE INDEX catalog_inheritance_edges_source_object_idx
+        ON catalog_inheritance_edges(source_object_id);
+    CREATE INDEX catalog_inheritance_edges_target_object_idx
+        ON catalog_inheritance_edges(target_object_id);
+    CREATE INDEX catalog_magnitudes_curve_idx
+        ON catalog_magnitudes(curve_row_id);
+    CREATE INDEX catalog_mechanics_magnitude_idx
+        ON catalog_mechanics(magnitude_id);
+    CREATE INDEX catalog_perks_ability_kit_idx
+        ON catalog_perks(ability_kit_id);
+    CREATE INDEX catalog_schematics_data_row_idx
+        ON catalog_schematics(crafting_data_row_id);
+    CREATE INDEX catalog_schematics_weapon_variant_idx
+        ON catalog_schematics(weapon_variant_id);
+    CREATE INDEX catalog_weapon_slot_loadouts_data_row_idx
+        ON catalog_weapon_slot_loadouts(source_data_row_id);
+    CREATE INDEX catalog_weapon_slot_options_alteration_idx
+        ON catalog_weapon_slot_options(alteration_id);
+    CREATE INDEX catalog_weapon_stats_data_row_idx
+        ON catalog_weapon_stats(source_data_row_id);
+    CREATE INDEX catalog_weapon_variants_stat_data_row_idx
+        ON catalog_weapon_variants(stat_data_row_id);
+    CREATE INDEX catalog_weapon_variants_slot_loadout_idx
+        ON catalog_weapon_variants(slot_loadout_id);
+    CREATE INDEX catalog_weapon_variants_baseline_loadout_idx
+        ON catalog_weapon_variants(baseline_slot_loadout_id);
     """
 ]
 

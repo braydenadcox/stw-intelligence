@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "scopes": [
+    {
+      "kind": "folder",
+      "path": "/SaveTheWorld/Items/Weapons"
+    },
+    {
+      "kind": "folder",
+      "path": "/SaveTheWorld/Items/Alteration_v2"
+    },
+    {
+      "kind": "folder",
+      "path": "/SaveTheWorld/Items/Alterations"
+    },
+    {
+      "kind": "folder",
+      "path": "/SaveTheWorld/Items/Datatables"
+    },
+    {
+      "kind": "folder",
+      "path": "/SaveTheWorld/Abilities/Weapons"
+    }
+  ]
+}

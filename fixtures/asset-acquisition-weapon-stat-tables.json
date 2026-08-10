@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "scopes": [
+    {
+      "kind": "package",
+      "path": "/Game/Items/Datatables/RangedWeapons"
+    },
+    {
+      "kind": "package",
+      "path": "/Game/Items/Datatables/MeleeWeapons"
+    }
+  ]
+}

@@ -76,6 +76,9 @@ python tools/stw_assets.py queue
 python tools/stw_assets.py queue --max-priority 0 --paths-only
 python tools/stw_assets.py roster
 python tools/stw_assets.py perk "AssaultDamage"
+python tools/stw_assets.py weapon-coverage
+python tools/stw_assets.py weapons --query "Nocturno"
+python tools/stw_assets.py weapon "Nocturno"
 python tools/stw_assets.py batch-plan
 python tools/stw_assets.py roster-receipt --confirm-complete-recursive-export
 ```
@@ -126,6 +129,15 @@ export batches (HGD identities, HID variants, hero/leader perk implementations, 
 GameplayEffect/ability bases, and the hero-perk balance table), then groups any remaining
 transitive references into deduplicated follow-up folders. Cosmetics, UI, progression,
 and unrelated active-ability assets are excluded from this workflow.
+
+The weapon catalog uses explicit Unreal primary-asset identities and recipe table rows to
+link schematics to ranged/melee weapon variants. It normalizes base stats, crafting costs,
+perk-slot loadouts, allowed alteration choices, and statically supported alteration
+semantics with source-object/data-row provenance. Friendly display-name groups are for
+catalog browsing only: same-named variants are not assumed to share one implementation,
+and ambiguous or missing structural links remain unresolved. See
+[weapon and schematic catalog](docs/weapon-schematic-catalog.md) for the model and
+coverage rules.
 
 The first deterministic consumer can search optimization-ready perk families and assemble
 an auditable commander/support result from exact normalized attributes, tags, and mechanics:

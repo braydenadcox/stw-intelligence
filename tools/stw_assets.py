@@ -8,6 +8,8 @@ import hashlib
 import json
 import re
 import sqlite3
+import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Iterator
@@ -16,7 +18,7 @@ from stw_pipeline import connect
 
 
 PERK_KIT_RE = re.compile(r"^Kit_Perk_H_(?P<family>.+)_(?P<tier>T\d+)$")
-NORMALIZER_VERSION = "phase2-v11"
+NORMALIZER_VERSION = "phase2-v13"
 ROSTER_PLAN_VERSION = "phase2-roster-v1"
 
 STW_HERO_CLASSES = ("Commando", "Constructor", "Ninja", "Outlander")
@@ -31,6 +33,11 @@ SEMANTIC_DEPENDENCY_CATEGORIES = {
     "custom_calculation",
     "granted_ability",
     "ability_mechanic",
+    "weapon_recipe_table",
+    "weapon_stat_table",
+    "weapon_alteration_ability_set",
+    "weapon_base_alteration",
+    "weapon_ammo_definition",
 }
 
 
@@ -365,24 +372,28 @@ def _snapshot_payloads(
     connection: sqlite3.Connection, snapshot_id: int
 ) -> dict[int, dict[str, Any]]:
     payloads: dict[int, dict[str, Any]] = {}
-    files = connection.execute(
-        "SELECT id, source_path FROM asset_files WHERE snapshot_id=? ORDER BY id",
+    object_rows_by_file: dict[tuple[int, str], list[sqlite3.Row]] = {}
+    for row in connection.execute(
+        """
+        SELECT file_row.id AS file_id, file_row.source_path,
+               object_row.id, object_row.export_index
+        FROM asset_files file_row
+        JOIN asset_objects object_row ON object_row.asset_file_id=file_row.id
+        WHERE file_row.snapshot_id=?
+        ORDER BY file_row.id, object_row.export_index
+        """,
         (snapshot_id,),
-    ).fetchall()
-    for file_row in files:
-        exports = _load_exports(Path(file_row["source_path"]))
-        object_rows = connection.execute(
-            """
-            SELECT id, export_index FROM asset_objects
-            WHERE asset_file_id=? ORDER BY export_index
-            """,
-            (file_row["id"],),
-        ).fetchall()
+    ):
+        object_rows_by_file.setdefault(
+            (row["file_id"], row["source_path"]), []
+        ).append(row)
+    for (_, source_path), object_rows in object_rows_by_file.items():
+        exports = _load_exports(Path(source_path))
         for object_row in object_rows:
             index = object_row["export_index"]
             if index >= len(exports):
                 raise ValueError(
-                    f"export index {index} missing from {file_row['source_path']}"
+                    f"export index {index} missing from {source_path}"
                 )
             payloads[object_row["id"]] = exports[index]
     return payloads
@@ -391,7 +402,41 @@ def _snapshot_payloads(
 def _clear_normalized_snapshot(
     connection: sqlite3.Connection, snapshot_id: int
 ) -> None:
+    # Delete leaf rows explicitly before their parents. Most leaf tables predate
+    # the large roster catalog and do not carry snapshot_id themselves; relying
+    # on SQLite's row-by-row ON DELETE CASCADE made a full re-normalization
+    # quadratic once tens of thousands of weapon slot options were present.
+    leaf_deletes = (
+        "DELETE FROM catalog_schematic_costs WHERE schematic_id IN "
+        "(SELECT id FROM catalog_schematics WHERE snapshot_id=?)",
+        "DELETE FROM catalog_weapon_stats WHERE weapon_variant_id IN "
+        "(SELECT id FROM catalog_weapon_variants WHERE snapshot_id=?)",
+        "DELETE FROM catalog_weapon_slot_options WHERE weapon_slot_id IN "
+        "(SELECT slot.id FROM catalog_weapon_slots slot JOIN "
+        "catalog_weapon_slot_loadouts loadout ON loadout.id=slot.slot_loadout_id "
+        "WHERE loadout.snapshot_id=?)",
+        "DELETE FROM catalog_weapon_slots WHERE slot_loadout_id IN "
+        "(SELECT id FROM catalog_weapon_slot_loadouts WHERE snapshot_id=?)",
+        "DELETE FROM catalog_hero_perks WHERE hero_id IN "
+        "(SELECT id FROM catalog_heroes WHERE snapshot_id=?)",
+        "DELETE FROM catalog_hero_abilities WHERE hero_id IN "
+        "(SELECT id FROM catalog_heroes WHERE snapshot_id=?)",
+        "DELETE FROM catalog_hero_variants WHERE hero_id IN "
+        "(SELECT id FROM catalog_heroes WHERE snapshot_id=?)",
+        "DELETE FROM catalog_ability_kit_grants WHERE ability_kit_id IN "
+        "(SELECT id FROM catalog_ability_kits WHERE snapshot_id=?)",
+        "DELETE FROM catalog_effect_modifiers WHERE gameplay_effect_id IN "
+        "(SELECT id FROM catalog_gameplay_effects WHERE snapshot_id=?)",
+        "DELETE FROM catalog_gameplay_tag_occurrences WHERE tag_id IN "
+        "(SELECT id FROM catalog_gameplay_tags WHERE snapshot_id=?)",
+    )
+    for statement in leaf_deletes:
+        connection.execute(statement, (snapshot_id,))
     for table in (
+        "catalog_schematics",
+        "catalog_weapon_identities",
+        "catalog_weapon_slot_loadouts",
+        "catalog_alterations",
         "catalog_mechanics",
         "catalog_opaque_mechanics",
         "catalog_inheritance_edges",
@@ -414,13 +459,33 @@ def _clear_normalized_snapshot(
 def _renormalize_existing_snapshot(
     connection: sqlite3.Connection, snapshot_id: int
 ) -> dict[str, Any]:
+    total_started = time.monotonic()
+    started = time.monotonic()
     payloads = _snapshot_payloads(connection, snapshot_id)
+    report_timing = len(payloads) >= 1_000
+    if report_timing:
+        print(
+            f"loaded snapshot payloads in {time.monotonic() - started:.2f}s",
+            file=sys.stderr,
+            flush=True,
+        )
     with connection:
         _start_normalization_run(connection, snapshot_id)
     try:
         with connection:
+            started = time.monotonic()
             _clear_normalized_snapshot(connection, snapshot_id)
-            _resolve_references(connection, snapshot_id)
+            if report_timing:
+                print(
+                    f"cleared derived catalog in {time.monotonic() - started:.2f}s",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            # An idempotent re-normalization reuses an immutable asset snapshot.
+            # Its object/reference graph was already resolved before the snapshot
+            # became ready; only derived catalog rows depend on the normalizer
+            # version. Re-resolving hundreds of thousands of unchanged references
+            # made normalizer upgrades unnecessarily expensive.
             _normalize_snapshot(connection, snapshot_id, payloads)
         with connection:
             _finish_normalization_run(connection, snapshot_id, "ready")
@@ -428,6 +493,12 @@ def _renormalize_existing_snapshot(
         with connection:
             _finish_normalization_run(connection, snapshot_id, "failed", str(error))
         raise
+    if report_timing:
+        print(
+            f"re-normalized snapshot in {time.monotonic() - total_started:.2f}s",
+            file=sys.stderr,
+            flush=True,
+        )
     return _snapshot_summary(connection, snapshot_id, idempotent=False)
 
 
@@ -478,17 +549,30 @@ def _normalize_snapshot(
     snapshot_id: int,
     payloads: dict[int, dict[str, Any]],
 ) -> None:
-    _normalize_curves(connection, snapshot_id, payloads)
-    _normalize_data_tables(connection, snapshot_id, payloads)
-    _normalize_inheritance(connection, snapshot_id)
-    _normalize_hero_classes(connection, snapshot_id, payloads)
-    _normalize_effects(connection, snapshot_id, payloads)
-    _normalize_ability_kits(connection, snapshot_id, payloads)
-    _normalize_hero_class_kits(connection, snapshot_id)
-    _normalize_heroes(connection, snapshot_id, payloads)
-    _normalize_gameplay_tags(connection, snapshot_id, payloads)
-    _link_modifier_curves(connection, snapshot_id)
-    _link_magnitude_curves(connection, snapshot_id)
+    report_timing = len(payloads) >= 1_000
+    steps = (
+        ("curves", _normalize_curves, (connection, snapshot_id, payloads)),
+        ("data tables", _normalize_data_tables, (connection, snapshot_id, payloads)),
+        ("inheritance", _normalize_inheritance, (connection, snapshot_id)),
+        ("hero classes", _normalize_hero_classes, (connection, snapshot_id, payloads)),
+        ("effects", _normalize_effects, (connection, snapshot_id, payloads)),
+        ("ability kits", _normalize_ability_kits, (connection, snapshot_id, payloads)),
+        ("hero class kits", _normalize_hero_class_kits, (connection, snapshot_id)),
+        ("heroes", _normalize_heroes, (connection, snapshot_id, payloads)),
+        ("weapons", _normalize_weapon_catalog, (connection, snapshot_id, payloads)),
+        ("gameplay tags", _normalize_gameplay_tags, (connection, snapshot_id, payloads)),
+        ("modifier curves", _link_modifier_curves, (connection, snapshot_id)),
+        ("magnitude curves", _link_magnitude_curves, (connection, snapshot_id)),
+    )
+    for label, operation, arguments in steps:
+        started = time.monotonic()
+        operation(*arguments)
+        if report_timing:
+            print(
+                f"normalized {label} in {time.monotonic() - started:.2f}s",
+                file=sys.stderr,
+                flush=True,
+            )
 
 
 def _normalize_curves(
@@ -1131,7 +1215,11 @@ def _normalize_effect_mechanics(
 def _is_ability_kit(
     export: dict[str, Any], object_id: int, structurally_referenced: set[int]
 ) -> bool:
-    return "AbilityKit" in str(export.get("Type")) or object_id in structurally_referenced
+    return (
+        "AbilityKit" in str(export.get("Type"))
+        or export.get("Type") == "FortAbilitySet"
+        or object_id in structurally_referenced
+    )
 
 
 def _normalize_ability_kits(
@@ -1852,6 +1940,596 @@ def _kit_id_for_path(
         (snapshot_id, package),
     ).fetchone()
     return row["id"] if row else None
+
+
+def _data_list_facts(properties: dict[str, Any]) -> dict[str, Any]:
+    facts: dict[str, Any] = {}
+    for item in properties.get("DataList") or []:
+        if not isinstance(item, dict):
+            continue
+        for key in ("Rarity", "Tier", "MaxTier", "RatingLookup", "Tags", "Traits"):
+            if key in item:
+                facts[key] = item[key]
+    return facts
+
+
+def _real_value(value: Any) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
+def _integer_value(value: Any) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return int(value)
+
+
+def _table_rows_by_package(
+    payloads: dict[int, dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    return {
+        package.casefold(): export["Rows"]
+        for export in payloads.values()
+        if export.get("Type") == "DataTable"
+        and isinstance(export.get("Rows"), dict)
+        and (package := canonical_package_path(export.get("Package"))) is not None
+    }
+
+
+def _data_row_id(
+    connection: sqlite3.Connection,
+    snapshot_id: int,
+    table_path: str | None,
+    row_name: str | None,
+) -> int | None:
+    package = canonical_package_path(table_path)
+    if not package or not row_name:
+        return None
+    row = connection.execute(
+        """
+        SELECT data_row.id
+        FROM catalog_data_rows data_row
+        JOIN catalog_data_tables data_table ON data_table.id=data_row.data_table_id
+        WHERE data_table.snapshot_id=? AND lower(data_table.package_path)=lower(?)
+          AND data_row.row_name=?
+        """,
+        (snapshot_id, package, row_name),
+    ).fetchone()
+    return row["id"] if row else None
+
+
+def _explicit_weapon_primary_asset_name(properties: dict[str, Any]) -> str | None:
+    names = [
+        value.split(":", 2)[2]
+        for value in properties.get("ActualAnalyticFNames") or []
+        if isinstance(value, str) and value.casefold().startswith("tag:weapon:")
+    ]
+    unique = sorted(set(names), key=str.casefold)
+    return unique[0] if len(unique) == 1 else None
+
+
+def _ability_kit_semantic_flag_index(
+    connection: sqlite3.Connection, snapshot_id: int
+) -> dict[int, tuple[bool, bool]]:
+    inheritance_children: dict[int, set[int]] = {}
+    for row in connection.execute(
+        """
+        SELECT source_object_id, target_object_id
+        FROM catalog_inheritance_edges
+        WHERE snapshot_id=? AND target_object_id IS NOT NULL
+        """,
+        (snapshot_id,),
+    ):
+        inheritance_children.setdefault(row["target_object_id"], set()).add(
+            row["source_object_id"]
+        )
+    supported_objects = {
+        row["source_object_id"]
+        for row in connection.execute(
+            """
+            SELECT DISTINCT gameplay_effect.source_object_id
+            FROM catalog_gameplay_effects gameplay_effect
+            JOIN catalog_effect_modifiers modifier
+              ON modifier.gameplay_effect_id=gameplay_effect.id
+            WHERE gameplay_effect.snapshot_id=?
+              AND modifier.interpretation_status='supported'
+            """,
+            (snapshot_id,),
+        )
+    }
+    opaque_objects = {
+        row["source_object_id"]
+        for row in connection.execute(
+            """
+            SELECT DISTINCT source_object_id FROM catalog_opaque_mechanics
+            WHERE snapshot_id=?
+            """,
+            (snapshot_id,),
+        )
+    }
+    kit_effect_roots: dict[int, set[int]] = {}
+    kit_ability_roots: dict[int, set[int]] = {}
+    for row in connection.execute(
+        """
+        SELECT grant_row.ability_kit_id,
+               gameplay_effect.source_object_id AS effect_object_id,
+               ability.source_object_id AS ability_object_id
+        FROM catalog_ability_kit_grants grant_row
+        JOIN catalog_ability_kits kit ON kit.id=grant_row.ability_kit_id
+        LEFT JOIN catalog_gameplay_effects gameplay_effect
+          ON gameplay_effect.id=grant_row.gameplay_effect_id
+        LEFT JOIN catalog_abilities ability ON ability.id=grant_row.ability_id
+        WHERE kit.snapshot_id=?
+        """,
+        (snapshot_id,),
+    ):
+        if row["effect_object_id"] is not None:
+            kit_effect_roots.setdefault(row["ability_kit_id"], set()).add(
+                row["effect_object_id"]
+            )
+        if row["ability_object_id"] is not None:
+            kit_ability_roots.setdefault(row["ability_kit_id"], set()).add(
+                row["ability_object_id"]
+            )
+    def inherited_by(seed: set[int]) -> set[int]:
+        result = set(seed)
+        frontier = list(seed)
+        while frontier:
+            for child in inheritance_children.get(frontier.pop(), set()):
+                if child not in result:
+                    result.add(child)
+                    frontier.append(child)
+        return result
+
+    supported_or_inherited = inherited_by(supported_objects)
+    opaque_or_inherited = inherited_by(opaque_objects)
+    result: dict[int, tuple[bool, bool]] = {}
+    for kit_id in set(kit_effect_roots) | set(kit_ability_roots):
+        roots = kit_effect_roots.get(kit_id, set()) | kit_ability_roots.get(
+            kit_id, set()
+        )
+        result[kit_id] = (
+            bool(roots & supported_or_inherited),
+            bool(roots & opaque_or_inherited),
+        )
+    return result
+
+
+def _normalize_alterations(
+    connection: sqlite3.Connection,
+    snapshot_id: int,
+    payloads: dict[int, dict[str, Any]],
+) -> dict[str, int]:
+    alterations: dict[str, int] = {}
+    semantic_flags = _ability_kit_semantic_flag_index(connection, snapshot_id)
+    for object_id, export in payloads.items():
+        if export.get("Type") != "FortAlterationItemDefinition":
+            continue
+        properties = export.get("Properties") or {}
+        object_row = connection.execute(
+            "SELECT package_path, object_name FROM asset_objects WHERE id=?", (object_id,)
+        ).fetchone()
+        ability_set_path = _object_path(properties.get("AlterationAbilitySet"))
+        ability_kit_id = None
+        if ability_set_path:
+            ability_kit = connection.execute(
+                """
+                SELECT id FROM catalog_ability_kits
+                WHERE snapshot_id=? AND lower(package_path)=lower(?)
+                """,
+                (snapshot_id, canonical_package_path(ability_set_path)),
+            ).fetchone()
+            ability_kit_id = ability_kit["id"] if ability_kit else None
+        facts = _data_list_facts(properties)
+        supported = False
+        opaque = False
+        if ability_kit_id is not None:
+            supported, opaque = semantic_flags.get(ability_kit_id, (False, False))
+        status = "supported" if supported else "opaque" if opaque else "partial"
+        alteration_key = object_row["object_name"].casefold()
+        alteration_id = connection.execute(
+            """
+            INSERT INTO catalog_alterations(
+                snapshot_id, source_object_id, alteration_key, package_path,
+                display_name, description, rarity, ability_set_path, ability_kit_id,
+                tags_json, semantic_status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                snapshot_id,
+                object_id,
+                alteration_key,
+                object_row["package_path"],
+                _localized_text(properties.get("ItemName")),
+                _localized_text(properties.get("ItemDescription")),
+                facts.get("Rarity"),
+                ability_set_path,
+                ability_kit_id,
+                json.dumps(properties.get("AdditionalGameplayTags") or [], separators=(",", ":")),
+                status,
+            ),
+        ).lastrowid
+        alterations[alteration_key] = alteration_id
+    return alterations
+
+
+def _normalize_weapon_slot_loadouts(
+    connection: sqlite3.Connection,
+    snapshot_id: int,
+    tables: dict[str, dict[str, Any]],
+    alterations: dict[str, int],
+) -> dict[str, int]:
+    loadout_package = "/SaveTheWorld/Items/Alteration_v2/SlotLoadouts"
+    definition_package = "/SaveTheWorld/Items/Alteration_v2/SlotDefs"
+    group_package = "/SaveTheWorld/Items/Alteration_v2/AlterationGroups"
+    loadout_rows = tables.get(loadout_package.casefold(), {})
+    definition_rows = tables.get(definition_package.casefold(), {})
+    group_rows = tables.get(group_package.casefold(), {})
+    result: dict[str, int] = {}
+    for loadout_name, payload in loadout_rows.items():
+        if not isinstance(payload, dict):
+            continue
+        loadout_id = connection.execute(
+            """
+            INSERT INTO catalog_weapon_slot_loadouts(
+                snapshot_id, loadout_row_name, source_data_row_id, interpretation_status
+            ) VALUES (?, ?, ?, 'supported')
+            """,
+            (
+                snapshot_id,
+                loadout_name,
+                _data_row_id(connection, snapshot_id, loadout_package, loadout_name),
+            ),
+        ).lastrowid
+        result[loadout_name] = loadout_id
+        loadout_supported = True
+        for slot_ordinal, slot in enumerate(payload.get("AlterationSlots") or []):
+            if not isinstance(slot, dict):
+                continue
+            definition_name = slot.get("SlotDefinitionRow")
+            definition = definition_rows.get(definition_name) if definition_name else None
+            group_name = definition.get("InitTierGroup") if isinstance(definition, dict) else None
+            group = group_rows.get(group_name) if group_name else None
+            slot_supported = isinstance(definition, dict) and isinstance(group, dict)
+            slot_id = connection.execute(
+                """
+                INSERT INTO catalog_weapon_slots(
+                    slot_loadout_id, slot_ordinal, unlock_level, unlock_rarity,
+                    slot_definition_row, alteration_group_row, respeccable,
+                    initial_rarity_min, initial_rarity_max, interpretation_status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    loadout_id,
+                    slot_ordinal,
+                    _integer_value(slot.get("UnlockLevel")),
+                    slot.get("UnlockRarity"),
+                    definition_name,
+                    group_name,
+                    int(bool(slot.get("bRespeccable"))),
+                    slot.get("SlotInitMin"),
+                    slot.get("SlotInitMax"),
+                    "supported" if slot_supported else "partial",
+                ),
+            ).lastrowid
+            if not isinstance(group, dict):
+                loadout_supported = False
+                continue
+            for rarity_entry in group.get("RarityMapping") or []:
+                if not isinstance(rarity_entry, dict):
+                    continue
+                rarity = str(rarity_entry.get("Key") or "Unknown")
+                value = rarity_entry.get("Value") or {}
+                for option_ordinal, option in enumerate(value.get("WeightData") or []):
+                    if not isinstance(option, dict) or not option.get("AID"):
+                        continue
+                    alteration_name = str(option["AID"]).split(":", 1)[-1]
+                    alteration_id = alterations.get(alteration_name.casefold())
+                    if alteration_id is None:
+                        slot_supported = False
+                        loadout_supported = False
+                    connection.execute(
+                        """
+                        INSERT INTO catalog_weapon_slot_options(
+                            weapon_slot_id, option_ordinal, perk_rarity,
+                            alteration_primary_asset_name, alteration_id,
+                            initial_roll_weight, exclusion_names_json
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            slot_id,
+                            option_ordinal,
+                            rarity,
+                            alteration_name,
+                            alteration_id,
+                            _integer_value(option.get("InitialRollWeight")),
+                            json.dumps(option.get("ExclusionNames") or [], separators=(",", ":")),
+                        ),
+                    )
+            if not slot_supported:
+                connection.execute(
+                    "UPDATE catalog_weapon_slots SET interpretation_status='partial' WHERE id=?",
+                    (slot_id,),
+                )
+        if not loadout_supported:
+            connection.execute(
+                """
+                UPDATE catalog_weapon_slot_loadouts
+                SET interpretation_status='partial' WHERE id=?
+                """,
+                (loadout_id,),
+            )
+    return result
+
+
+def _normalize_weapon_variants(
+    connection: sqlite3.Connection,
+    snapshot_id: int,
+    payloads: dict[int, dict[str, Any]],
+    tables: dict[str, dict[str, Any]],
+    loadouts: dict[str, int],
+) -> dict[str, list[int]]:
+    variants_by_primary_asset: dict[str, list[int]] = {}
+    identities: dict[str, int] = {}
+    for object_id, export in payloads.items():
+        object_type = str(export.get("Type") or "")
+        if object_type not in {
+            "FortWeaponRangedItemDefinition",
+            "FortWeaponMeleeItemDefinition",
+        }:
+            continue
+        properties = export.get("Properties") or {}
+        primary_asset_name = _explicit_weapon_primary_asset_name(properties)
+        if primary_asset_name is None:
+            continue
+        weapon_kind = "ranged" if "Ranged" in object_type else "melee"
+        display_name = _localized_text(properties.get("ItemName"))
+        evidence = "localized_display_and_kind" if display_name else "variant_only"
+        display_name = display_name or primary_asset_name
+        identity_key = (
+            f"{weapon_kind}:{display_name.casefold()}"
+            if evidence == "localized_display_and_kind"
+            else f"{weapon_kind}:variant:{primary_asset_name.casefold()}"
+        )
+        identity_id = identities.get(identity_key)
+        if identity_id is None:
+            identity_id = connection.execute(
+                """
+                INSERT INTO catalog_weapon_identities(
+                    snapshot_id, identity_key, display_name, description,
+                    weapon_kind, identity_evidence
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    snapshot_id,
+                    identity_key,
+                    display_name,
+                    _localized_text(properties.get("ItemDescription")),
+                    weapon_kind,
+                    evidence,
+                ),
+            ).lastrowid
+            identities[identity_key] = identity_id
+        facts = _data_list_facts(properties)
+        stat_handle = properties.get("WeaponStatHandle") or {}
+        stat_table_path = _object_path(stat_handle.get("DataTable"))
+        stat_row_name = stat_handle.get("RowName")
+        stat_row = tables.get((canonical_package_path(stat_table_path) or "").casefold(), {}).get(
+            stat_row_name
+        )
+        stat_data_row_id = _data_row_id(
+            connection, snapshot_id, stat_table_path, stat_row_name
+        )
+        slot_row = properties.get("AlterationSlotsLoadoutRow")
+        baseline_row = properties.get("BaselineAlterationSlotsLoadoutRow")
+        slot_loadout_id = loadouts.get(slot_row) if slot_row else None
+        baseline_id = loadouts.get(baseline_row) if baseline_row else None
+        status = (
+            "supported"
+            if isinstance(stat_row, dict)
+            and stat_data_row_id is not None
+            and slot_row is not None
+            and slot_loadout_id is not None
+            else "partial"
+        )
+        object_row = connection.execute(
+            "SELECT package_path, object_name FROM asset_objects WHERE id=?", (object_id,)
+        ).fetchone()
+        variant_id = connection.execute(
+            """
+            INSERT INTO catalog_weapon_variants(
+                snapshot_id, identity_id, source_object_id, variant_key,
+                primary_asset_name, package_path, object_type, rarity, tier, max_tier,
+                display_tier, trigger_type, weapon_actor_path, stat_table_path,
+                stat_row_name, stat_data_row_id, slot_loadout_row, slot_loadout_id,
+                baseline_slot_loadout_row, baseline_slot_loadout_id,
+                base_alteration_path, primary_fire_ability_path, ammo_data_path,
+                tags_json, traits_json, interpretation_status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                      ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                snapshot_id,
+                identity_id,
+                object_id,
+                object_row["object_name"],
+                primary_asset_name,
+                object_row["package_path"],
+                object_type,
+                facts.get("Rarity"),
+                facts.get("Tier"),
+                facts.get("MaxTier"),
+                properties.get("DisplayTier"),
+                properties.get("TriggerType"),
+                _object_path(properties.get("WeaponActorClass")),
+                canonical_package_path(stat_table_path),
+                stat_row_name,
+                stat_data_row_id,
+                slot_row,
+                slot_loadout_id,
+                baseline_row,
+                baseline_id,
+                _object_path(properties.get("BaseAlteration")),
+                _object_path(properties.get("PrimaryFireAbility")),
+                _object_path(properties.get("AmmoData")),
+                json.dumps(facts.get("Tags") or [], separators=(",", ":")),
+                json.dumps(facts.get("Traits") or [], separators=(",", ":")),
+                status,
+            ),
+        ).lastrowid
+        variants_by_primary_asset.setdefault(primary_asset_name.casefold(), []).append(
+            variant_id
+        )
+        if isinstance(stat_row, dict) and stat_data_row_id is not None:
+            connection.execute(
+                """
+                INSERT INTO catalog_weapon_stats(
+                    weapon_variant_id, source_data_row_id, base_level, named_weight_row,
+                    damage_point_blank, damage_mid, damage_long, damage_max_range,
+                    environmental_damage, impact_damage, damage_scale, impact_scale,
+                    crit_chance, crit_damage_bonus, fire_rate, reload_time, magazine_size,
+                    durability_per_use, range_point_blank, range_mid, range_long, range_max,
+                    raw_stats_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                          ?, ?, ?)
+                """,
+                (
+                    variant_id,
+                    stat_data_row_id,
+                    _integer_value(stat_row.get("BaseLevel")),
+                    stat_row.get("NamedWeightRow"),
+                    _real_value(stat_row.get("DmgPB")),
+                    _real_value(stat_row.get("DmgMid")),
+                    _real_value(stat_row.get("DmgLong")),
+                    _real_value(stat_row.get("DmgMaxRange")),
+                    _real_value(stat_row.get("EnvDmgPB")),
+                    _real_value(stat_row.get("ImpactDmgPB")),
+                    _real_value(stat_row.get("DmgScale")),
+                    _real_value(stat_row.get("ImpactDmgScale")),
+                    _real_value(stat_row.get("DiceCritChance")),
+                    _real_value(stat_row.get("DiceCritDamageMultiplier")),
+                    _real_value(stat_row.get("FiringRate")),
+                    _real_value(stat_row.get("ReloadTime")),
+                    _integer_value(stat_row.get("ClipSize")),
+                    _real_value(stat_row.get("DurabilityPerUse")),
+                    _real_value(stat_row.get("RngPB")),
+                    _real_value(stat_row.get("RngMid")),
+                    _real_value(stat_row.get("RngLong")),
+                    _real_value(stat_row.get("RngMax")),
+                    json.dumps(stat_row, sort_keys=True, separators=(",", ":")),
+                ),
+            )
+    return variants_by_primary_asset
+
+
+def _normalize_schematics(
+    connection: sqlite3.Connection,
+    snapshot_id: int,
+    payloads: dict[int, dict[str, Any]],
+    tables: dict[str, dict[str, Any]],
+    variants_by_primary_asset: dict[str, list[int]],
+) -> None:
+    for object_id, export in payloads.items():
+        if export.get("Type") != "FortSchematicItemDefinition":
+            continue
+        properties = export.get("Properties") or {}
+        object_row = connection.execute(
+            "SELECT package_path, object_name FROM asset_objects WHERE id=?", (object_id,)
+        ).fetchone()
+        crafting = properties.get("CraftingRecipe") or {}
+        crafting_table_path = _object_path(crafting.get("DataTable"))
+        crafting_row_name = crafting.get("RowName")
+        recipe = tables.get(
+            (canonical_package_path(crafting_table_path) or "").casefold(), {}
+        ).get(crafting_row_name)
+        results = recipe.get("RecipeResults") or [] if isinstance(recipe, dict) else []
+        result = results[0] if len(results) == 1 and isinstance(results[0], dict) else {}
+        primary = result.get("ItemPrimaryAssetId") or {}
+        result_type = (primary.get("PrimaryAssetType") or {}).get("Name")
+        result_name = primary.get("PrimaryAssetName")
+        candidates = (
+            variants_by_primary_asset.get(str(result_name).casefold(), [])
+            if result_type == "Weapon" and result_name
+            else []
+        )
+        if result_type != "Weapon":
+            link_status, variant_id = "not_applicable", None
+        elif len(candidates) == 1:
+            link_status, variant_id = "resolved", candidates[0]
+        elif candidates:
+            link_status, variant_id = "ambiguous", None
+        else:
+            link_status, variant_id = "unresolved", None
+        facts = _data_list_facts(properties)
+        rating = facts.get("RatingLookup") or {}
+        schematic_id = connection.execute(
+            """
+            INSERT INTO catalog_schematics(
+                snapshot_id, source_object_id, schematic_key, package_path,
+                crafting_table_path, crafting_row_name, crafting_data_row_id,
+                result_asset_type, result_primary_asset_name, result_quantity,
+                weapon_variant_id, link_status, rarity, tier, max_tier,
+                rating_curve_path, rating_row_name, tags_json, traits_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                snapshot_id,
+                object_id,
+                object_row["object_name"],
+                object_row["package_path"],
+                canonical_package_path(crafting_table_path),
+                crafting_row_name,
+                _data_row_id(connection, snapshot_id, crafting_table_path, crafting_row_name),
+                result_type,
+                result_name,
+                _integer_value(result.get("Quantity")),
+                variant_id,
+                link_status,
+                facts.get("Rarity"),
+                facts.get("Tier"),
+                facts.get("MaxTier"),
+                canonical_package_path(_object_path(rating.get("CurveTable"))),
+                rating.get("RowName"),
+                json.dumps(facts.get("Tags") or [], separators=(",", ":")),
+                json.dumps(facts.get("Traits") or [], separators=(",", ":")),
+            ),
+        ).lastrowid
+        if isinstance(recipe, dict):
+            for ordinal, cost in enumerate(recipe.get("RecipeCosts") or []):
+                if not isinstance(cost, dict):
+                    continue
+                cost_asset = cost.get("ItemPrimaryAssetId") or {}
+                cost_type = (cost_asset.get("PrimaryAssetType") or {}).get("Name")
+                cost_name = cost_asset.get("PrimaryAssetName")
+                quantity = _integer_value(cost.get("Quantity"))
+                if not cost_type or not cost_name or quantity is None:
+                    continue
+                connection.execute(
+                    """
+                    INSERT INTO catalog_schematic_costs(
+                        schematic_id, cost_ordinal, item_asset_type,
+                        item_primary_asset_name, quantity
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (schematic_id, ordinal, cost_type, cost_name, quantity),
+                )
+
+
+def _normalize_weapon_catalog(
+    connection: sqlite3.Connection,
+    snapshot_id: int,
+    payloads: dict[int, dict[str, Any]],
+) -> None:
+    tables = _table_rows_by_package(payloads)
+    alterations = _normalize_alterations(connection, snapshot_id, payloads)
+    loadouts = _normalize_weapon_slot_loadouts(
+        connection, snapshot_id, tables, alterations
+    )
+    variants = _normalize_weapon_variants(
+        connection, snapshot_id, payloads, tables, loadouts
+    )
+    _normalize_schematics(connection, snapshot_id, payloads, tables, variants)
 
 
 def _link_modifier_curves(connection: sqlite3.Connection, snapshot_id: int) -> None:
@@ -2733,6 +3411,20 @@ def _queue_classification(
         )
     ):
         return 4, "out_of_scope", "presentation or progression data is outside Phase 2"
+    if "craftingrecipe.datatable" in path:
+        return 0, "weapon_recipe_table", "resolves an explicit schematic recipe row"
+    if "weaponstathandle.datatable" in path:
+        return 0, "weapon_stat_table", "resolves the weapon's explicit base-stat row"
+    if "alterationabilityset" in path:
+        return (
+            0,
+            "weapon_alteration_ability_set",
+            "resolves an explicit weapon-perk ability/effect set",
+        )
+    if "basealteration" in path:
+        return 1, "weapon_base_alteration", "resolves an intrinsic damage/element alteration"
+    if "ammodata" in path:
+        return 2, "weapon_ammo_definition", "resolves the weapon's explicit ammunition type"
     if "heroperk" in path or "commanderperk" in path:
         return 0, "hero_perk_kit", "closes a hero support/commander perk grant"
     if "tierabilitykits" in path or "grantedabilitykit" in path:
@@ -3692,6 +4384,300 @@ def full_roster_batch_plan(
     }
 
 
+def weapon_catalog_coverage(
+    connection: sqlite3.Connection, snapshot_id: int | None = None
+) -> dict[str, Any]:
+    snapshot_id = snapshot_id or latest_asset_snapshot_id(connection)
+    if snapshot_id is None:
+        return {"snapshot_id": None, "counts": {}, "ratios": {}}
+    queries = {
+        "weapon_identities": "SELECT COUNT(*) FROM catalog_weapon_identities WHERE snapshot_id=?",
+        "weapon_variants": "SELECT COUNT(*) FROM catalog_weapon_variants WHERE snapshot_id=?",
+        "ranged_variants": """
+            SELECT COUNT(*) FROM catalog_weapon_variants variant
+            JOIN catalog_weapon_identities identity_row ON identity_row.id=variant.identity_id
+            WHERE variant.snapshot_id=? AND identity_row.weapon_kind='ranged'
+        """,
+        "melee_variants": """
+            SELECT COUNT(*) FROM catalog_weapon_variants variant
+            JOIN catalog_weapon_identities identity_row ON identity_row.id=variant.identity_id
+            WHERE variant.snapshot_id=? AND identity_row.weapon_kind='melee'
+        """,
+        "supported_weapon_variants": """
+            SELECT COUNT(*) FROM catalog_weapon_variants
+            WHERE snapshot_id=? AND interpretation_status='supported'
+        """,
+        "weapon_stat_rows": """
+            SELECT COUNT(*) FROM catalog_weapon_stats stat
+            JOIN catalog_weapon_variants variant ON variant.id=stat.weapon_variant_id
+            WHERE variant.snapshot_id=?
+        """,
+        "schematics": "SELECT COUNT(*) FROM catalog_schematics WHERE snapshot_id=?",
+        "weapon_schematics": """
+            SELECT COUNT(*) FROM catalog_schematics
+            WHERE snapshot_id=? AND result_asset_type='Weapon'
+        """,
+        "resolved_weapon_schematics": """
+            SELECT COUNT(*) FROM catalog_schematics
+            WHERE snapshot_id=? AND result_asset_type='Weapon' AND link_status='resolved'
+        """,
+        "ambiguous_weapon_schematics": """
+            SELECT COUNT(*) FROM catalog_schematics
+            WHERE snapshot_id=? AND result_asset_type='Weapon' AND link_status='ambiguous'
+        """,
+        "unresolved_weapon_schematics": """
+            SELECT COUNT(*) FROM catalog_schematics
+            WHERE snapshot_id=? AND result_asset_type='Weapon' AND link_status='unresolved'
+        """,
+        "crafting_cost_rows": """
+            SELECT COUNT(*) FROM catalog_schematic_costs cost
+            JOIN catalog_schematics schematic ON schematic.id=cost.schematic_id
+            WHERE schematic.snapshot_id=?
+        """,
+        "slot_loadouts": """
+            SELECT COUNT(*) FROM catalog_weapon_slot_loadouts WHERE snapshot_id=?
+        """,
+        "supported_slot_loadouts": """
+            SELECT COUNT(*) FROM catalog_weapon_slot_loadouts
+            WHERE snapshot_id=? AND interpretation_status='supported'
+        """,
+        "weapon_slots": """
+            SELECT COUNT(*) FROM catalog_weapon_slots slot_row
+            JOIN catalog_weapon_slot_loadouts loadout ON loadout.id=slot_row.slot_loadout_id
+            WHERE loadout.snapshot_id=?
+        """,
+        "slot_options": """
+            SELECT COUNT(*) FROM catalog_weapon_slot_options option_row
+            JOIN catalog_weapon_slots slot_row ON slot_row.id=option_row.weapon_slot_id
+            JOIN catalog_weapon_slot_loadouts loadout ON loadout.id=slot_row.slot_loadout_id
+            WHERE loadout.snapshot_id=?
+        """,
+        "resolved_slot_options": """
+            SELECT COUNT(*) FROM catalog_weapon_slot_options option_row
+            JOIN catalog_weapon_slots slot_row ON slot_row.id=option_row.weapon_slot_id
+            JOIN catalog_weapon_slot_loadouts loadout ON loadout.id=slot_row.slot_loadout_id
+            WHERE loadout.snapshot_id=? AND option_row.alteration_id IS NOT NULL
+        """,
+        "alterations": "SELECT COUNT(*) FROM catalog_alterations WHERE snapshot_id=?",
+        "supported_alterations": """
+            SELECT COUNT(*) FROM catalog_alterations
+            WHERE snapshot_id=? AND semantic_status='supported'
+        """,
+        "partial_alterations": """
+            SELECT COUNT(*) FROM catalog_alterations
+            WHERE snapshot_id=? AND semantic_status='partial'
+        """,
+        "opaque_alterations": """
+            SELECT COUNT(*) FROM catalog_alterations
+            WHERE snapshot_id=? AND semantic_status='opaque'
+        """,
+        "display_groups_with_multiple_actor_classes": """
+            SELECT COUNT(*) FROM (
+                SELECT identity_row.id
+                FROM catalog_weapon_identities identity_row
+                JOIN catalog_weapon_variants variant ON variant.identity_id=identity_row.id
+                WHERE identity_row.snapshot_id=?
+                GROUP BY identity_row.id
+                HAVING COUNT(DISTINCT variant.weapon_actor_path)>1
+            )
+        """,
+    }
+    counts = {
+        name: connection.execute(query, (snapshot_id,)).fetchone()[0]
+        for name, query in queries.items()
+    }
+    return {
+        "snapshot_id": snapshot_id,
+        "counts": counts,
+        "ratios": {
+            "weapon_variant_stat_and_slot_resolution": (
+                counts["supported_weapon_variants"] / counts["weapon_variants"]
+                if counts["weapon_variants"]
+                else None
+            ),
+            "weapon_schematic_link_resolution": (
+                counts["resolved_weapon_schematics"] / counts["weapon_schematics"]
+                if counts["weapon_schematics"]
+                else None
+            ),
+            "slot_option_identity_resolution": (
+                counts["resolved_slot_options"] / counts["slot_options"]
+                if counts["slot_options"]
+                else None
+            ),
+            "alteration_static_semantic_coverage": (
+                counts["supported_alterations"] / counts["alterations"]
+                if counts["alterations"]
+                else None
+            ),
+        },
+        "identity_boundary": (
+            "friendly display-name groups are convenient catalog identities, not proof "
+            "that every same-named variant shares one implementation; actor-class "
+            "collisions remain counted explicitly"
+        ),
+    }
+
+
+def weapon_catalog_search(
+    connection: sqlite3.Connection,
+    query: str | None = None,
+    snapshot_id: int | None = None,
+    *,
+    limit: int = 50,
+) -> dict[str, Any]:
+    snapshot_id = snapshot_id or latest_asset_snapshot_id(connection)
+    if snapshot_id is None:
+        return {"snapshot_id": None, "weapons": []}
+    pattern = f"%{query}%" if query else "%"
+    rows = connection.execute(
+        """
+        SELECT identity_row.id, identity_row.identity_key, identity_row.display_name,
+               identity_row.weapon_kind, identity_row.identity_evidence,
+               COUNT(DISTINCT variant.id) AS variant_count,
+               COUNT(DISTINCT variant.weapon_actor_path) AS actor_class_count,
+               SUM(CASE WHEN variant.interpretation_status='supported' THEN 1 ELSE 0 END)
+                   AS supported_variant_count,
+               COUNT(DISTINCT schematic.id) AS craftable_variant_count
+        FROM catalog_weapon_identities identity_row
+        JOIN catalog_weapon_variants variant ON variant.identity_id=identity_row.id
+        LEFT JOIN catalog_schematics schematic
+          ON schematic.weapon_variant_id=variant.id AND schematic.link_status='resolved'
+        WHERE identity_row.snapshot_id=?
+          AND (identity_row.display_name LIKE ? OR variant.primary_asset_name LIKE ?)
+        GROUP BY identity_row.id
+        ORDER BY lower(identity_row.display_name), identity_row.weapon_kind
+        LIMIT ?
+        """,
+        (snapshot_id, pattern, pattern, max(1, min(limit, 500))),
+    ).fetchall()
+    return {"snapshot_id": snapshot_id, "weapons": [dict(row) for row in rows]}
+
+
+def weapon_provenance(
+    connection: sqlite3.Connection,
+    name: str,
+    snapshot_id: int | None = None,
+) -> dict[str, Any] | None:
+    snapshot_id = snapshot_id or latest_asset_snapshot_id(connection)
+    if snapshot_id is None:
+        return None
+    identities = connection.execute(
+        """
+        SELECT DISTINCT identity_row.*
+        FROM catalog_weapon_identities identity_row
+        JOIN catalog_weapon_variants variant ON variant.identity_id=identity_row.id
+        WHERE identity_row.snapshot_id=? AND (
+            lower(identity_row.display_name)=lower(?)
+            OR lower(variant.primary_asset_name)=lower(?)
+            OR lower(variant.variant_key)=lower(?)
+        )
+        ORDER BY identity_row.weapon_kind, identity_row.identity_key
+        """,
+        (snapshot_id, name, name, name),
+    ).fetchall()
+    if not identities:
+        return None
+    result: list[dict[str, Any]] = []
+    for identity in identities:
+        variant_rows = connection.execute(
+            """
+            SELECT variant.*, file_row.source_path, file_row.content_sha256,
+                   stat.base_level, stat.named_weight_row, stat.damage_point_blank,
+                   stat.damage_mid, stat.damage_long, stat.damage_max_range,
+                   stat.environmental_damage, stat.impact_damage, stat.damage_scale,
+                   stat.impact_scale, stat.crit_chance, stat.crit_damage_bonus,
+                   stat.fire_rate, stat.reload_time, stat.magazine_size,
+                   stat.durability_per_use, stat.range_point_blank, stat.range_mid,
+                   stat.range_long, stat.range_max,
+                   schematic.id AS schematic_id, schematic.schematic_key,
+                   schematic.crafting_row_name, schematic.link_status
+            FROM catalog_weapon_variants variant
+            JOIN asset_objects object_row ON object_row.id=variant.source_object_id
+            JOIN asset_files file_row ON file_row.id=object_row.asset_file_id
+            LEFT JOIN catalog_weapon_stats stat ON stat.weapon_variant_id=variant.id
+            LEFT JOIN catalog_schematics schematic ON schematic.weapon_variant_id=variant.id
+            WHERE variant.identity_id=?
+            ORDER BY variant.rarity, variant.tier, variant.primary_asset_name
+            """,
+            (identity["id"],),
+        ).fetchall()
+        variants: list[dict[str, Any]] = []
+        loadout_ids: set[int] = set()
+        for variant in variant_rows:
+            item = dict(variant)
+            item["tags"] = json.loads(item.pop("tags_json"))
+            item["traits"] = json.loads(item.pop("traits_json"))
+            if item["slot_loadout_id"] is not None:
+                loadout_ids.add(item["slot_loadout_id"])
+            schematic_id = item.pop("schematic_id")
+            item["crafting_costs"] = (
+                [
+                    dict(row)
+                    for row in connection.execute(
+                        """
+                        SELECT cost_ordinal, item_asset_type,
+                               item_primary_asset_name, quantity
+                        FROM catalog_schematic_costs WHERE schematic_id=?
+                        ORDER BY cost_ordinal
+                        """,
+                        (schematic_id,),
+                    ).fetchall()
+                ]
+                if schematic_id is not None
+                else []
+            )
+            variants.append(item)
+        loadouts = []
+        for loadout_id in sorted(loadout_ids):
+            loadout = connection.execute(
+                "SELECT * FROM catalog_weapon_slot_loadouts WHERE id=?", (loadout_id,)
+            ).fetchone()
+            slots = []
+            for slot in connection.execute(
+                """
+                SELECT * FROM catalog_weapon_slots
+                WHERE slot_loadout_id=? ORDER BY slot_ordinal
+                """,
+                (loadout_id,),
+            ).fetchall():
+                slot_item = dict(slot)
+                slot_item["options"] = [
+                    {
+                        **dict(option),
+                        "exclusion_names": json.loads(option["exclusion_names_json"]),
+                    }
+                    for option in connection.execute(
+                        """
+                        SELECT option_row.option_ordinal, option_row.perk_rarity,
+                               option_row.alteration_primary_asset_name,
+                               option_row.initial_roll_weight,
+                               option_row.exclusion_names_json,
+                               alteration.display_name, alteration.description,
+                               alteration.semantic_status
+                        FROM catalog_weapon_slot_options option_row
+                        LEFT JOIN catalog_alterations alteration
+                          ON alteration.id=option_row.alteration_id
+                        WHERE option_row.weapon_slot_id=?
+                        ORDER BY option_row.perk_rarity, option_row.option_ordinal
+                        """,
+                        (slot["id"],),
+                    ).fetchall()
+                ]
+                for option in slot_item["options"]:
+                    option.pop("exclusion_names_json", None)
+                slots.append(slot_item)
+            loadouts.append({**dict(loadout), "slots": slots})
+        result.append(
+            {
+                "identity": dict(identity),
+                "variants": variants,
+                "slot_loadouts": loadouts,
+            }
+        )
+    return {"snapshot_id": snapshot_id, "matches": result}
+
+
 def catalog_coverage(
     connection: sqlite3.Connection, snapshot_id: int | None = None
 ) -> dict[str, Any]:
@@ -3896,6 +4882,7 @@ def catalog_coverage(
             ),
         },
         "critical_export_queue": queue["counts"],
+        "weapons": weapon_catalog_coverage(connection, snapshot_id),
     }
 
 
@@ -3933,6 +4920,11 @@ def _snapshot_summary(
             "catalog_mechanics",
             "catalog_opaque_mechanics",
             "catalog_inheritance_edges",
+            "catalog_weapon_identities",
+            "catalog_weapon_variants",
+            "catalog_schematics",
+            "catalog_alterations",
+            "catalog_weapon_slot_loadouts",
         )
     }
     unresolved = unresolved_reference_report(connection, snapshot_id)
@@ -3984,6 +4976,21 @@ def _parser() -> argparse.ArgumentParser:
     queue.add_argument("--paths-only", action="store_true")
     coverage = commands.add_parser("coverage", help="show normalized catalog coverage")
     coverage.add_argument("--snapshot-id", type=int)
+    weapon_coverage = commands.add_parser(
+        "weapon-coverage", help="show weapon, schematic, slot, and alteration coverage"
+    )
+    weapon_coverage.add_argument("--snapshot-id", type=int)
+    weapons = commands.add_parser(
+        "weapons", help="list friendly weapon identities and variant coverage"
+    )
+    weapons.add_argument("--query")
+    weapons.add_argument("--limit", type=int, default=50)
+    weapons.add_argument("--snapshot-id", type=int)
+    weapon = commands.add_parser(
+        "weapon", help="show weapon variants, stats, recipes, slots, and provenance"
+    )
+    weapon.add_argument("name")
+    weapon.add_argument("--snapshot-id", type=int)
     roster = commands.add_parser(
         "roster", help="show canonical hero/perk roster and semantic readiness"
     )
@@ -4042,6 +5049,19 @@ def main(argv: Iterable[str] | None = None) -> int:
                 return 0
         elif args.command == "coverage":
             payload = catalog_coverage(connection, args.snapshot_id)
+        elif args.command == "weapon-coverage":
+            payload = weapon_catalog_coverage(connection, args.snapshot_id)
+        elif args.command == "weapons":
+            payload = weapon_catalog_search(
+                connection,
+                args.query,
+                args.snapshot_id,
+                limit=args.limit,
+            )
+        elif args.command == "weapon":
+            payload = weapon_provenance(connection, args.name, args.snapshot_id)
+            if payload is None:
+                raise SystemExit(f"weapon not found: {args.name}")
         elif args.command == "roster":
             payload = roster_coverage_report(connection, args.snapshot_id)
         elif args.command == "perk":

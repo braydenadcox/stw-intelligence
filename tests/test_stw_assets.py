@@ -18,6 +18,9 @@ from stw_assets import (  # noqa: E402
     record_roster_export_receipt,
     roster_coverage_report,
     unresolved_reference_report,
+    weapon_catalog_coverage,
+    weapon_catalog_search,
+    weapon_provenance,
 )
 from stw_pipeline import connect  # noqa: E402
 
@@ -218,6 +221,284 @@ def write_golden_slice(root: Path) -> list[Path]:
         )
     )
     return files
+
+
+def write_weapon_slice(root: Path) -> list[Path]:
+    weapon_package = "/SaveTheWorld/Items/Weapons/Ranged/Test/WID_Test_SR_Ore_T05"
+    schematic_package = "/SaveTheWorld/Items/Schematics/Ranged/Test/SID_Test_SR_Ore_T05"
+    recipe_package = "/SaveTheWorld/Items/Datatables/CraftingRecipes_New"
+    stats_package = "/Game/Items/DataTables/RangedWeapons"
+    loadouts_package = "/SaveTheWorld/Items/Alteration_v2/SlotLoadouts"
+    definitions_package = "/SaveTheWorld/Items/Alteration_v2/SlotDefs"
+    groups_package = "/SaveTheWorld/Items/Alteration_v2/AlterationGroups"
+    alteration_package = "/SaveTheWorld/Items/Alteration_v2/AttributeAlterations/Damage/AID_Att_Damage_T05"
+    ability_set_package = "/SaveTheWorld/Items/Alteration_v2/AttributeAlterations/Damage/AS_Att_Damage_T05"
+    effect_package = "/SaveTheWorld/Items/Alteration_v2/AttributeAlterations/Damage/GE_Att_Damage"
+    return [
+        _write_export(
+            root,
+            "Weapons/WID_Test_SR_Ore_T05.json",
+            [
+                {
+                    "Type": "FortWeaponRangedItemDefinition",
+                    "Name": "WID_Test_SR_Ore_T05",
+                    "Package": weapon_package,
+                    "Properties": {
+                        "ActualAnalyticFNames": ["Tag:Weapon:wid_test_sr_ore_t05"],
+                        "ItemName": {"SourceString": "Test Rifle"},
+                        "ItemDescription": {"SourceString": "Fixture rifle"},
+                        "WeaponStatHandle": {
+                            "DataTable": {"ObjectPath": f"{stats_package}.0"},
+                            "RowName": "Test_SR_Ore_T05",
+                        },
+                        "AlterationSlotsLoadoutRow": "SlotLoadout.Test",
+                        "WeaponActorClass": _reference(
+                            "/SaveTheWorld/Weapons/Test/B_Test", "B_Test_C"
+                        ),
+                        "BaseAlteration": _reference(
+                            "/Game/Items/Alterations/BaseAlteration_BallisticDamage",
+                            "BaseAlteration_BallisticDamage",
+                        ),
+                        "PrimaryFireAbility": _reference(
+                            "/Game/Abilities/Weapons/Ranged/GA_Ranged_GenericDamage",
+                            "GA_Ranged_GenericDamage_C",
+                        ),
+                        "AmmoData": _reference(
+                            "/Game/Items/Ammo/AmmoDataBulletsLight",
+                            "AmmoDataBulletsLight",
+                        ),
+                        "TriggerType": "EFortWeaponTriggerType::Automatic",
+                        "DisplayTier": "EFortDisplayTier::Brightcore",
+                        "DataList": [
+                            {"Rarity": "EFortRarity::Legendary"},
+                            {"Tier": "EFortItemTier::V", "MaxTier": "EFortItemTier::V"},
+                            {"Tags": ["Weapon.Ranged.Assault"]},
+                            {"Traits": ["Item.Trait.HasDurability"]},
+                        ],
+                    },
+                }
+            ],
+        ),
+        _write_export(
+            root,
+            "Schematics/SID_Test_SR_Ore_T05.json",
+            [
+                {
+                    "Type": "FortSchematicItemDefinition",
+                    "Name": "SID_Test_SR_Ore_T05",
+                    "Package": schematic_package,
+                    "Properties": {
+                        "CraftingRecipe": {
+                            "DataTable": {"ObjectPath": f"{recipe_package}.0"},
+                            "RowName": "Ranged.Test.SR.Ore.T05",
+                        },
+                        "DataList": [
+                            {"Rarity": "EFortRarity::Legendary"},
+                            {"Tier": "EFortItemTier::V", "MaxTier": "EFortItemTier::V"},
+                            {"Tags": ["Weapon.Ranged.Assault"]},
+                        ],
+                    },
+                }
+            ],
+        ),
+        _write_export(
+            root,
+            "Tables/CraftingRecipes_New.json",
+            [
+                {
+                    "Type": "DataTable",
+                    "Name": "CraftingRecipes_New",
+                    "Package": recipe_package,
+                    "Rows": {
+                        "Ranged.Test.SR.Ore.T05": {
+                            "RecipeResults": [
+                                {
+                                    "ItemPrimaryAssetId": {
+                                        "PrimaryAssetType": {"Name": "Weapon"},
+                                        "PrimaryAssetName": "wid_test_sr_ore_t05",
+                                    },
+                                    "Quantity": 1,
+                                }
+                            ],
+                            "RecipeCosts": [
+                                {
+                                    "ItemPrimaryAssetId": {
+                                        "PrimaryAssetType": {"Name": "Ingredient"},
+                                        "PrimaryAssetName": "ingredient_test",
+                                    },
+                                    "Quantity": 11,
+                                }
+                            ],
+                        }
+                    },
+                }
+            ],
+        ),
+        _write_export(
+            root,
+            "Tables/RangedWeapons.json",
+            [
+                {
+                    "Type": "DataTable",
+                    "Name": "RangedWeapons",
+                    "Package": stats_package,
+                    "Rows": {
+                        "Test_SR_Ore_T05": {
+                            "BaseLevel": 1,
+                            "NamedWeightRow": "Assault_Test",
+                            "DmgPB": 100.0,
+                            "DmgMid": 75.0,
+                            "DmgLong": 50.0,
+                            "DmgMaxRange": 25.0,
+                            "EnvDmgPB": 20.0,
+                            "ImpactDmgPB": 30.0,
+                            "DmgScale": 0.05,
+                            "ImpactDmgScale": 0.05,
+                            "DiceCritChance": 0.2,
+                            "DiceCritDamageMultiplier": 0.75,
+                            "FiringRate": 8.0,
+                            "ReloadTime": 2.5,
+                            "ClipSize": 30,
+                            "DurabilityPerUse": 0.1,
+                            "RngPB": 1024.0,
+                            "RngMid": 2048.0,
+                            "RngLong": 4096.0,
+                            "RngMax": 8192.0,
+                        }
+                    },
+                }
+            ],
+        ),
+        _write_export(
+            root,
+            "Tables/SlotLoadouts.json",
+            [
+                {
+                    "Type": "DataTable",
+                    "Name": "SlotLoadouts",
+                    "Package": loadouts_package,
+                    "Rows": {
+                        "SlotLoadout.Test": {
+                            "AlterationSlots": [
+                                {
+                                    "UnlockLevel": 5,
+                                    "UnlockRarity": "EFortRarity::Common",
+                                    "SlotDefinitionRow": "Slot.Test.Damage",
+                                    "bRespeccable": True,
+                                    "SlotInitMin": "EFortRarity::Legendary",
+                                    "SlotInitMax": "EFortRarity::Legendary",
+                                }
+                            ]
+                        }
+                    },
+                }
+            ],
+        ),
+        _write_export(
+            root,
+            "Tables/SlotDefs.json",
+            [
+                {
+                    "Type": "DataTable",
+                    "Name": "SlotDefs",
+                    "Package": definitions_package,
+                    "Rows": {"Slot.Test.Damage": {"InitTierGroup": "AGRP.Test.Damage"}},
+                }
+            ],
+        ),
+        _write_export(
+            root,
+            "Tables/AlterationGroups.json",
+            [
+                {
+                    "Type": "DataTable",
+                    "Name": "AlterationGroups",
+                    "Package": groups_package,
+                    "Rows": {
+                        "AGRP.Test.Damage": {
+                            "RarityMapping": [
+                                {
+                                    "Key": "EFortRarity::Legendary",
+                                    "Value": {
+                                        "WeightData": [
+                                            {
+                                                "AID": "Alteration:aid_att_damage_t05",
+                                                "InitialRollWeight": 10000,
+                                                "ExclusionNames": ["Damage"],
+                                            }
+                                        ]
+                                    },
+                                }
+                            ]
+                        }
+                    },
+                }
+            ],
+        ),
+        _write_export(
+            root,
+            "Alterations/AID_Att_Damage_T05.json",
+            [
+                {
+                    "Type": "FortAlterationItemDefinition",
+                    "Name": "AID_Att_Damage_T05",
+                    "Package": alteration_package,
+                    "Properties": {
+                        "AlterationAbilitySet": _reference(
+                            ability_set_package, "AS_Att_Damage_T05"
+                        ),
+                        "ItemName": {"SourceString": "Damage"},
+                        "ItemDescription": {"SourceString": "+30% Damage"},
+                        "DataList": [{"Rarity": "EFortRarity::Legendary"}],
+                    },
+                }
+            ],
+        ),
+        _write_export(
+            root,
+            "Alterations/AS_Att_Damage_T05.json",
+            [
+                {
+                    "Type": "FortAbilitySet",
+                    "Name": "AS_Att_Damage_T05",
+                    "Package": ability_set_package,
+                    "Properties": {
+                        "GrantedGameplayEffects": [
+                            {
+                                "GameplayEffect": _reference(
+                                    effect_package, "GE_Att_Damage_C"
+                                ),
+                                "Level": 0,
+                            }
+                        ]
+                    },
+                }
+            ],
+        ),
+        _write_export(
+            root,
+            "Alterations/GE_Att_Damage.json",
+            [
+                {
+                    "Type": "GE_Att_Damage_C",
+                    "Name": "Default__GE_Att_Damage_C",
+                    "Package": effect_package,
+                    "Properties": {
+                        "Modifiers": [
+                            {
+                                "Attribute": {"AttributeName": "WeaponDamageMultiplier"},
+                                "ModifierOp": "EGameplayModOp::Additive",
+                                "ModifierMagnitude": {
+                                    "MagnitudeCalculationType": "EGameplayEffectMagnitudeCalculation::ScalableFloat",
+                                    "ScalableFloatMagnitude": {"Value": 0.3},
+                                },
+                            }
+                        ]
+                    },
+                }
+            ],
+        ),
+    ]
 
 
 def extend_with_phase_two_semantics(root: Path) -> list[Path]:
@@ -457,6 +738,102 @@ def extend_with_phase_two_semantics(root: Path) -> list[Path]:
 
 
 class AssetCatalogTests(unittest.TestCase):
+    def test_weapon_slice_links_recipe_stats_slots_and_alteration_semantics(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "exports"
+            write_weapon_slice(root)
+            connection = connect(Path(directory) / "catalog.sqlite3")
+            try:
+                summary = ingest_asset_directory(
+                    connection, root, build_key="weapon-slice-test"
+                )
+                coverage = weapon_catalog_coverage(
+                    connection, summary["snapshot_id"]
+                )
+                detail = weapon_provenance(
+                    connection, "Test Rifle", summary["snapshot_id"]
+                )
+                search = weapon_catalog_search(
+                    connection, "Rifle", summary["snapshot_id"]
+                )
+            finally:
+                connection.close()
+
+        self.assertEqual(1, coverage["counts"]["weapon_identities"])
+        self.assertEqual(1, coverage["counts"]["weapon_variants"])
+        self.assertEqual(1, coverage["counts"]["resolved_weapon_schematics"])
+        self.assertEqual(1, coverage["counts"]["resolved_slot_options"])
+        self.assertEqual(1, coverage["counts"]["supported_alterations"])
+        self.assertEqual(1.0, coverage["ratios"]["weapon_schematic_link_resolution"])
+        self.assertEqual("Test Rifle", search["weapons"][0]["display_name"])
+        variant = detail["matches"][0]["variants"][0]
+        self.assertEqual("wid_test_sr_ore_t05", variant["primary_asset_name"])
+        self.assertEqual(100.0, variant["damage_point_blank"])
+        self.assertEqual(0.2, variant["crit_chance"])
+        self.assertEqual(11, variant["crafting_costs"][0]["quantity"])
+        option = detail["matches"][0]["slot_loadouts"][0]["slots"][0]["options"][0]
+        self.assertEqual("+30% Damage", option["description"])
+        self.assertEqual("supported", option["semantic_status"])
+
+    def test_weapon_schematic_stays_unresolved_without_explicit_asset_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "exports"
+            write_weapon_slice(root)
+            weapon_file = root / "Weapons" / "WID_Test_SR_Ore_T05.json"
+            payload = json.loads(weapon_file.read_text(encoding="utf-8"))
+            payload[0]["Properties"].pop("ActualAnalyticFNames")
+            weapon_file.write_text(json.dumps(payload), encoding="utf-8")
+            connection = connect(Path(directory) / "catalog.sqlite3")
+            try:
+                summary = ingest_asset_directory(
+                    connection, root, build_key="weapon-no-guess-test"
+                )
+                coverage = weapon_catalog_coverage(
+                    connection, summary["snapshot_id"]
+                )
+            finally:
+                connection.close()
+
+        self.assertEqual(0, coverage["counts"]["weapon_variants"])
+        self.assertEqual(1, coverage["counts"]["unresolved_weapon_schematics"])
+
+    def test_weapon_catalog_can_be_rederived_without_stale_leaf_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "exports"
+            write_weapon_slice(root)
+            connection = connect(Path(directory) / "catalog.sqlite3")
+            try:
+                first = ingest_asset_directory(
+                    connection, root, build_key="weapon-rederive-test"
+                )
+                before = {
+                    table: connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                    for table in (
+                        "catalog_schematic_costs",
+                        "catalog_weapon_stats",
+                        "catalog_weapon_slots",
+                        "catalog_weapon_slot_options",
+                    )
+                }
+                with connection:
+                    connection.execute(
+                        "DELETE FROM asset_normalization_runs WHERE snapshot_id=?",
+                        (first["snapshot_id"],),
+                    )
+                second = ingest_asset_directory(
+                    connection, root, build_key="weapon-rederive-test"
+                )
+                after = {
+                    table: connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                    for table in before
+                }
+            finally:
+                connection.close()
+
+        self.assertEqual(first["snapshot_id"], second["snapshot_id"])
+        self.assertFalse(second["idempotent"])
+        self.assertEqual(before, after)
+
     def test_hero_class_kits_preserve_real_gameplay_ability_shape(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "exports"
@@ -1323,7 +1700,7 @@ class AssetCatalogTests(unittest.TestCase):
         self.assertEqual(before, after)
         self.assertEqual("37.00", build["game_version"])
         self.assertEqual("123456", build["changelist"])
-        self.assertEqual("phase2-v11", second["normalization"]["normalizer_version"])
+        self.assertEqual("phase2-v13", second["normalization"]["normalizer_version"])
 
     def test_ingestion_preserves_duplicate_object_names_within_a_package(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1405,7 +1782,7 @@ class AssetCatalogTests(unittest.TestCase):
         self.assertEqual(first["snapshot_id"], second["snapshot_id"])
         self.assertFalse(second["idempotent"])
         self.assertGreater(tag_count, 0)
-        self.assertEqual([("phase2-v11", "ready")], [tuple(row) for row in runs])
+        self.assertEqual([("phase2-v13", "ready")], [tuple(row) for row in runs])
 
     def test_unresolved_references_are_reported_without_inference(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

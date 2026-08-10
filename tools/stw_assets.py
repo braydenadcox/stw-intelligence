@@ -16,7 +16,7 @@ from stw_pipeline import connect
 
 
 PERK_KIT_RE = re.compile(r"^Kit_Perk_H_(?P<family>.+)_(?P<tier>T\d+)$")
-NORMALIZER_VERSION = "phase2-v1"
+NORMALIZER_VERSION = "phase2-v8"
 
 
 @dataclass(frozen=True)
@@ -177,9 +177,21 @@ def ingest_asset_directory(
         ).fetchone()
         if existing is not None:
             if existing["status"] != "ready":
-                raise RuntimeError(
-                    f"asset snapshot {existing['id']} is not ready: {existing['status']}"
-                )
+                raw_file_count = connection.execute(
+                    "SELECT COUNT(*) FROM asset_files WHERE snapshot_id=?",
+                    (existing["id"],),
+                ).fetchone()[0]
+                if existing["status"] == "failed" and raw_file_count == 0:
+                    connection.execute(
+                        "DELETE FROM asset_snapshots WHERE id=?", (existing["id"],)
+                    )
+                    existing = None
+                else:
+                    raise RuntimeError(
+                        f"asset snapshot {existing['id']} is not ready: "
+                        f"{existing['status']}"
+                    )
+        if existing is not None:
             completed = connection.execute(
                 """
                 SELECT id FROM asset_normalization_runs
@@ -360,6 +372,8 @@ def _clear_normalized_snapshot(
         "catalog_mechanics",
         "catalog_opaque_mechanics",
         "catalog_inheritance_edges",
+        "catalog_hero_class_kits",
+        "catalog_ability_links",
         "catalog_gameplay_tags",
         "catalog_heroes",
         "catalog_perks",
@@ -368,6 +382,7 @@ def _clear_normalized_snapshot(
         "catalog_gameplay_effects",
         "catalog_magnitudes",
         "catalog_hero_classes",
+        "catalog_data_tables",
         "catalog_curve_tables",
     ):
         connection.execute(f"DELETE FROM {table} WHERE snapshot_id=?", (snapshot_id,))
@@ -441,10 +456,12 @@ def _normalize_snapshot(
     payloads: dict[int, dict[str, Any]],
 ) -> None:
     _normalize_curves(connection, snapshot_id, payloads)
+    _normalize_data_tables(connection, snapshot_id, payloads)
     _normalize_inheritance(connection, snapshot_id)
     _normalize_hero_classes(connection, snapshot_id, payloads)
     _normalize_effects(connection, snapshot_id, payloads)
     _normalize_ability_kits(connection, snapshot_id, payloads)
+    _normalize_hero_class_kits(connection, snapshot_id)
     _normalize_heroes(connection, snapshot_id, payloads)
     _normalize_gameplay_tags(connection, snapshot_id, payloads)
     _link_modifier_curves(connection, snapshot_id)
@@ -494,6 +511,59 @@ def _normalize_curves(
                     """,
                     (row_id, ordinal, time_value, output_value, point.get("InterpMode")),
                 )
+
+
+def _walk_data_table_handles(value: Any) -> Iterator[tuple[str, str]]:
+    if isinstance(value, dict):
+        table_path = _object_path(value.get("DataTable"))
+        row_name = value.get("RowName")
+        package = canonical_package_path(table_path)
+        if package and isinstance(row_name, str) and row_name not in {"", "None"}:
+            yield package, row_name
+        for child in value.values():
+            yield from _walk_data_table_handles(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from _walk_data_table_handles(child)
+
+
+def _normalize_data_tables(
+    connection: sqlite3.Connection,
+    snapshot_id: int,
+    payloads: dict[int, dict[str, Any]],
+) -> None:
+    requested_rows = {
+        handle for payload in payloads.values() for handle in _walk_data_table_handles(payload)
+    }
+    for object_id, export in payloads.items():
+        if export.get("Type") != "DataTable" or not isinstance(export.get("Rows"), dict):
+            continue
+        object_row = connection.execute(
+            "SELECT package_path FROM asset_objects WHERE id=?", (object_id,)
+        ).fetchone()
+        package = object_row["package_path"]
+        table_id = connection.execute(
+            """
+            INSERT INTO catalog_data_tables(
+                snapshot_id, source_object_id, package_path, table_name
+            ) VALUES (?, ?, ?, ?)
+            """,
+            (snapshot_id, object_id, package, export.get("Name", "Unknown")),
+        ).lastrowid
+        for row_name, row_payload in export["Rows"].items():
+            if (package, row_name) not in requested_rows:
+                continue
+            connection.execute(
+                """
+                INSERT INTO catalog_data_rows(data_table_id, row_name, row_json)
+                VALUES (?, ?, ?)
+                """,
+                (
+                    table_id,
+                    row_name,
+                    json.dumps(row_payload, sort_keys=True, separators=(",", ":")),
+                ),
+            )
 
 
 def _normalize_inheritance(connection: sqlite3.Connection, snapshot_id: int) -> None:
@@ -608,7 +678,7 @@ def _normalize_effects(
         )
     }
     for package in structural_packages:
-        semantic_id = _semantic_object_for_package(
+        semantic_id = _gameplay_effect_object_for_package(
             connection, snapshot_id, package, payloads
         )
         if semantic_id is not None:
@@ -736,9 +806,14 @@ def _insert_magnitude(
         attribute = magnitude.get("AttributeBasedMagnitude") or {}
         custom = magnitude.get("CustomMagnitude") or {}
         set_by_caller = magnitude.get("SetByCallerMagnitude") or {}
-        if calculation_type is None and ("Value" in magnitude or "Curve" in magnitude):
+        if calculation_type is None and (
+            "Value" in magnitude
+            or "Curve" in magnitude
+            or bool(scalable)
+        ):
             calculation_type = "ScalableFloat"
-            scalable = magnitude
+            if not scalable:
+                scalable = magnitude
         literal_value = scalable.get("Value")
         if "Custom" in str(calculation_type) or _object_path(custom.get("CalculationClassMagnitude")):
             status = "opaque"
@@ -1016,23 +1091,21 @@ def _normalize_ability_kits(
         kit_id = connection.execute(
             """
             INSERT INTO catalog_ability_kits(
-                snapshot_id, source_object_id, package_path, kit_name
-            ) VALUES (?, ?, ?, ?)
+                snapshot_id, source_object_id, package_path, kit_name, display_name
+            ) VALUES (?, ?, ?, ?, ?)
             """,
-            (snapshot_id, object_id, object_row["package_path"], object_row["object_name"]),
+            (
+                snapshot_id,
+                object_id,
+                object_row["package_path"],
+                object_row["object_name"],
+                _localized_text((export.get("Properties") or {}).get("DisplayName")),
+            ),
         ).lastrowid
         references = connection.execute(
             """
-            SELECT ar.*,
-                   ge.id AS gameplay_effect_id,
-                   ability.id AS ability_id
+            SELECT ar.*
             FROM asset_references ar
-            LEFT JOIN catalog_gameplay_effects ge
-              ON ge.snapshot_id=ar.snapshot_id
-             AND ge.package_path=ar.target_package_path
-            LEFT JOIN catalog_abilities ability
-              ON ability.snapshot_id=ar.snapshot_id
-             AND ability.package_path=ar.target_package_path
             WHERE ar.source_object_id=?
             """,
             (object_id,),
@@ -1043,15 +1116,35 @@ def _normalize_ability_kits(
             structural_ability = (
                 "grantedabilities" in path_lower
                 or "grantedgameplayabilities" in path_lower
+                or "gameplayabilities" in path_lower
+                or "gadgets" in path_lower
             )
-            ability_id = reference["ability_id"]
-            if structural_ability and reference["target_object_id"] is not None:
+            semantic_object_id = None
+            if structural_effect:
+                semantic_object_id = _gameplay_effect_object_for_package(
+                    connection,
+                    snapshot_id,
+                    reference["target_package_path"],
+                    payloads,
+                )
+            elif structural_ability:
                 semantic_object_id = _semantic_object_for_package(
                     connection,
                     snapshot_id,
                     reference["target_package_path"],
                     payloads,
                 )
+            effect_row = connection.execute(
+                "SELECT id FROM catalog_gameplay_effects WHERE source_object_id=?",
+                (semantic_object_id or reference["target_object_id"],),
+            ).fetchone()
+            gameplay_effect_id = effect_row["id"] if effect_row else None
+            ability_row = connection.execute(
+                "SELECT id FROM catalog_abilities WHERE source_object_id=?",
+                (semantic_object_id or reference["target_object_id"],),
+            ).fetchone()
+            ability_id = ability_row["id"] if ability_row else None
+            if structural_ability and reference["target_object_id"] is not None:
                 ability_id = _ensure_ability(
                     connection,
                     snapshot_id,
@@ -1060,7 +1153,7 @@ def _normalize_ability_kits(
                         semantic_object_id or reference["target_object_id"], {}
                     ),
                 )
-            if reference["gameplay_effect_id"] is not None or structural_effect:
+            if gameplay_effect_id is not None or structural_effect:
                 kind = "gameplay_effect"
             elif ability_id is not None or structural_ability:
                 kind = "ability"
@@ -1078,10 +1171,112 @@ def _normalize_ability_kits(
                     reference["id"],
                     kind,
                     reference["target_path"],
-                    reference["gameplay_effect_id"],
+                    gameplay_effect_id,
                     ability_id,
                 ),
             )
+    _normalize_linked_abilities(connection, snapshot_id, payloads)
+
+
+def _normalize_linked_abilities(
+    connection: sqlite3.Connection,
+    snapshot_id: int,
+    payloads: dict[int, dict[str, Any]],
+) -> None:
+    source_abilities = connection.execute(
+        """
+        SELECT id, source_object_id FROM catalog_abilities
+        WHERE snapshot_id=? ORDER BY id
+        """,
+        (snapshot_id,),
+    ).fetchall()
+    for source in source_abilities:
+        references = connection.execute(
+            """
+            SELECT * FROM asset_references
+            WHERE source_object_id=?
+              AND lower(property_path) LIKE '%gameplayability%'
+            ORDER BY id
+            """,
+            (source["source_object_id"],),
+        ).fetchall()
+        for reference in references:
+            target_ability_id = None
+            resolution_status = reference["resolution_status"]
+            if reference["target_object_id"] is not None:
+                semantic_object_id = _semantic_object_for_package(
+                    connection,
+                    snapshot_id,
+                    reference["target_package_path"],
+                    payloads,
+                )
+                target_object_id = semantic_object_id or reference["target_object_id"]
+                target_ability_id = _ensure_ability(
+                    connection,
+                    snapshot_id,
+                    target_object_id,
+                    payloads.get(target_object_id, {}),
+                )
+                resolution_status = "resolved"
+            connection.execute(
+                """
+                INSERT INTO catalog_ability_links(
+                    snapshot_id, source_ability_id, source_reference_id, relation,
+                    target_path, target_ability_id, resolution_status
+                ) VALUES (?, ?, ?, 'gameplay_ability', ?, ?, ?)
+                """,
+                (
+                    snapshot_id,
+                    source["id"],
+                    reference["id"],
+                    reference["target_path"],
+                    target_ability_id,
+                    resolution_status,
+                ),
+            )
+
+
+def _normalize_hero_class_kits(
+    connection: sqlite3.Connection, snapshot_id: int
+) -> None:
+    rows = connection.execute(
+        """
+        SELECT hero_class.id AS hero_class_id, reference.id AS reference_id,
+               reference.property_path, reference.target_path,
+               kit.id AS ability_kit_id
+        FROM catalog_hero_classes hero_class
+        JOIN asset_references reference
+          ON reference.source_object_id=hero_class.source_object_id
+        LEFT JOIN catalog_ability_kits kit
+          ON kit.snapshot_id=hero_class.snapshot_id
+         AND kit.package_path=reference.target_package_path
+        WHERE hero_class.snapshot_id=?
+          AND lower(reference.property_path) LIKE '%classabilitykits%'
+        ORDER BY hero_class.id, reference.property_path
+        """,
+        (snapshot_id,),
+    ).fetchall()
+    ordinals: dict[int, int] = {}
+    for row in rows:
+        match = re.search(r"ClassAbilityKits\[(\d+)\]", row["property_path"], re.I)
+        ordinal = int(match.group(1)) if match else ordinals.get(row["hero_class_id"], 0)
+        ordinals[row["hero_class_id"]] = ordinal + 1
+        connection.execute(
+            """
+            INSERT INTO catalog_hero_class_kits(
+                snapshot_id, hero_class_id, kit_ordinal, source_reference_id,
+                ability_kit_path, ability_kit_id
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                snapshot_id,
+                row["hero_class_id"],
+                ordinal,
+                row["reference_id"],
+                row["target_path"],
+                row["ability_kit_id"],
+            ),
+        )
 
 
 def _semantic_object_for_package(
@@ -1101,8 +1296,56 @@ def _semantic_object_for_package(
     for row in candidates:
         payload = payloads.get(row["id"], {})
         score = 0
-        if isinstance(payload.get("Properties"), dict):
+        properties = payload.get("Properties")
+        if isinstance(properties, dict):
             score += 2
+            if properties:
+                score += 2
+        if row["object_type"] != "BlueprintGeneratedClass":
+            score += 1
+        scored.append((score, row["id"]))
+    if not scored:
+        return None
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    return scored[0][1]
+
+
+def _gameplay_effect_object_for_package(
+    connection: sqlite3.Connection,
+    snapshot_id: int,
+    package_path: str,
+    payloads: dict[int, dict[str, Any]],
+) -> int | None:
+    candidates = connection.execute(
+        """
+        SELECT id, object_type, object_name FROM asset_objects
+        WHERE snapshot_id=? AND package_path=? ORDER BY export_index
+        """,
+        (snapshot_id, package_path),
+    ).fetchall()
+    scored: list[tuple[int, int]] = []
+    effect_keys = {
+        "DurationPolicy",
+        "DurationMagnitude",
+        "Period",
+        "ChanceToApplyToTarget",
+        "Executions",
+        "GameplayEffectExecutionDefinitions",
+        "StackingType",
+        "StackLimitCount",
+    }
+    for row in candidates:
+        payload = payloads.get(row["id"], {})
+        properties = payload.get("Properties")
+        score = 0
+        if isinstance(properties, dict):
+            if "Modifiers" in properties:
+                score += 100
+            if "GEComponents" in properties:
+                score += 50
+            score += 10 * len(effect_keys.intersection(properties))
+        if str(row["object_name"]).startswith("Default__"):
+            score += 5
         if row["object_type"] != "BlueprintGeneratedClass":
             score += 1
         scored.append((score, row["id"]))
@@ -1159,6 +1402,7 @@ def _normalize_ability_mechanics(
         ("CooldownDuration", "cooldown"),
         ("AbilityCooldown", "cooldown"),
         ("ChargeTime", "charge_time"),
+        ("AbilityDuration", "duration"),
     ):
         if key not in properties:
             continue
@@ -1182,12 +1426,44 @@ def _normalize_ability_mechanics(
             magnitude_id=magnitude_id,
             status="supported" if magnitude_id is not None else "partial",
         )
+    costs = properties.get("Costs")
+    if costs is not None:
+        recognized = True
+        cost_items = costs if isinstance(costs, list) else [costs]
+        for ordinal, cost in enumerate(cost_items):
+            if not isinstance(cost, dict):
+                continue
+            property_path = f"$.Properties.Costs[{ordinal}]"
+            magnitude_id = _insert_magnitude(
+                connection,
+                snapshot_id,
+                source_object_id,
+                f"{property_path}.CostValue",
+                "ability_cost",
+                cost.get("CostValue"),
+            )
+            _insert_mechanic(
+                connection,
+                snapshot_id,
+                source_object_id,
+                "ability",
+                ability_id,
+                "cost",
+                property_path,
+                magnitude_id=magnitude_id,
+                value=cost,
+                status="supported" if magnitude_id is not None else "partial",
+            )
     for key, mechanic_type in (
         ("CooldownGameplayEffectClass", "cooldown_effect"),
         ("CostGameplayEffectClass", "cost_effect"),
         ("AbilityTriggers", "trigger"),
         ("ActivationRequiredTags", "activation_condition"),
         ("ActivationBlockedTags", "activation_condition"),
+        ("AbilityTags", "ability_tags"),
+        ("ActivationOwnedTags", "owned_tags"),
+        ("DamageStatHandle", "damage_stat_row"),
+        ("EffectContainers", "effect_container"),
     ):
         if key not in properties:
             continue
@@ -1561,14 +1837,28 @@ def hero_provenance(
     ).fetchone()
     if hero is None:
         return None
-    abilities = connection.execute(
+    ability_rows = connection.execute(
         """
-        SELECT ability_ordinal, ability_kit_path, minimum_rarity,
-               CASE WHEN ability_kit_id IS NULL THEN 'unresolved' ELSE 'resolved' END status
-        FROM catalog_hero_abilities WHERE hero_id=? ORDER BY ability_ordinal
+        SELECT ha.ability_ordinal, ha.ability_kit_path, ha.minimum_rarity,
+               ha.ability_kit_id, ak.display_name
+        FROM catalog_hero_abilities ha
+        LEFT JOIN catalog_ability_kits ak ON ak.id=ha.ability_kit_id
+        WHERE ha.hero_id=? ORDER BY ha.ability_ordinal
         """,
         (hero["id"],),
     ).fetchall()
+    abilities = []
+    for row in ability_rows:
+        evidence = _ability_kit_semantic_status(connection, row["ability_kit_id"])
+        abilities.append(
+            {
+                "ability_ordinal": row["ability_ordinal"],
+                "ability_kit_path": row["ability_kit_path"],
+                "minimum_rarity": row["minimum_rarity"],
+                "display_name": row["display_name"],
+                **evidence,
+            }
+        )
     variants = connection.execute(
         """
         SELECT hv.variant_key, hv.display_name, hv.rarity, hv.tier,
@@ -1591,6 +1881,16 @@ def hero_provenance(
         """,
         (hero["id"],),
     ).fetchall()
+    class_kits = connection.execute(
+        """
+        SELECT class_kit.kit_ordinal, class_kit.ability_kit_path,
+               class_kit.ability_kit_id, kit.kit_name, kit.display_name
+        FROM catalog_hero_class_kits class_kit
+        LEFT JOIN catalog_ability_kits kit ON kit.id=class_kit.ability_kit_id
+        WHERE class_kit.hero_class_id=? ORDER BY class_kit.kit_ordinal
+        """,
+        (hero["hero_class_id"],),
+    ).fetchall() if hero["hero_class_id"] else []
     return {
         "snapshot_id": snapshot_id,
         "build": {
@@ -1604,6 +1904,18 @@ def hero_provenance(
             "class": hero["hero_class"],
             "class_path": hero["hero_class_path"],
             "class_status": "resolved" if hero["hero_class_id"] else "unresolved",
+            "class_kits": [
+                {
+                    "ordinal": row["kit_ordinal"],
+                    "ability_kit_path": row["ability_kit_path"],
+                    "kit_name": row["kit_name"],
+                    "display_name": row["display_name"],
+                    **_ability_kit_semantic_status(
+                        connection, row["ability_kit_id"]
+                    ),
+                }
+                for row in class_kits
+            ],
             "statline_tags": json.loads(hero["statline_tags_json"]),
             "source": _source_evidence(hero),
         },
@@ -1618,12 +1930,167 @@ def hero_provenance(
             }
             for row in variants
         ],
-        "abilities": [dict(row) for row in abilities],
+        "abilities": abilities,
         "perks": [_perk_provenance(connection, snapshot_id, row) for row in perks],
         "unresolved": unresolved_reference_report(
             connection, snapshot_id=snapshot_id, source_prefix=hero["package_path"].rsplit("/", 2)[0]
         ),
     }
+
+
+def _ability_kit_semantic_status(
+    connection: sqlite3.Connection, ability_kit_id: int | None
+) -> dict[str, Any]:
+    if ability_kit_id is None:
+        return {"status": "unresolved", "unresolved_grants": []}
+    grants = connection.execute(
+        """
+        SELECT grant_row.grant_kind, grant_row.target_path,
+               grant_row.gameplay_effect_id, grant_row.ability_id,
+               reference.resolution_status,
+               ability.source_object_id AS ability_source_object_id
+        FROM catalog_ability_kit_grants grant_row
+        JOIN asset_references reference ON reference.id=grant_row.source_reference_id
+        LEFT JOIN catalog_abilities ability ON ability.id=grant_row.ability_id
+        WHERE grant_row.ability_kit_id=?
+          AND grant_row.grant_kind IN ('ability', 'gameplay_effect')
+        ORDER BY grant_row.target_path
+        """,
+        (ability_kit_id,),
+    ).fetchall()
+    unresolved = [
+        row["target_path"]
+        for row in grants
+        if row["resolution_status"] != "resolved"
+        or (
+            row["grant_kind"] == "ability" and row["ability_id"] is None
+        )
+        or (
+            row["grant_kind"] == "gameplay_effect"
+            and row["gameplay_effect_id"] is None
+        )
+    ]
+    implementations: list[dict[str, Any]] = []
+    for row in grants:
+        if row["grant_kind"] != "ability" or row["ability_source_object_id"] is None:
+            continue
+        links = connection.execute(
+            """
+            SELECT link.target_path, link.resolution_status,
+                   target.id AS target_ability_id,
+                   target.display_name, target.ability_key,
+                   target.package_path, target.semantic_status,
+                   target.source_object_id
+            FROM catalog_ability_links link
+            LEFT JOIN catalog_abilities target ON target.id=link.target_ability_id
+            WHERE link.source_ability_id=? ORDER BY link.target_path
+            """,
+            (row["ability_id"],),
+        ).fetchall()
+        unresolved.extend(
+            linked["target_path"]
+            for linked in links
+            if linked["resolution_status"] != "resolved"
+        )
+        for linked in links:
+            dependencies: list[str] = []
+            if linked["source_object_id"] is not None:
+                references = connection.execute(
+                    """
+                    SELECT reference.property_path, reference.target_path,
+                           reference.target_package_path,
+                           reference.resolution_status,
+                           object.object_type AS source_type
+                    FROM asset_references reference
+                    JOIN asset_objects object ON object.id=reference.source_object_id
+                    WHERE reference.source_object_id=?
+                      AND reference.resolution_status <> 'resolved'
+                    ORDER BY reference.target_path
+                    """,
+                    (linked["source_object_id"],),
+                ).fetchall()
+                for reference in references:
+                    priority, _, _ = _queue_classification(
+                        reference["source_type"],
+                        reference["property_path"],
+                        reference["target_package_path"],
+                    )
+                    if priority <= 1:
+                        dependencies.append(reference["target_path"])
+            unresolved.extend(dependencies)
+            implementations.append(
+                {
+                    "target_path": linked["target_path"],
+                    "status": linked["resolution_status"],
+                    "ability_key": linked["ability_key"],
+                    "display_name": linked["display_name"],
+                    "package_path": linked["package_path"],
+                    "semantic_status": linked["semantic_status"],
+                    "unresolved_dependencies": sorted(set(dependencies)),
+                    "mechanics": (
+                        _ability_mechanics(connection, linked["target_ability_id"])
+                        if linked["target_ability_id"] is not None
+                        else []
+                    ),
+                }
+            )
+    unresolved = sorted(set(unresolved))
+    if not grants:
+        status = "partial_no_semantic_grants"
+    elif unresolved:
+        status = "partial_missing_grants"
+    else:
+        status = "resolved"
+    return {
+        "status": status,
+        "unresolved_grants": unresolved,
+        "implementations": implementations,
+    }
+
+
+def _ability_mechanics(
+    connection: sqlite3.Connection, ability_id: int
+) -> list[dict[str, Any]]:
+    rows = connection.execute(
+        """
+        SELECT mechanic.mechanic_type, mechanic.property_path,
+               mechanic.conditions_json, mechanic.value_json,
+               mechanic.interpretation_status,
+               magnitude.calculation_type, magnitude.literal_value,
+               magnitude.curve_table_path, magnitude.curve_row_name,
+               magnitude.interpretation_status AS magnitude_status,
+               (SELECT point.output_value
+                FROM catalog_curve_points point
+                WHERE point.curve_row_id=magnitude.curve_row_id
+                ORDER BY point.point_ordinal LIMIT 1) AS curve_output_value
+        FROM catalog_mechanics mechanic
+        LEFT JOIN catalog_magnitudes magnitude ON magnitude.id=mechanic.magnitude_id
+        WHERE owner_domain='ability' AND owner_id=? ORDER BY mechanic.id
+        """,
+        (ability_id,),
+    ).fetchall()
+    return [
+        {
+            "type": row["mechanic_type"],
+            "property_path": row["property_path"],
+            "conditions": json.loads(row["conditions_json"]),
+            "value": json.loads(row["value_json"]),
+            "status": row["interpretation_status"],
+            "magnitude": (
+                {
+                    "calculation_type": row["calculation_type"],
+                    "literal_value": row["literal_value"],
+                    "curve_table_path": row["curve_table_path"],
+                    "curve_row_name": row["curve_row_name"],
+                    "curve_output_value": row["curve_output_value"],
+                    "status": row["magnitude_status"],
+                }
+                if row["calculation_type"] is not None
+                else None
+            ),
+        }
+        for row in rows
+    ]
 
 
 def _perk_provenance(
@@ -1652,6 +2119,21 @@ def _perk_provenance(
         ).fetchone()
         if kit_source is not None:
             result["ability_kit_source"] = _source_evidence(kit_source)
+        unresolved_grants = connection.execute(
+            """
+            SELECT grant_row.target_path
+            FROM catalog_ability_kit_grants grant_row
+            JOIN asset_references reference
+              ON reference.id=grant_row.source_reference_id
+            WHERE grant_row.ability_kit_id=?
+              AND grant_row.grant_kind='gameplay_effect'
+              AND (reference.resolution_status <> 'resolved'
+                   OR grant_row.gameplay_effect_id IS NULL)
+            ORDER BY grant_row.target_path
+            """,
+            (perk["ability_kit_id"],),
+        ).fetchall()
+        result["unresolved_grants"] = [row["target_path"] for row in unresolved_grants]
         modifiers = connection.execute(
             """
             SELECT ge.effect_name, ge.template_path, ge.stacking_type, ge.stack_limit,
@@ -1746,7 +2228,9 @@ def _perk_provenance(
                     },
                 }
             )
-        if not result["effects"]:
+        if result["unresolved_grants"]:
+            result["status"] = "partial_missing_grants"
+        elif not result["effects"]:
             result["status"] = "resolved_kit_without_supported_effect"
     return result
 
@@ -1897,8 +2381,32 @@ def _queue_classification(
         return 0, "hero_perk_kit", "closes a hero support/commander perk grant"
     if "tierabilitykits" in path or "grantedabilitykit" in path:
         return 0, "active_ability_kit", "closes a hero active-ability or perk kit"
+    if "gadgets" in path:
+        return (
+            0,
+            "active_ability_implementation",
+            "resolves the active ability gadget implementation",
+        )
+    if "gameplayability" in path or "gameplayabilities" in path:
+        return (
+            0,
+            "active_ability_logic",
+            "resolves the GameplayAbility explicitly selected by the gadget",
+        )
+    if ".items." in path:
+        return (
+            1,
+            "active_ability_resource",
+            "resolves an item or resource explicitly used by an active ability kit",
+        )
     if "combinedstatges" in path:
         return 2, "hero_stat_effect", "supports later hero-stat evaluation"
+    if "damagestathandle" in path:
+        return 1, "ability_scaling", "resolves an active ability's damage-stat row"
+    if "classabilitykits" in path:
+        return 1, "hero_class_perk", "closes a class-granted perk kit"
+    if "additionalitemstoloadwhenequipped" in path:
+        return 1, "ability_payload", "resolves an item used by an active ability"
     if "gameplayeffect" in path:
         return 0, "granted_gameplay_effect", "reveals an explicitly granted GameplayEffect"
     if ".template." in path or ".super." in path or ".archetype." in path:
@@ -2026,11 +2534,121 @@ def catalog_coverage(
             JOIN catalog_heroes h ON h.id=hv.hero_id WHERE h.snapshot_id=?
         """,
         "hero_classes": "SELECT COUNT(*) FROM catalog_hero_classes WHERE snapshot_id=?",
+        "hero_class_kits": "SELECT COUNT(*) FROM catalog_hero_class_kits WHERE snapshot_id=?",
+        "resolved_hero_class_kit_files": """
+            SELECT COUNT(*) FROM catalog_hero_class_kits
+            WHERE snapshot_id=? AND ability_kit_id IS NOT NULL
+        """,
         "abilities": "SELECT COUNT(*) FROM catalog_abilities WHERE snapshot_id=?",
         "perks": "SELECT COUNT(*) FROM catalog_perks WHERE snapshot_id=?",
-        "resolved_perk_kits": """
+        "resolved_perk_kit_files": """
             SELECT COUNT(*) FROM catalog_perks
             WHERE snapshot_id=? AND ability_kit_id IS NOT NULL
+        """,
+        "fully_resolved_perks": """
+            SELECT COUNT(*) FROM catalog_perks perk
+            WHERE perk.snapshot_id=? AND perk.ability_kit_id IS NOT NULL
+              AND NOT EXISTS (
+                  SELECT 1 FROM catalog_ability_kit_grants grant_row
+                  JOIN asset_references reference
+                    ON reference.id=grant_row.source_reference_id
+                  WHERE grant_row.ability_kit_id=perk.ability_kit_id
+                    AND grant_row.grant_kind='gameplay_effect'
+                    AND (reference.resolution_status <> 'resolved'
+                         OR grant_row.gameplay_effect_id IS NULL)
+              )
+        """,
+        "hero_active_kits": """
+            SELECT COUNT(*) FROM catalog_hero_abilities ability_row
+            JOIN catalog_heroes hero ON hero.id=ability_row.hero_id
+            WHERE hero.snapshot_id=?
+        """,
+        "resolved_active_kit_files": """
+            SELECT COUNT(*) FROM catalog_hero_abilities ability_row
+            JOIN catalog_heroes hero ON hero.id=ability_row.hero_id
+            WHERE hero.snapshot_id=? AND ability_row.ability_kit_id IS NOT NULL
+        """,
+        "fully_resolved_active_kits": """
+            SELECT COUNT(*) FROM catalog_hero_abilities hero_ability
+            JOIN catalog_heroes hero ON hero.id=hero_ability.hero_id
+            WHERE hero.snapshot_id=? AND hero_ability.ability_kit_id IS NOT NULL
+              AND NOT EXISTS (
+                  SELECT 1 FROM catalog_ability_kit_grants grant_row
+                  JOIN asset_references reference
+                    ON reference.id=grant_row.source_reference_id
+                  LEFT JOIN catalog_abilities ability
+                    ON ability.id=grant_row.ability_id
+                  WHERE grant_row.ability_kit_id=hero_ability.ability_kit_id
+                    AND grant_row.grant_kind IN ('ability', 'gameplay_effect')
+                    AND (
+                        reference.resolution_status <> 'resolved'
+                        OR (grant_row.grant_kind='ability'
+                            AND grant_row.ability_id IS NULL)
+                        OR (grant_row.grant_kind='gameplay_effect'
+                            AND grant_row.gameplay_effect_id IS NULL)
+                        OR EXISTS (
+                            SELECT 1 FROM asset_references linked_reference
+                            WHERE linked_reference.source_object_id=ability.source_object_id
+                              AND lower(linked_reference.property_path)
+                                  LIKE '%gameplayability%'
+                              AND linked_reference.resolution_status <> 'resolved'
+                        )
+                        OR EXISTS (
+                            SELECT 1 FROM catalog_ability_links ability_link
+                            JOIN catalog_abilities linked_ability
+                              ON linked_ability.id=ability_link.target_ability_id
+                            JOIN asset_references dependency
+                              ON dependency.source_object_id=linked_ability.source_object_id
+                            WHERE ability_link.source_ability_id=ability.id
+                              AND dependency.resolution_status <> 'resolved'
+                              AND (
+                                  lower(dependency.property_path) LIKE '%gameplayeffect%'
+                                  OR lower(dependency.property_path) LIKE '%.template.%'
+                                  OR lower(dependency.property_path) LIKE '%.super.%'
+                                  OR lower(dependency.property_path) LIKE '%.archetype.%'
+                              )
+                        )
+                    )
+              )
+        """,
+        "ability_links": "SELECT COUNT(*) FROM catalog_ability_links WHERE snapshot_id=?",
+        "data_tables": "SELECT COUNT(*) FROM catalog_data_tables WHERE snapshot_id=?",
+        "referenced_data_rows": """
+            SELECT COUNT(*) FROM catalog_data_rows row
+            JOIN catalog_data_tables table_row ON table_row.id=row.data_table_id
+            WHERE table_row.snapshot_id=?
+        """,
+        "unresolved_gameplay_ability_links": """
+            SELECT COUNT(*) FROM asset_references reference
+            JOIN catalog_abilities ability
+              ON ability.source_object_id=reference.source_object_id
+            WHERE ability.snapshot_id=?
+              AND lower(reference.property_path) LIKE '%gameplayability%'
+              AND reference.resolution_status <> 'resolved'
+        """,
+        "unresolved_active_semantic_dependencies": """
+            SELECT COUNT(*) FROM catalog_ability_links link
+            JOIN catalog_abilities target ON target.id=link.target_ability_id
+            JOIN asset_references dependency
+              ON dependency.source_object_id=target.source_object_id
+            WHERE link.snapshot_id=? AND dependency.resolution_status <> 'resolved'
+              AND (
+                  lower(dependency.property_path) LIKE '%gameplayeffect%'
+                  OR lower(dependency.property_path) LIKE '%.template.%'
+                  OR lower(dependency.property_path) LIKE '%.super.%'
+                  OR lower(dependency.property_path) LIKE '%.archetype.%'
+              )
+        """,
+        "unresolved_semantic_grants": """
+            SELECT COUNT(*) FROM catalog_ability_kit_grants grant_row
+            JOIN catalog_ability_kits kit ON kit.id=grant_row.ability_kit_id
+            JOIN asset_references reference ON reference.id=grant_row.source_reference_id
+            WHERE kit.snapshot_id=?
+              AND grant_row.grant_kind IN ('ability', 'gameplay_effect')
+              AND (reference.resolution_status <> 'resolved'
+                   OR (grant_row.grant_kind='ability' AND grant_row.ability_id IS NULL)
+                   OR (grant_row.grant_kind='gameplay_effect'
+                       AND grant_row.gameplay_effect_id IS NULL))
         """,
         "ability_kits": "SELECT COUNT(*) FROM catalog_ability_kits WHERE snapshot_id=?",
         "gameplay_effects": "SELECT COUNT(*) FROM catalog_gameplay_effects WHERE snapshot_id=?",
@@ -2059,7 +2677,8 @@ def catalog_coverage(
         "snapshot_id": snapshot_id,
         "counts": counts,
         "ratios": {
-            "perk_kit_resolution": counts["resolved_perk_kits"] / perks if perks else None,
+            "perk_kit_file_resolution": counts["resolved_perk_kit_files"] / perks if perks else None,
+            "perk_semantic_resolution": counts["fully_resolved_perks"] / perks if perks else None,
             "inheritance_resolution": (
                 (inheritance - counts["unresolved_inheritance"]) / inheritance
                 if inheritance
@@ -2096,6 +2715,9 @@ def _snapshot_summary(
             "catalog_curve_tables",
             "catalog_hero_classes",
             "catalog_abilities",
+            "catalog_ability_links",
+            "catalog_hero_class_kits",
+            "catalog_data_tables",
             "catalog_gameplay_tags",
             "catalog_magnitudes",
             "catalog_mechanics",

@@ -135,8 +135,14 @@ def write_golden_slice(root: Path) -> list[Path]:
                         "Name": kit_name,
                         "Package": kit_package,
                         "Properties": {
+                            "DisplayName": {"SourceString": "Assault Damage"},
                             "GrantedGameplayEffects": [
-                                _reference(effect_package, f"{effect_name}_C")
+                                {
+                                    "GameplayEffect": _reference(
+                                        effect_package, f"{effect_name}_C"
+                                    ),
+                                    "Level": 0,
+                                }
                             ]
                         },
                     }
@@ -382,6 +388,467 @@ def extend_with_phase_two_semantics(root: Path) -> list[Path]:
 
 
 class AssetCatalogTests(unittest.TestCase):
+    def test_hero_class_kits_preserve_real_gameplay_ability_shape(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "exports"
+            write_golden_slice(root)
+            class_package = (
+                "/SaveTheWorld/Abilities/Player/Perks/Class/Commando/HCGD_Commando"
+            )
+            kit_package = (
+                "/SaveTheWorld/Abilities/Player/Perks/Class/Commando/StayFrosty/"
+                "Kit_Perk_C_Commando_StayFrosty_T01"
+            )
+            ability_package = (
+                "/SaveTheWorld/Abilities/Player/Perks/Class/Commando/StayFrosty/"
+                "GA_Perk_C_Commando_StayFrosty_T01"
+            )
+            effect_package = (
+                "/SaveTheWorld/Abilities/Player/Perks/Class/Commando/StayFrosty/"
+                "GE_Perk_C_Commando_StayFrosty_T01_Tag"
+            )
+            _write_export(
+                root,
+                "Classes/HCGD_Commando.json",
+                [
+                    {
+                        "Type": "FortHeroClassGameplayDefinition",
+                        "Name": "HCGD_Commando",
+                        "Package": class_package,
+                        "Properties": {
+                            "ClassAbilityKits": [
+                                {"ObjectPath": f"{kit_package}.Kit"}
+                            ]
+                        },
+                    }
+                ],
+            )
+            _write_export(
+                root,
+                "Classes/Kit_Perk_C_Commando_StayFrosty_T01.json",
+                [
+                    {
+                        "Type": "FortAbilityKit",
+                        "Name": "Kit",
+                        "Package": kit_package,
+                        "Properties": {
+                            "DisplayName": {"SourceString": "Stay Frosty"},
+                            "GameplayAbilities": {
+                                "ObjectPath": f"{ability_package}.0"
+                            },
+                            "GrantedGameplayEffects": {
+                                "GameplayEffect": {
+                                    "ObjectPath": f"{effect_package}.1"
+                                }
+                            },
+                        },
+                    }
+                ],
+            )
+            connection = connect(Path(directory) / "catalog.sqlite3")
+            try:
+                summary = ingest_asset_directory(
+                    connection, root, build_key="hero-class-kit-test"
+                )
+                hero = hero_provenance(connection, "Rescue Trooper Ramirez")
+                coverage = catalog_coverage(connection, summary["snapshot_id"])
+            finally:
+                connection.close()
+
+        assert hero is not None
+        class_kit = hero["hero"]["class_kits"][0]
+        self.assertEqual("Stay Frosty", class_kit["display_name"])
+        self.assertEqual("partial_missing_grants", class_kit["status"])
+        self.assertEqual(
+            sorted([f"{ability_package}.0", f"{effect_package}.1"]),
+            class_kit["unresolved_grants"],
+        )
+        self.assertEqual(1, coverage["counts"]["hero_class_kits"])
+        self.assertEqual(1, coverage["counts"]["resolved_hero_class_kit_files"])
+
+    def test_linked_gameplay_ability_and_referenced_data_row_are_normalized(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "exports"
+            write_golden_slice(root)
+            kit = (
+                "/SaveTheWorld/Abilities/Player/Commando/Actives/FragGrenade/"
+                "Kit_Commando_FragGrenade"
+            )
+            gadget = (
+                "/SaveTheWorld/Abilities/Player/Commando/Actives/FragGrenade/"
+                "G_Commando_FragGrenade"
+            )
+            gameplay_ability = (
+                "/SaveTheWorld/Abilities/Player/Commando/Actives/FragGrenade/"
+                "GA_Commando_FragGrenade_WithTrajectory"
+            )
+            table = "/Game/Balance/DataTables/GadgetScaling"
+            _write_export(
+                root,
+                "Abilities/Kit_Commando_FragGrenade.json",
+                [
+                    {
+                        "Type": "FortAbilityKit",
+                        "Name": "Kit_Commando_FragGrenade",
+                        "Package": kit,
+                        "Properties": {
+                            "Gadgets": [{"ObjectPath": f"{gadget}.Gadget"}]
+                        },
+                    }
+                ],
+            )
+            _write_export(
+                root,
+                "Abilities/G_Commando_FragGrenade.json",
+                [
+                    {
+                        "Type": "FortGadgetItemDefinition",
+                        "Name": "Gadget",
+                        "Package": gadget,
+                        "Properties": {
+                            "GameplayAbility": {
+                                "ObjectPath": f"{gameplay_ability}.0"
+                            }
+                        },
+                    }
+                ],
+            )
+            _write_export(
+                root,
+                "Abilities/GA_Commando_FragGrenade_WithTrajectory.json",
+                [
+                    {
+                        "Type": "BlueprintGeneratedClass",
+                        "Name": "GA_Commando_FragGrenade_WithTrajectory_C",
+                        "Package": gameplay_ability,
+                        "Properties": {},
+                    },
+                    {
+                        "Type": "GA_Commando_FragGrenade_WithTrajectory_C",
+                        "Name": "Default__GA_Commando_FragGrenade_WithTrajectory_C",
+                        "Package": gameplay_ability,
+                        "Properties": {
+                            "AbilityDuration": 8.0,
+                            "Costs": {"CostValue": {"Value": 30.0, "Curve": {}}},
+                            "DamageStatHandle": {
+                                "DataTable": {"ObjectPath": f"{table}.0"},
+                                "RowName": "Commando_FragGrenade",
+                            },
+                        },
+                    },
+                ],
+            )
+            _write_export(
+                root,
+                "Balance/GadgetScaling.json",
+                [
+                    {
+                        "Type": "DataTable",
+                        "Name": "GadgetScaling",
+                        "Package": table,
+                        "Properties": {},
+                        "Rows": {
+                            "Commando_FragGrenade": {"DmgPB": 153.0},
+                            "Unreferenced": {"DmgPB": 999.0},
+                        },
+                    }
+                ],
+            )
+            connection = connect(Path(directory) / "catalog.sqlite3")
+            try:
+                summary = ingest_asset_directory(
+                    connection, root, build_key="linked-ability-test"
+                )
+                hero = hero_provenance(connection, "Rescue Trooper Ramirez")
+                coverage = catalog_coverage(connection, summary["snapshot_id"])
+                data_rows = connection.execute(
+                    "SELECT row_name, row_json FROM catalog_data_rows"
+                ).fetchall()
+            finally:
+                connection.close()
+
+        assert hero is not None
+        frag = hero["abilities"][0]
+        self.assertEqual("resolved", frag["status"])
+        self.assertEqual(1, len(frag["implementations"]))
+        self.assertEqual(
+            gameplay_ability, frag["implementations"][0]["package_path"]
+        )
+        self.assertEqual(
+            {"duration", "cost", "damage_stat_row"},
+            {row["type"] for row in frag["implementations"][0]["mechanics"]},
+        )
+        duration = next(
+            row
+            for row in frag["implementations"][0]["mechanics"]
+            if row["type"] == "duration"
+        )
+        self.assertEqual(8.0, duration["magnitude"]["literal_value"])
+        cost = next(
+            row
+            for row in frag["implementations"][0]["mechanics"]
+            if row["type"] == "cost"
+        )
+        self.assertEqual(30.0, cost["magnitude"]["literal_value"])
+        self.assertEqual(1, coverage["counts"]["ability_links"])
+        self.assertEqual(1, coverage["counts"]["referenced_data_rows"])
+        self.assertEqual(
+            [("Commando_FragGrenade", '{"DmgPB":153.0}')],
+            [tuple(row) for row in data_rows],
+        )
+
+    def test_real_gadget_exposes_exact_gameplay_ability_dependency(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "exports"
+            write_golden_slice(root)
+            kit = (
+                "/SaveTheWorld/Abilities/Player/Commando/Actives/FragGrenade/"
+                "Kit_Commando_FragGrenade"
+            )
+            gadget = (
+                "/SaveTheWorld/Abilities/Player/Commando/Actives/FragGrenade/"
+                "G_Commando_FragGrenade"
+            )
+            gameplay_ability = (
+                "/SaveTheWorld/Abilities/Player/Commando/Actives/FragGrenade/"
+                "GA_Commando_FragGrenade_WithTrajectory"
+            )
+            _write_export(
+                root,
+                "Abilities/Kit_Commando_FragGrenade.json",
+                [
+                    {
+                        "Type": "FortAbilityKit",
+                        "Name": "Kit_Commando_FragGrenade",
+                        "Package": kit,
+                        "Properties": {
+                            "DisplayName": {"SourceString": "Frag Grenade"},
+                            "Gadgets": [
+                                {"ObjectPath": f"{gadget}.G_Commando_FragGrenade"}
+                            ],
+                        },
+                    }
+                ],
+            )
+            _write_export(
+                root,
+                "Abilities/G_Commando_FragGrenade.json",
+                [
+                    {
+                        "Type": "FortGadgetItemDefinition",
+                        "Name": "G_Commando_FragGrenade",
+                        "Package": gadget,
+                        "Properties": {
+                            "GameplayAbility": {
+                                "AssetPathName": (
+                                    f"{gameplay_ability}."
+                                    "GA_Commando_FragGrenade_WithTrajectory_C"
+                                )
+                            }
+                        },
+                    }
+                ],
+            )
+            connection = connect(Path(directory) / "catalog.sqlite3")
+            try:
+                summary = ingest_asset_directory(
+                    connection, root, build_key="real-gadget-test"
+                )
+                hero = hero_provenance(connection, "Rescue Trooper Ramirez")
+                queue = asset_export_queue(
+                    connection,
+                    summary["snapshot_id"],
+                    hero_name="Rescue Trooper Ramirez",
+                )
+            finally:
+                connection.close()
+
+        assert hero is not None
+        frag = hero["abilities"][0]
+        self.assertEqual("partial_missing_grants", frag["status"])
+        self.assertEqual(
+            [f"{gameplay_ability}.GA_Commando_FragGrenade_WithTrajectory_C"],
+            frag["unresolved_grants"],
+        )
+        queued = next(
+            asset
+            for asset in queue["assets"]
+            if asset["package_path"] == gameplay_ability
+        )
+        self.assertEqual(0, queued["priority"])
+        self.assertIn("active_ability_logic", queued["categories"])
+
+    def test_grant_resolves_one_semantic_effect_from_multi_export_package(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "exports"
+            source_files = write_golden_slice(root)
+            support_kit = next(
+                path
+                for path in source_files
+                if path.name == "Kit_Perk_H_AssaultDamage_T01.json"
+            )
+            payload = json.loads(support_kit.read_text(encoding="utf-8"))
+            payload[0]["Properties"]["GrantedGameplayEffects"].append(
+                {
+                    "GameplayEffect": {"ObjectPath": "/Test/Effects/GE_Multi.1"},
+                    "Level": 0,
+                }
+            )
+            support_kit.write_text(
+                json.dumps(payload, separators=(",", ":")), encoding="utf-8"
+            )
+            _write_export(
+                root,
+                "Effects/GE_Multi.json",
+                [
+                    {
+                        "Type": "AssetTagsGameplayEffectComponent",
+                        "Name": "AssetTagsGameplayEffectComponent_0",
+                        "Package": "/Test/Effects/GE_Multi",
+                        "Properties": {
+                            "InheritableAssetTags": {
+                                "Added": ["Asset.Test.MultiExport"]
+                            }
+                        },
+                    },
+                    {
+                        "Type": "BlueprintGeneratedClass",
+                        "Name": "GE_Multi_C",
+                        "Package": "/Test/Effects/GE_Multi",
+                        "Properties": {},
+                    },
+                    {
+                        "Type": "GE_Multi_C",
+                        "Name": "Default__GE_Multi_C",
+                        "Package": "/Test/Effects/GE_Multi",
+                        "Properties": {
+                            "GEComponents": [],
+                            "DurationMagnitude": {
+                                "ScalableFloatMagnitude": {"Value": 7.0, "Curve": {}}
+                            },
+                        },
+                    },
+                ],
+            )
+            connection = connect(Path(directory) / "catalog.sqlite3")
+            try:
+                ingest_asset_directory(connection, root, build_key="multi-export-test")
+                rows = connection.execute(
+                    """
+                    SELECT effect.effect_name, object.export_index
+                    FROM catalog_ability_kit_grants grant_row
+                    JOIN catalog_gameplay_effects effect
+                      ON effect.id=grant_row.gameplay_effect_id
+                    JOIN asset_objects object ON object.id=effect.source_object_id
+                    WHERE grant_row.target_path='/Test/Effects/GE_Multi.1'
+                    """
+                ).fetchall()
+                duration = connection.execute(
+                    """
+                    SELECT literal_value, calculation_type, interpretation_status
+                    FROM catalog_magnitudes
+                    WHERE purpose='effect_duration'
+                    """
+                ).fetchone()
+            finally:
+                connection.close()
+
+        self.assertEqual(
+            [("Default__GE_Multi_C", 2)], [tuple(row) for row in rows]
+        )
+        self.assertEqual((7.0, "ScalableFloat", "supported"), tuple(duration))
+
+    def test_real_fmodel_kit_shapes_remain_partial_until_grants_are_exported(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "exports"
+            source_files = write_golden_slice(root)
+            support_kit = next(
+                path
+                for path in source_files
+                if path.name == "Kit_Perk_H_AssaultDamage_T01.json"
+            )
+            payload = json.loads(support_kit.read_text(encoding="utf-8"))
+            payload[0]["Properties"]["GrantedGameplayEffects"].append(
+                {
+                    "GameplayEffect": {
+                        "ObjectPath": "/Test/Missing/GE_AssaultTag.1"
+                    },
+                    "Level": 0,
+                }
+            )
+            support_kit.write_text(
+                json.dumps(payload, separators=(",", ":")), encoding="utf-8"
+            )
+
+            frag_kit = (
+                "/SaveTheWorld/Abilities/Player/Commando/Actives/FragGrenade/"
+                "Kit_Commando_FragGrenade"
+            )
+            gadget = (
+                "/SaveTheWorld/Abilities/Player/Commando/Actives/FragGrenade/"
+                "G_Commando_FragGrenade"
+            )
+            _write_export(
+                root,
+                "Abilities/Kit_Commando_FragGrenade.json",
+                [
+                    {
+                        "Type": "FortAbilityKit",
+                        "Name": "Kit_Commando_FragGrenade",
+                        "Package": frag_kit,
+                        "Properties": {
+                            "DisplayName": {"SourceString": "Frag Grenade"},
+                            "Gadgets": [
+                                {"ObjectPath": f"{gadget}.G_Commando_FragGrenade"}
+                            ],
+                            "GrantedGameplayEffects": [
+                                {
+                                    "GameplayEffect": {
+                                        "ObjectPath": "/Test/Missing/GE_FragTag.1"
+                                    },
+                                    "Level": 0,
+                                }
+                            ],
+                        },
+                    }
+                ],
+            )
+            connection = connect(Path(directory) / "catalog.sqlite3")
+            try:
+                summary = ingest_asset_directory(
+                    connection, root, build_key="real-kit-shape-test"
+                )
+                hero = hero_provenance(connection, "Rescue Trooper Ramirez")
+                queue = asset_export_queue(
+                    connection,
+                    summary["snapshot_id"],
+                    hero_name="Rescue Trooper Ramirez",
+                )
+                grant = connection.execute(
+                    """
+                    SELECT grant_row.grant_kind
+                    FROM catalog_ability_kit_grants grant_row
+                    JOIN catalog_ability_kits kit ON kit.id=grant_row.ability_kit_id
+                    WHERE kit.kit_name='Kit_Commando_FragGrenade'
+                      AND grant_row.target_path LIKE '%G_Commando_FragGrenade%'
+                    """
+                ).fetchone()
+            finally:
+                connection.close()
+
+        assert hero is not None
+        self.assertEqual("Frag Grenade", hero["abilities"][0]["display_name"])
+        self.assertEqual("partial_missing_grants", hero["abilities"][0]["status"])
+        self.assertEqual("ability", grant["grant_kind"])
+        support = next(perk for perk in hero["perks"] if perk["mode"] == "support")
+        self.assertEqual("partial_missing_grants", support["status"])
+        self.assertEqual(["/Test/Missing/GE_AssaultTag.1"], support["unresolved_grants"])
+        gadget_asset = next(
+            asset for asset in queue["assets"] if asset["package_path"] == gadget
+        )
+        self.assertEqual(0, gadget_asset["priority"])
+        self.assertIn("active_ability_implementation", gadget_asset["categories"])
+
     def test_phase_two_normalizes_structural_semantics_and_opacity(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "exports"
@@ -448,6 +915,7 @@ class AssetCatalogTests(unittest.TestCase):
         self.assertEqual("resolved", hero["abilities"][0]["status"])
         self.assertGreaterEqual(coverage["counts"]["hero_classes"], 1)
         self.assertGreaterEqual(coverage["counts"]["abilities"], 1)
+        self.assertEqual(1, coverage["counts"]["fully_resolved_active_kits"])
         self.assertGreaterEqual(coverage["counts"]["gameplay_tags"], 4)
         self.assertIn(("Weapon.Ranged.Assault", "source_required"), tags)
         self.assertIn(("Enemy.MistMonster", "target_required"), tags)
@@ -605,7 +1073,7 @@ class AssetCatalogTests(unittest.TestCase):
         self.assertEqual(before, after)
         self.assertEqual("37.00", build["game_version"])
         self.assertEqual("123456", build["changelist"])
-        self.assertEqual("phase2-v1", second["normalization"]["normalizer_version"])
+        self.assertEqual("phase2-v8", second["normalization"]["normalizer_version"])
 
     def test_existing_raw_snapshot_is_rederived_for_a_new_normalizer(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -645,7 +1113,7 @@ class AssetCatalogTests(unittest.TestCase):
         self.assertEqual(first["snapshot_id"], second["snapshot_id"])
         self.assertFalse(second["idempotent"])
         self.assertGreater(tag_count, 0)
-        self.assertEqual([("phase2-v1", "ready")], [tuple(row) for row in runs])
+        self.assertEqual([("phase2-v8", "ready")], [tuple(row) for row in runs])
 
     def test_unresolved_references_are_reported_without_inference(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -709,6 +709,51 @@ MIGRATIONS = [
     );
     CREATE INDEX catalog_opaque_mechanics_snapshot_idx
         ON catalog_opaque_mechanics(snapshot_id, mechanic_kind);
+    """,
+    """
+    ALTER TABLE catalog_ability_kits ADD COLUMN display_name TEXT;
+    """,
+    """
+    CREATE TABLE catalog_ability_links (
+        id INTEGER PRIMARY KEY,
+        snapshot_id INTEGER NOT NULL REFERENCES asset_snapshots(id) ON DELETE CASCADE,
+        source_ability_id INTEGER NOT NULL REFERENCES catalog_abilities(id) ON DELETE CASCADE,
+        source_reference_id INTEGER NOT NULL UNIQUE REFERENCES asset_references(id),
+        relation TEXT NOT NULL CHECK (relation IN ('gameplay_ability')),
+        target_path TEXT NOT NULL,
+        target_ability_id INTEGER REFERENCES catalog_abilities(id),
+        resolution_status TEXT NOT NULL
+            CHECK (resolution_status IN ('resolved', 'unresolved', 'ambiguous'))
+    );
+    CREATE INDEX catalog_ability_links_source_idx
+        ON catalog_ability_links(source_ability_id);
+
+    CREATE TABLE catalog_data_tables (
+        id INTEGER PRIMARY KEY,
+        snapshot_id INTEGER NOT NULL REFERENCES asset_snapshots(id) ON DELETE CASCADE,
+        source_object_id INTEGER NOT NULL UNIQUE REFERENCES asset_objects(id),
+        package_path TEXT NOT NULL,
+        table_name TEXT NOT NULL
+    );
+    CREATE TABLE catalog_data_rows (
+        id INTEGER PRIMARY KEY,
+        data_table_id INTEGER NOT NULL REFERENCES catalog_data_tables(id) ON DELETE CASCADE,
+        row_name TEXT NOT NULL,
+        row_json TEXT NOT NULL,
+        UNIQUE (data_table_id, row_name)
+    );
+    """,
+    """
+    CREATE TABLE catalog_hero_class_kits (
+        id INTEGER PRIMARY KEY,
+        snapshot_id INTEGER NOT NULL REFERENCES asset_snapshots(id) ON DELETE CASCADE,
+        hero_class_id INTEGER NOT NULL REFERENCES catalog_hero_classes(id) ON DELETE CASCADE,
+        kit_ordinal INTEGER NOT NULL,
+        source_reference_id INTEGER NOT NULL UNIQUE REFERENCES asset_references(id),
+        ability_kit_path TEXT NOT NULL,
+        ability_kit_id INTEGER REFERENCES catalog_ability_kits(id),
+        UNIQUE (hero_class_id, kit_ordinal)
+    );
     """
 ]
 

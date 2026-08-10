@@ -332,7 +332,72 @@ def extend_with_phase_two_semantics(root: Path) -> list[Path]:
                             {
                                 "CalculationClass": {
                                     "ObjectPath": "/Test/Calculations/Exec_CustomProc.0"
-                                }
+                                },
+                                "CalculationModifiers": [
+                                    {
+                                        "CapturedAttribute": {
+                                            "AttributeToCapture": {
+                                                "AttributeName": "HealingSource"
+                                            }
+                                        },
+                                        "AggregatorType": (
+                                            "EGameplayEffectScopedModifierAggregatorType::"
+                                            "CapturedAttributeBacked"
+                                        ),
+                                        "ModifierOp": "EGameplayModOp::Additive",
+                                        "TargetTags": {
+                                            "RequireTags": [
+                                                "Granted.Perk.Blueprint.T02"
+                                            ],
+                                            "IgnoreTags": [],
+                                        },
+                                        "ModifierMagnitude": {
+                                            "MagnitudeCalculationType": (
+                                                "EGameplayEffectMagnitudeCalculation::"
+                                                "AttributeBased"
+                                            ),
+                                            "AttributeBasedMagnitude": {
+                                                "Coefficient": {
+                                                    "Value": 1.0,
+                                                    "Curve": {
+                                                        "CurveTable": {
+                                                            "ObjectPath": (
+                                                                "/Game/Balance/DataTables/"
+                                                                "CombatEffects_HeroAbilities.0"
+                                                            )
+                                                        },
+                                                        "RowName": (
+                                                            "Perk.AssaultDamage.T01.DamageMult"
+                                                        ),
+                                                    },
+                                                }
+                                            },
+                                        },
+                                    },
+                                    {
+                                        "CapturedAttribute": {
+                                            "AttributeToCapture": {
+                                                "AttributeName": "OutgoingBaseDamage"
+                                            }
+                                        },
+                                        "AggregatorType": (
+                                            "EGameplayEffectScopedModifierAggregatorType::"
+                                            "CapturedAttributeBacked"
+                                        ),
+                                        "ModifierOp": "EGameplayModOp::Additive",
+                                        "ModifierMagnitude": {
+                                            "MagnitudeCalculationType": (
+                                                "EGameplayEffectMagnitudeCalculation::"
+                                                "SetByCaller"
+                                            ),
+                                            "SetByCallerMagnitude": {
+                                                "DataTag": {
+                                                    "TagName": "SetByCaller.AbilityDamage"
+                                                }
+                                            },
+                                        },
+                                    },
+                                ],
                             }
                         ],
                     },
@@ -899,6 +964,31 @@ class AssetCatalogTests(unittest.TestCase):
                     WHERE ao.package_path='/Test/Effects/GE_Literal'
                     """
                 ).fetchone()
+                execution_modifier = connection.execute(
+                    """
+                    SELECT magnitude.curve_row_name, magnitude.coefficient,
+                           magnitude.interpretation_status,
+                           mechanic.conditions_json
+                    FROM catalog_mechanics mechanic
+                    JOIN catalog_magnitudes magnitude
+                      ON magnitude.id=mechanic.magnitude_id
+                    WHERE mechanic.mechanic_type='execution_modifier'
+                      AND mechanic.value_json LIKE '%HealingSource%'
+                    """
+                ).fetchone()
+                set_by_caller_modifier = connection.execute(
+                    """
+                    SELECT magnitude.calculation_type,
+                           magnitude.set_by_caller_tag,
+                           magnitude.interpretation_status,
+                           mechanic.value_json
+                    FROM catalog_mechanics mechanic
+                    JOIN catalog_magnitudes magnitude
+                      ON magnitude.id=mechanic.magnitude_id
+                    WHERE mechanic.mechanic_type='execution_modifier'
+                      AND mechanic.value_json LIKE '%OutgoingBaseDamage%'
+                    """
+                ).fetchone()
                 name_only_grant = connection.execute(
                     """
                     SELECT grant_kind, gameplay_effect_id, ability_id
@@ -926,6 +1016,7 @@ class AssetCatalogTests(unittest.TestCase):
                 "period",
                 "application_chance",
                 "execution",
+                "execution_modifier",
                 "cooldown",
                 "trigger",
                 "stacking",
@@ -936,6 +1027,22 @@ class AssetCatalogTests(unittest.TestCase):
         self.assertIn("execution_calculation", opaque)
         self.assertEqual(0.2, literal["literal_value"])
         self.assertEqual("supported", literal["interpretation_status"])
+        self.assertEqual(
+            ("Perk.AssaultDamage.T01.DamageMult", 1.0, "partial"),
+            tuple(execution_modifier)[:3],
+        )
+        self.assertIn(
+            "Granted.Perk.Blueprint.T02", execution_modifier["conditions_json"]
+        )
+        self.assertEqual(
+            (
+                "EGameplayEffectMagnitudeCalculation::SetByCaller",
+                "SetByCaller.AbilityDamage",
+                "partial",
+            ),
+            tuple(set_by_caller_modifier)[:3],
+        )
+        self.assertIn("OutgoingBaseDamage", set_by_caller_modifier["value_json"])
         self.assertEqual("reference", name_only_grant["grant_kind"])
         self.assertIsNone(name_only_grant["gameplay_effect_id"])
         self.assertIsNone(name_only_grant["ability_id"])
@@ -975,6 +1082,145 @@ class AssetCatalogTests(unittest.TestCase):
         self.assertFalse(any("DamageBuff_T02" in package for package in packages))
         self.assertTrue(all(asset["priority"] <= 2 for asset in queue["assets"]))
         self.assertIn("never synthesized", queue["selection_rule"])
+
+    def test_blueprint_granted_perk_preserves_parameters_effects_and_queue(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "exports"
+            source_files = write_golden_slice(root)
+            hgd_file = next(
+                path for path in source_files if path.name == "HGD_Commando_GrenadeGun.json"
+            )
+            hgd_payload = json.loads(hgd_file.read_text(encoding="utf-8"))
+            hgd_properties = hgd_payload[0]["Properties"]
+            support_kit = "/Test/Perks/Blueprint/Kit_Perk_H_Blueprint_T01"
+            commander_kit = "/Test/Perks/Blueprint/Kit_Perk_H_Blueprint_T02"
+            ability = "/Test/Perks/Blueprint/GA_Perk_H_Blueprint_T01"
+            effect = "/Test/Perks/Blueprint/GE_Perk_H_Blueprint_Result"
+            hgd_properties["HeroPerk"]["GrantedAbilityKit"]["AssetPathName"] = (
+                f"{support_kit}.Kit_Perk_H_Blueprint_T01"
+            )
+            hgd_properties["CommanderPerk"]["GrantedAbilityKit"]["AssetPathName"] = (
+                f"{commander_kit}.Kit_Perk_H_Blueprint_T02"
+            )
+            hgd_file.write_text(
+                json.dumps(hgd_payload, separators=(",", ":")), encoding="utf-8"
+            )
+            _write_export(
+                root,
+                "Blueprint/Kit_Perk_H_Blueprint_T01.json",
+                [
+                    {
+                        "Type": "FortAbilityKit",
+                        "Name": "Kit_Perk_H_Blueprint_T01",
+                        "Package": support_kit,
+                        "Properties": {
+                            "GrantedAbilities": [
+                                {"GameplayAbility": {"ObjectPath": f"{ability}.1"}}
+                            ]
+                        },
+                    }
+                ],
+            )
+            _write_export(
+                root,
+                "Blueprint/Kit_Perk_H_Blueprint_T02.json",
+                [
+                    {
+                        "Type": "FortAbilityKit",
+                        "Name": "Kit_Perk_H_Blueprint_T02",
+                        "Package": commander_kit,
+                        "Properties": {},
+                    }
+                ],
+            )
+            _write_export(
+                root,
+                "Blueprint/GA_Perk_H_Blueprint_T01.json",
+                [
+                    {
+                        "Type": "BlueprintGeneratedClass",
+                        "Name": "GA_Perk_H_Blueprint_T01_C",
+                        "Package": ability,
+                        "Properties": {},
+                    },
+                    {
+                        "Type": "GA_Perk_H_Blueprint_T01_C",
+                        "Name": "Default__GA_Perk_H_Blueprint_T01_C",
+                        "Package": ability,
+                        "Properties": {
+                            "ChanceToProc": {
+                                "Value": 1.0,
+                                "Curve": {
+                                    "CurveTable": {
+                                        "ObjectPath": (
+                                            "/Game/Balance/DataTables/"
+                                            "CombatEffects_HeroAbilities.0"
+                                        )
+                                    },
+                                    "RowName": "Perk.Blueprint.T01.Chance",
+                                },
+                            },
+                            "GE_Result": {
+                                "ObjectName": (
+                                    "BlueprintGeneratedClass'"
+                                    "GE_Perk_H_Blueprint_Result_C'"
+                                ),
+                                "ObjectPath": f"{effect}.1",
+                            },
+                            "AbilityTriggers": [
+                                {
+                                    "TriggerTag": {"TagName": "Event.Damage.Killed"},
+                                    "TriggerSource": (
+                                        "EGameplayAbilityTriggerSource::GameplayEvent"
+                                    ),
+                                }
+                            ],
+                        },
+                    },
+                ],
+            )
+            connection = connect(Path(directory) / "catalog.sqlite3")
+            try:
+                summary = ingest_asset_directory(
+                    connection, root, build_key="blueprint-perk-test"
+                )
+                hero = hero_provenance(connection, "Rescue Trooper Ramirez")
+                queue = asset_export_queue(
+                    connection,
+                    summary["snapshot_id"],
+                    hero_name="Rescue Trooper Ramirez",
+                )
+            finally:
+                connection.close()
+
+        assert hero is not None
+        by_mode = {perk["mode"]: perk for perk in hero["perks"]}
+        self.assertEqual(
+            "structured_blueprint_behavior", by_mode["support"]["status"]
+        )
+        self.assertEqual(
+            "structured_blueprint_behavior", by_mode["commander"]["status"]
+        )
+        implementation = by_mode["support"]["family_ability_implementations"][0]
+        self.assertEqual("T01", implementation["granting_tier"])
+        self.assertEqual(
+            {"parameter", "referenced_effect", "trigger"},
+            {mechanic["type"] for mechanic in implementation["mechanics"]},
+        )
+        parameter = next(
+            mechanic
+            for mechanic in implementation["mechanics"]
+            if mechanic["type"] == "parameter"
+        )
+        self.assertEqual(
+            "Perk.Blueprint.T01.Chance",
+            parameter["magnitude"]["curve_row_name"],
+        )
+        queued = next(
+            asset for asset in queue["assets"] if asset["package_path"] == effect
+        )
+        self.assertEqual(0, queued["priority"])
+        self.assertIn("referenced_gameplay_effect", queued["categories"])
 
     def test_rescue_trooper_chain_is_normalized_with_provenance(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1073,7 +1319,7 @@ class AssetCatalogTests(unittest.TestCase):
         self.assertEqual(before, after)
         self.assertEqual("37.00", build["game_version"])
         self.assertEqual("123456", build["changelist"])
-        self.assertEqual("phase2-v8", second["normalization"]["normalizer_version"])
+        self.assertEqual("phase2-v11", second["normalization"]["normalizer_version"])
 
     def test_existing_raw_snapshot_is_rederived_for_a_new_normalizer(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1113,7 +1359,7 @@ class AssetCatalogTests(unittest.TestCase):
         self.assertEqual(first["snapshot_id"], second["snapshot_id"])
         self.assertFalse(second["idempotent"])
         self.assertGreater(tag_count, 0)
-        self.assertEqual([("phase2-v8", "ready")], [tuple(row) for row in runs])
+        self.assertEqual([("phase2-v11", "ready")], [tuple(row) for row in runs])
 
     def test_unresolved_references_are_reported_without_inference(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

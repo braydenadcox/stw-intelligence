@@ -16,7 +16,7 @@ from stw_pipeline import connect
 
 
 PERK_KIT_RE = re.compile(r"^Kit_Perk_H_(?P<family>.+)_(?P<tier>T\d+)$")
-NORMALIZER_VERSION = "phase2-v8"
+NORMALIZER_VERSION = "phase2-v11"
 
 
 @dataclass(frozen=True)
@@ -826,11 +826,18 @@ def _insert_magnitude(
     else:
         return None
 
+    coefficient_shape = attribute.get("Coefficient") or custom.get("Coefficient") or {}
     curve = scalable.get("Curve") or {}
+    if not _object_path(curve.get("CurveTable")) and isinstance(
+        coefficient_shape, dict
+    ):
+        coefficient_curve = coefficient_shape.get("Curve") or {}
+        if _object_path(coefficient_curve.get("CurveTable")):
+            curve = coefficient_curve
     curve_table_path = canonical_package_path(_object_path(curve.get("CurveTable")))
     custom_path = _object_path(custom.get("CalculationClassMagnitude"))
     caller_tag = ((set_by_caller.get("DataTag") or {}).get("TagName"))
-    coefficient = (attribute.get("Coefficient") or custom.get("Coefficient") or {}).get("Value")
+    coefficient = coefficient_shape.get("Value")
     pre_additive = (
         attribute.get("PreMultiplyAdditiveValue")
         or custom.get("PreMultiplyAdditiveValue")
@@ -1058,6 +1065,44 @@ def _normalize_effect_mechanics(
                     "GameplayEffect execution calculations are not evaluated in Phase 2",
                 ),
             )
+            if not isinstance(execution, dict):
+                continue
+            for modifier_ordinal, modifier in enumerate(
+                execution.get("CalculationModifiers") or []
+            ):
+                if not isinstance(modifier, dict):
+                    continue
+                modifier_path = f"{path}.CalculationModifiers[{modifier_ordinal}]"
+                magnitude_id = _insert_magnitude(
+                    connection,
+                    snapshot_id,
+                    source_object_id,
+                    f"{modifier_path}.ModifierMagnitude",
+                    "effect_execution_modifier",
+                    modifier.get("ModifierMagnitude"),
+                )
+                captured = modifier.get("CapturedAttribute") or {}
+                attribute_to_capture = captured.get("AttributeToCapture") or {}
+                _insert_mechanic(
+                    connection,
+                    snapshot_id,
+                    source_object_id,
+                    "gameplay_effect",
+                    effect_id,
+                    "execution_modifier",
+                    modifier_path,
+                    magnitude_id=magnitude_id,
+                    conditions={
+                        "source": modifier.get("SourceTags") or {},
+                        "target": modifier.get("TargetTags") or {},
+                    },
+                    value={
+                        "attribute": attribute_to_capture.get("AttributeName"),
+                        "operation": modifier.get("ModifierOp"),
+                        "aggregator_type": modifier.get("AggregatorType"),
+                    },
+                    status="partial" if magnitude_id is not None else "opaque",
+                )
 
 
 def _is_ability_kit(
@@ -1398,6 +1443,7 @@ def _normalize_ability_mechanics(
     properties: dict[str, Any],
 ) -> None:
     recognized = False
+    recognized_keys: set[str] = set()
     for key, mechanic_type in (
         ("CooldownDuration", "cooldown"),
         ("AbilityCooldown", "cooldown"),
@@ -1407,6 +1453,7 @@ def _normalize_ability_mechanics(
         if key not in properties:
             continue
         recognized = True
+        recognized_keys.add(key)
         magnitude_id = _insert_magnitude(
             connection,
             snapshot_id,
@@ -1429,6 +1476,7 @@ def _normalize_ability_mechanics(
     costs = properties.get("Costs")
     if costs is not None:
         recognized = True
+        recognized_keys.add("Costs")
         cost_items = costs if isinstance(costs, list) else [costs]
         for ordinal, cost in enumerate(cost_items):
             if not isinstance(cost, dict):
@@ -1468,6 +1516,7 @@ def _normalize_ability_mechanics(
         if key not in properties:
             continue
         recognized = True
+        recognized_keys.add(key)
         _insert_mechanic(
             connection,
             snapshot_id,
@@ -1480,6 +1529,114 @@ def _normalize_ability_mechanics(
             value=properties[key] if "Tags" not in key else None,
             status="partial",
         )
+
+    # Hero perks commonly grant a GameplayAbility whose Blueprint defaults hold
+    # the actual balance inputs.  Preserve those explicit inputs structurally;
+    # do not pretend to execute the Blueprint graph or infer how its variables
+    # interact.
+    for key, value in properties.items():
+        if key in recognized_keys:
+            continue
+        property_path = f"$.Properties.{key}"
+        magnitude_like = isinstance(value, dict) and (
+            "MagnitudeCalculationType" in value
+            or "ScalableFloatMagnitude" in value
+            or ("Value" in value and "Curve" in value)
+        )
+        if magnitude_like:
+            recognized = True
+            magnitude_id = _insert_magnitude(
+                connection,
+                snapshot_id,
+                source_object_id,
+                property_path,
+                "ability_parameter",
+                value,
+            )
+            _insert_mechanic(
+                connection,
+                snapshot_id,
+                source_object_id,
+                "ability",
+                ability_id,
+                "parameter",
+                property_path,
+                magnitude_id=magnitude_id,
+                value={"name": key},
+                status="supported" if magnitude_id is not None else "partial",
+            )
+            continue
+
+        direct_path = _object_path(value)
+        if direct_path:
+            recognized = True
+            target_package = canonical_package_path(direct_path)
+            target_name = (target_package or "").rsplit("/", 1)[-1]
+            mechanic_type = (
+                "referenced_effect"
+                if target_name.startswith(("GE_", "GET_"))
+                else "referenced_asset"
+            )
+            _insert_mechanic(
+                connection,
+                snapshot_id,
+                source_object_id,
+                "ability",
+                ability_id,
+                mechanic_type,
+                property_path,
+                value={"name": key, "target_path": direct_path},
+                status="partial",
+            )
+            continue
+
+        nested_references = list(_walk_references(value, property_path))
+        effect_references = [
+            target
+            for _, target in nested_references
+            if (canonical_package_path(target) or "").rsplit("/", 1)[-1].startswith(
+                ("GE_", "GET_")
+            )
+        ]
+        if effect_references:
+            recognized = True
+            _insert_mechanic(
+                connection,
+                snapshot_id,
+                source_object_id,
+                "ability",
+                ability_id,
+                "effect_map",
+                property_path,
+                value={"name": key, "target_paths": effect_references},
+                status="partial",
+            )
+        elif key.startswith("TC_"):
+            recognized = True
+            _insert_mechanic(
+                connection,
+                snapshot_id,
+                source_object_id,
+                "ability",
+                ability_id,
+                "tag_condition",
+                property_path,
+                conditions=value,
+                status="partial",
+            )
+        elif key.startswith("Att_"):
+            recognized = True
+            _insert_mechanic(
+                connection,
+                snapshot_id,
+                source_object_id,
+                "ability",
+                ability_id,
+                "attribute_reference",
+                property_path,
+                value=value,
+                status="partial",
+            )
     connection.execute(
         "UPDATE catalog_abilities SET semantic_status=? WHERE id=?",
         ("partial" if recognized else "opaque", ability_id),
@@ -2093,6 +2250,139 @@ def _ability_mechanics(
     ]
 
 
+def _ability_effect_references(
+    connection: sqlite3.Connection, source_object_id: int
+) -> list[dict[str, Any]]:
+    rows = connection.execute(
+        """
+        SELECT reference.target_path, reference.resolution_status,
+               effect.id AS gameplay_effect_id, effect.effect_name,
+               effect.template_path, effect.source_object_id,
+               file.source_path, file.content_sha256
+        FROM asset_references reference
+        LEFT JOIN catalog_gameplay_effects effect
+          ON effect.snapshot_id=reference.snapshot_id
+         AND effect.package_path=reference.target_package_path
+        LEFT JOIN asset_objects object ON object.id=effect.source_object_id
+        LEFT JOIN asset_files file ON file.id=object.asset_file_id
+        WHERE reference.source_object_id=?
+        ORDER BY reference.target_path
+        """,
+        (source_object_id,),
+    ).fetchall()
+    rows = [
+        row
+        for row in rows
+        if (canonical_package_path(row["target_path"]) or "")
+        .rsplit("/", 1)[-1]
+        .startswith(("GE_", "GET_"))
+    ]
+    result: list[dict[str, Any]] = []
+    for row in rows:
+        modifiers: list[dict[str, Any]] = []
+        if row["gameplay_effect_id"] is not None:
+            modifier_rows = connection.execute(
+                """
+                SELECT modifier.attribute_name, modifier.modifier_operation,
+                       modifier.curve_row_name, modifier.interpretation_status,
+                       magnitude.calculation_type, magnitude.literal_value,
+                       magnitude.custom_calculation_path,
+                       magnitude.set_by_caller_tag,
+                       magnitude.interpretation_status AS magnitude_status,
+                       (SELECT point.output_value
+                        FROM catalog_curve_points point
+                        WHERE point.curve_row_id=magnitude.curve_row_id
+                        ORDER BY point.point_ordinal LIMIT 1) AS curve_output_value
+                FROM catalog_effect_modifiers modifier
+                LEFT JOIN catalog_magnitudes magnitude
+                  ON magnitude.id=modifier.magnitude_id
+                WHERE modifier.gameplay_effect_id=?
+                ORDER BY modifier.modifier_ordinal
+                """,
+                (row["gameplay_effect_id"],),
+            ).fetchall()
+            modifiers = [dict(modifier) for modifier in modifier_rows]
+        result.append(
+            {
+                "target_path": row["target_path"],
+                "resolution_status": row["resolution_status"],
+                "effect": row["effect_name"],
+                "template_path": row["template_path"],
+                "modifiers": modifiers,
+                "mechanics": (
+                    _effect_mechanics(connection, row["gameplay_effect_id"])
+                    if row["gameplay_effect_id"] is not None
+                    else []
+                ),
+                "source": (
+                    {
+                        "source_path": row["source_path"],
+                        "source_sha256": row["content_sha256"],
+                    }
+                    if row["source_path"] is not None
+                    else None
+                ),
+            }
+        )
+    return result
+
+
+def _perk_ability_implementations(
+    connection: sqlite3.Connection,
+    snapshot_id: int,
+    perk_family: str,
+) -> list[dict[str, Any]]:
+    rows = connection.execute(
+        """
+        SELECT perk.perk_tier, grant_row.target_path,
+               reference.resolution_status, ability.id AS ability_id,
+               ability.ability_key, ability.package_path,
+               ability.semantic_status, ability.source_object_id,
+               file.source_path, file.content_sha256
+        FROM catalog_perks perk
+        JOIN catalog_ability_kit_grants grant_row
+          ON grant_row.ability_kit_id=perk.ability_kit_id
+        JOIN asset_references reference ON reference.id=grant_row.source_reference_id
+        LEFT JOIN catalog_abilities ability ON ability.id=grant_row.ability_id
+        LEFT JOIN asset_objects object ON object.id=ability.source_object_id
+        LEFT JOIN asset_files file ON file.id=object.asset_file_id
+        WHERE perk.snapshot_id=? AND perk.perk_family=?
+          AND grant_row.grant_kind='ability'
+        ORDER BY perk.perk_tier, grant_row.target_path
+        """,
+        (snapshot_id, perk_family),
+    ).fetchall()
+    return [
+        {
+            "granting_tier": row["perk_tier"],
+            "target_path": row["target_path"],
+            "resolution_status": row["resolution_status"],
+            "ability": row["ability_key"],
+            "package_path": row["package_path"],
+            "semantic_status": row["semantic_status"],
+            "mechanics": (
+                _ability_mechanics(connection, row["ability_id"])
+                if row["ability_id"] is not None
+                else []
+            ),
+            "referenced_effects": (
+                _ability_effect_references(connection, row["source_object_id"])
+                if row["source_object_id"] is not None
+                else []
+            ),
+            "source": (
+                {
+                    "source_path": row["source_path"],
+                    "source_sha256": row["content_sha256"],
+                }
+                if row["source_path"] is not None
+                else None
+            ),
+        }
+        for row in rows
+    ]
+
+
 def _perk_provenance(
     connection: sqlite3.Connection, snapshot_id: int, perk: sqlite3.Row
 ) -> dict[str, Any]:
@@ -2105,6 +2395,9 @@ def _perk_provenance(
         "ability_kit_path": perk["ability_kit_path"],
         "status": "unresolved_ability_kit" if perk["ability_kit_id"] is None else "resolved",
         "effects": [],
+        "family_ability_implementations": _perk_ability_implementations(
+            connection, snapshot_id, perk["perk_family"]
+        ),
     }
     if perk["ability_kit_id"] is not None:
         kit_source = connection.execute(
@@ -2230,6 +2523,16 @@ def _perk_provenance(
             )
         if result["unresolved_grants"]:
             result["status"] = "partial_missing_grants"
+        elif result["family_ability_implementations"]:
+            unresolved_abilities = any(
+                item["resolution_status"] != "resolved"
+                for item in result["family_ability_implementations"]
+            )
+            result["status"] = (
+                "partial_blueprint_behavior"
+                if unresolved_abilities
+                else "structured_blueprint_behavior"
+            )
         elif not result["effects"]:
             result["status"] = "resolved_kit_without_supported_effect"
     return result
@@ -2238,11 +2541,23 @@ def _perk_provenance(
 def _effect_mechanics(connection: sqlite3.Connection, effect_id: int) -> list[dict[str, Any]]:
     rows = connection.execute(
         """
-        SELECT mechanic_type, property_path, conditions_json, value_json,
-               interpretation_status
-        FROM catalog_mechanics
-        WHERE owner_domain='gameplay_effect' AND owner_id=?
-        ORDER BY id
+        SELECT mechanic.mechanic_type, mechanic.property_path,
+               mechanic.conditions_json, mechanic.value_json,
+               mechanic.interpretation_status,
+               magnitude.calculation_type, magnitude.literal_value,
+               magnitude.coefficient, magnitude.pre_additive,
+               magnitude.post_additive, magnitude.curve_table_path,
+               magnitude.curve_row_name, magnitude.custom_calculation_path,
+               magnitude.set_by_caller_tag,
+               magnitude.interpretation_status AS magnitude_status,
+               (SELECT point.output_value
+                FROM catalog_curve_points point
+                WHERE point.curve_row_id=magnitude.curve_row_id
+                ORDER BY point.point_ordinal LIMIT 1) AS curve_output_value
+        FROM catalog_mechanics mechanic
+        LEFT JOIN catalog_magnitudes magnitude ON magnitude.id=mechanic.magnitude_id
+        WHERE mechanic.owner_domain='gameplay_effect' AND mechanic.owner_id=?
+        ORDER BY mechanic.id
         """,
         (effect_id,),
     ).fetchall()
@@ -2253,6 +2568,23 @@ def _effect_mechanics(connection: sqlite3.Connection, effect_id: int) -> list[di
             "conditions": json.loads(row["conditions_json"]),
             "value": json.loads(row["value_json"]),
             "status": row["interpretation_status"],
+            "magnitude": (
+                {
+                    "calculation_type": row["calculation_type"],
+                    "literal_value": row["literal_value"],
+                    "coefficient": row["coefficient"],
+                    "pre_additive": row["pre_additive"],
+                    "post_additive": row["post_additive"],
+                    "curve_table_path": row["curve_table_path"],
+                    "curve_row_name": row["curve_row_name"],
+                    "curve_output_value": row["curve_output_value"],
+                    "custom_calculation_path": row["custom_calculation_path"],
+                    "set_by_caller_tag": row["set_by_caller_tag"],
+                    "status": row["magnitude_status"],
+                }
+                if row["calculation_type"] is not None
+                else None
+            ),
         }
         for row in rows
     ]
@@ -2362,6 +2694,7 @@ def _queue_classification(
 ) -> tuple[int, str, str]:
     path = property_path.lower()
     target = target_package.lower()
+    target_name = target.rsplit("/", 1)[-1]
     if target.startswith("/script/") or target == "/script":
         return 99, "engine_native", "engine/script objects are not FModel export targets"
     if any(
@@ -2409,6 +2742,18 @@ def _queue_classification(
         return 1, "ability_payload", "resolves an item used by an active ability"
     if "gameplayeffect" in path:
         return 0, "granted_gameplay_effect", "reveals an explicitly granted GameplayEffect"
+    if target_name.startswith(("ge_", "get_")):
+        return (
+            0,
+            "referenced_gameplay_effect",
+            "resolves a GameplayEffect explicitly referenced by Blueprint defaults",
+        )
+    if target_name.startswith(("ga_", "gat_")):
+        return (
+            0,
+            "referenced_ability_logic",
+            "resolves GameplayAbility logic explicitly referenced by the perk graph",
+        )
     if ".template." in path or ".super." in path or ".archetype." in path:
         return 0, "inheritance", "closes inherited/shared gameplay semantics"
     if "curvetable" in path and (
@@ -2541,6 +2886,9 @@ def catalog_coverage(
         """,
         "abilities": "SELECT COUNT(*) FROM catalog_abilities WHERE snapshot_id=?",
         "perks": "SELECT COUNT(*) FROM catalog_perks WHERE snapshot_id=?",
+        "perk_families": """
+            SELECT COUNT(DISTINCT perk_family) FROM catalog_perks WHERE snapshot_id=?
+        """,
         "resolved_perk_kit_files": """
             SELECT COUNT(*) FROM catalog_perks
             WHERE snapshot_id=? AND ability_kit_id IS NOT NULL
@@ -2553,9 +2901,35 @@ def catalog_coverage(
                   JOIN asset_references reference
                     ON reference.id=grant_row.source_reference_id
                   WHERE grant_row.ability_kit_id=perk.ability_kit_id
-                    AND grant_row.grant_kind='gameplay_effect'
+                    AND grant_row.grant_kind IN ('ability', 'gameplay_effect')
                     AND (reference.resolution_status <> 'resolved'
-                         OR grant_row.gameplay_effect_id IS NULL)
+                         OR (grant_row.grant_kind='gameplay_effect'
+                             AND grant_row.gameplay_effect_id IS NULL)
+                         OR (grant_row.grant_kind='ability'
+                             AND grant_row.ability_id IS NULL))
+              )
+        """,
+        "perk_families_with_supported_effects": """
+            SELECT COUNT(DISTINCT perk.perk_family)
+            FROM catalog_perks perk
+            JOIN catalog_ability_kit_grants grant_row
+              ON grant_row.ability_kit_id=perk.ability_kit_id
+            JOIN catalog_effect_modifiers modifier
+              ON modifier.gameplay_effect_id=grant_row.gameplay_effect_id
+            WHERE perk.snapshot_id=?
+              AND modifier.interpretation_status='supported'
+        """,
+        "perk_families_with_blueprint_behavior": """
+            SELECT COUNT(DISTINCT perk.perk_family)
+            FROM catalog_perks perk
+            JOIN catalog_ability_kit_grants grant_row
+              ON grant_row.ability_kit_id=perk.ability_kit_id
+            JOIN catalog_abilities ability ON ability.id=grant_row.ability_id
+            WHERE perk.snapshot_id=?
+              AND EXISTS (
+                  SELECT 1 FROM catalog_mechanics mechanic
+                  WHERE mechanic.owner_domain='ability'
+                    AND mechanic.owner_id=ability.id
               )
         """,
         "hero_active_kits": """
@@ -2679,6 +3053,16 @@ def catalog_coverage(
         "ratios": {
             "perk_kit_file_resolution": counts["resolved_perk_kit_files"] / perks if perks else None,
             "perk_semantic_resolution": counts["fully_resolved_perks"] / perks if perks else None,
+            "perk_family_supported_effect_coverage": (
+                counts["perk_families_with_supported_effects"] / counts["perk_families"]
+                if counts["perk_families"]
+                else None
+            ),
+            "perk_family_blueprint_behavior_coverage": (
+                counts["perk_families_with_blueprint_behavior"] / counts["perk_families"]
+                if counts["perk_families"]
+                else None
+            ),
             "inheritance_resolution": (
                 (inheritance - counts["unresolved_inheritance"]) / inheritance
                 if inheritance

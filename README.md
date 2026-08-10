@@ -53,6 +53,31 @@ Run the test suite with:
 python -m unittest discover -s tests -v
 ```
 
+## Local Fortnite asset catalog
+
+Phase 1 can inventory a read-only FModel export directory and build a versioned local
+hero/perk reference graph. Raw Fortnite JSON is not copied into the repository or the
+database. The catalog stores source paths, file hashes, build metadata, normalized facts,
+and explicit resolved/unresolved reference edges.
+
+Supply the actual Fortnite build identifier rather than guessing it:
+
+```powershell
+python tools/stw_assets.py ingest `
+  "C:\path\to\FModel\Output\Exports" `
+  --build-id "your-fortnite-build-id" `
+  --game-version "your-game-version" `
+  --exporter-version "your-fmodel-version"
+
+python tools/stw_assets.py hero "Rescue Trooper Ramirez"
+python tools/stw_assets.py unresolved
+```
+
+The checked-in Rescue Trooper golden manifest contains hashes and required follow-up
+asset paths only; it contains no Fortnite asset payloads. The focused unit-test fixture
+is synthetic and validates `AssaultDamage T01/T02` as `+17% / +33%` only when an
+AbilityKit, GameplayEffect modifier, and curve row resolve into a complete evidence chain.
+
 ## Live local application
 
 On Windows, the default command watches Fortnite's standard log location, loads the
@@ -88,13 +113,15 @@ python tools/stw_app.py --log "C:\path\to\FortniteGame.log" --db data/stw-intell
 For a deliberate one-time replay of an existing log, add `--from-start`. The local API
 provides `/api/current`, `/api/attempts`, `/api/attempts/<id>`,
 `/api/missions/current`, `/api/correlation/current`, `/api/activity/current`,
-`/api/recommendation/current`, `/api/settings`, `/api/diagnostics`, and `/api/health`.
+`/api/recommendation/current`, `/api/cohorts/current`, `/api/settings`,
+`/api/diagnostics`, and `/api/health`.
 
-The Activity view compares complete, solo, Public Fill observations for the same
-rotation-scoped mission. It reports a versioned 0-100 observed matchmaking activity
-score, component evidence, sample count, effective sample size, coverage, and confidence.
-The score is local evidence only: it is not a player population, queue depth, or CCU
-estimate. Recompute or inspect it from the command line with:
+The Activity view keeps each observed node rotation-scoped, then reuses evidence across
+daily resets only through a versioned, provider-backed comparable-mission cohort. A
+cohort requires a consistent theater, objective, power level, and four-player status
+from accepted mission matches. Missing or conflicting identities remain excluded. The
+view discloses node and rotation counts alongside the versioned 0-100 activity score.
+This remains local evidence—not player population, queue depth, or CCU.
 
 Recommendations compare observations in the same three-hour local-time band. The
 default timezone is `America/Los_Angeles` and can be changed in Settings. A
@@ -103,6 +130,7 @@ otherwise the app visibly falls back to the overall recent ranking.
 
 ```powershell
 python tools/stw_activity.py refresh
+python tools/stw_activity.py cohorts
 python tools/stw_activity.py report
 python tools/stw_activity.py recommend
 ```

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import sqlite3
@@ -21,6 +22,7 @@ RECENCY_HALF_LIFE_HOURS = 6.0
 RECOMMENDATION_VERSION = "activity-ranking-v1"
 TIME_CONTEXT_VERSION = "local-time-band-v1"
 TIME_BAND_HOURS = 3
+COHORT_VERSION = "mission-signature-v1"
 SCORE_TIE_EPSILON = 0.01
 
 
@@ -174,7 +176,9 @@ def _confidence(sample_count: int, effective_sample_size: float) -> str:
     return "low"
 
 
-def recommend_region(regions: list[dict[str, Any]]) -> dict[str, Any]:
+def recommend_region(
+    regions: list[dict[str, Any]], mission_scope: str = "this exact mission"
+) -> dict[str, Any]:
     """Turn comparable regional activity into an explainable, abstaining decision."""
     eligible = [row for row in regions if row["confidence"] != "insufficient"]
     basis = {
@@ -188,6 +192,8 @@ def recommend_region(regions: list[dict[str, Any]]) -> dict[str, Any]:
             "assignment latency is also shown separately and is not network ping."
         ),
     }
+
+
     if not eligible:
         return {
             "status": "insufficient_data",
@@ -266,7 +272,7 @@ def recommend_region(regions: list[dict[str, Any]]) -> dict[str, Any]:
         "headline": f"Try {winner['region']}",
         "summary": (
             f"{winner['region']} has the strongest observed matchmaking activity "
-            f"for this exact mission, with {winner['confidence']} evidence confidence."
+            f"for {mission_scope}, with {winner['confidence']} evidence confidence."
         ),
         "confidence": winner["confidence"],
         "score": winner["score"],
@@ -295,12 +301,137 @@ def recommend_region(regions: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def refresh_mission_cohorts(connection: sqlite3.Connection) -> dict[str, int]:
+    """Link rotation-scoped nodes only when provider-backed identity is complete."""
+    nodes = connection.execute("SELECT id FROM mission_nodes ORDER BY id").fetchall()
+    matches = connection.execute(
+        """
+        SELECT mm.id AS match_id, mm.mission_node_id, mm.confidence,
+               em.id AS external_mission_id, em.theater_code,
+               o.canonical_code AS objective_code, em.power_level,
+               em.is_four_player, mr.provider_rotation_key,
+               mr.valid_from, mr.valid_until
+        FROM mission_matches mm
+        JOIN external_missions em ON em.id=mm.external_mission_id
+        JOIN objectives o ON o.id=em.objective_id
+        JOIN mission_rotations mr ON mr.id=mm.rotation_id
+        WHERE mm.status='accepted'
+        ORDER BY mm.mission_node_id, mm.matched_at, mm.id
+        """
+    ).fetchall()
+    by_node: dict[int, list[sqlite3.Row]] = defaultdict(list)
+    for match in matches:
+        by_node[match["mission_node_id"]].append(match)
+    counts = {"cohorts": 0, "included": 0, "excluded": 0, "conflicts": 0}
+    with connection:
+        connection.execute(
+            "DELETE FROM mission_cohort_memberships WHERE cohort_version=?",
+            (COHORT_VERSION,),
+        )
+        for node in nodes:
+            node_id = node["id"]
+            accepted = [
+                row for row in by_node.get(node_id, [])
+                if row["confidence"] in ("high", "medium")
+            ]
+            signatures = {
+                (
+                    row["theater_code"], row["objective_code"],
+                    row["power_level"], int(row["is_four_player"]),
+                )
+                for row in accepted
+            }
+            evidence: dict[str, Any] = {
+                "cohort_version": COHORT_VERSION,
+                "mission_node_id": node_id,
+                "accepted_match_ids": [row["match_id"] for row in accepted],
+                "rule": (
+                    "accepted_provider_match_with_consistent_theater_objective_"
+                    "power_level_and_four_player_status"
+                ),
+            }
+            if not accepted or len(signatures) != 1:
+                status = "excluded" if not accepted else "conflict"
+                evidence["reason"] = (
+                    "no_high_or_medium_confidence_accepted_match"
+                    if not accepted else "conflicting_accepted_mission_identities"
+                )
+                if signatures:
+                    evidence["signatures"] = [list(value) for value in sorted(signatures)]
+                connection.execute(
+                    """
+                    INSERT INTO mission_cohort_memberships(
+                        mission_node_id, cohort_version, status, evidence_json
+                    ) VALUES (?, ?, ?, ?)
+                    """,
+                    (node_id, COHORT_VERSION, status, json.dumps(evidence, sort_keys=True)),
+                )
+                counts["excluded" if status == "excluded" else "conflicts"] += 1
+                continue
+            theater, objective, power_level, is_four_player = next(iter(signatures))
+            identity = {
+                "theater_code": theater,
+                "objective_code": objective,
+                "power_level": power_level,
+                "is_four_player": bool(is_four_player),
+            }
+            identity_key = hashlib.sha256(
+                json.dumps(identity, sort_keys=True).encode("utf-8")
+            ).hexdigest()
+            connection.execute(
+                """
+                INSERT INTO mission_cohorts(
+                    cohort_version, identity_key, theater_code, objective_code,
+                    power_level, is_four_player
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(cohort_version, identity_key) DO NOTHING
+                """,
+                (
+                    COHORT_VERSION, identity_key, theater, objective,
+                    power_level, is_four_player,
+                ),
+            )
+            cohort_id = connection.execute(
+                "SELECT id FROM mission_cohorts WHERE cohort_version=? AND identity_key=?",
+                (COHORT_VERSION, identity_key),
+            ).fetchone()[0]
+            chosen = accepted[-1]
+            evidence["identity"] = identity
+            evidence["source_rotation"] = {
+                "provider_rotation_key": chosen["provider_rotation_key"],
+                "valid_from": chosen["valid_from"],
+                "valid_until": chosen["valid_until"],
+            }
+            connection.execute(
+                """
+                INSERT INTO mission_cohort_memberships(
+                    mission_node_id, cohort_id, cohort_version, status,
+                    mission_match_id, external_mission_id, evidence_json
+                ) VALUES (?, ?, ?, 'included', ?, ?, ?)
+                """,
+                (
+                    node_id, cohort_id, COHORT_VERSION, chosen["match_id"],
+                    chosen["external_mission_id"], json.dumps(evidence, sort_keys=True),
+                ),
+            )
+            counts["included"] += 1
+        counts["cohorts"] = connection.execute(
+            """
+            SELECT COUNT(DISTINCT cohort_id) FROM mission_cohort_memberships
+            WHERE cohort_version=? AND status='included'
+            """,
+            (COHORT_VERSION,),
+        ).fetchone()[0]
+    return counts
+
+
 def refresh_activity(
     connection: sqlite3.Connection,
     now: datetime | None = None,
     window_seconds: int = WINDOW_SECONDS,
 ) -> dict[str, int]:
     instant = _now(now)
+    cohort_counts = refresh_mission_cohorts(connection)
     if window_seconds not in (15, 30, 60):
         raise ValueError("activity window must be 15, 30, or 60 seconds")
     all_attempts = connection.execute(
@@ -485,7 +616,11 @@ def refresh_activity(
                     coverage[60],
                 ),
             )
-    return {"attempts_scored": len(scored), "regions_scored": len(grouped)}
+    return {
+        "attempts_scored": len(scored),
+        "regions_scored": len(grouped),
+        **{f"cohort_{key}": value for key, value in cohort_counts.items()},
+    }
 
 
 def activity_overview(
@@ -607,6 +742,146 @@ def activity_overview(
     }
 
 
+def _cohort_scope(
+    connection: sqlite3.Connection, mission_node_id: int
+) -> dict[str, Any]:
+    row = connection.execute(
+        """
+        SELECT mcm.status, mcm.cohort_id, mcm.evidence_json,
+               mc.theater_code, mc.objective_code, mc.power_level,
+               mc.is_four_player
+        FROM mission_cohort_memberships mcm
+        LEFT JOIN mission_cohorts mc ON mc.id=mcm.cohort_id
+        WHERE mcm.mission_node_id=? AND mcm.cohort_version=?
+        """,
+        (mission_node_id, COHORT_VERSION),
+    ).fetchone()
+    if row is None or row["status"] != "included":
+        evidence = json.loads(row["evidence_json"]) if row else {}
+        return {
+            "type": "exact_rotation",
+            "status": row["status"] if row else "not_evaluated",
+            "cohort_version": COHORT_VERSION,
+            "cohort_id": None,
+            "node_ids": [mission_node_id],
+            "node_count": 1,
+            "rotation_count": 1,
+            "identity": None,
+            "reason": evidence.get("reason", "no_safe_cross_rotation_identity"),
+        }
+    members = connection.execute(
+        """
+        SELECT mcm.mission_node_id, mn.rotation_context
+        FROM mission_cohort_memberships mcm
+        JOIN mission_nodes mn ON mn.id=mcm.mission_node_id
+        WHERE mcm.cohort_id=? AND mcm.cohort_version=? AND mcm.status='included'
+        ORDER BY mn.first_seen_at, mcm.mission_node_id
+        """,
+        (row["cohort_id"], COHORT_VERSION),
+    ).fetchall()
+    rotations = {member["rotation_context"] for member in members}
+    return {
+        "type": "cross_rotation_cohort",
+        "status": "cross_rotation" if len(rotations) > 1 else "single_rotation",
+        "cohort_version": COHORT_VERSION,
+        "cohort_id": row["cohort_id"],
+        "node_ids": [member["mission_node_id"] for member in members],
+        "node_count": len(members),
+        "rotation_count": len(rotations),
+        "identity": {
+            "theater_code": row["theater_code"],
+            "objective_code": row["objective_code"],
+            "power_level": row["power_level"],
+            "is_four_player": bool(row["is_four_player"]),
+        },
+        "reason": None,
+    }
+
+
+def _aggregate_sample_regions(
+    connection: sqlite3.Connection,
+    node_ids: list[int],
+    instant: datetime,
+    local_zone: ZoneInfo | None = None,
+    band_start: int | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    placeholders = ",".join("?" for _ in node_ids)
+    rows = connection.execute(
+        f"""
+        SELECT r.code AS region, ma.ended_at, ma.started_at, ma.build_id,
+               aas.score, aas.arrival_score, aas.concurrency_score,
+               aas.breadth_score, aas.retention_score, aas.assignment_score,
+               a.assignment_latency_seconds
+        FROM attempt_activity_scores aas
+        JOIN mission_attempts ma ON ma.id=aas.attempt_id
+        JOIN regions r ON r.id=ma.requested_region_id
+        LEFT JOIN assignments a ON a.attempt_id=ma.id
+        WHERE ma.mission_node_id IN ({placeholders}) AND aas.score_version=?
+          AND aas.window_seconds=?
+        ORDER BY COALESCE(ma.ended_at, ma.started_at), ma.id
+        """,
+        (*node_ids, SCORE_VERSION, WINDOW_SECONDS),
+    ).fetchall()
+    eligible: list[tuple[sqlite3.Row, datetime]] = []
+    for row in rows:
+        sample_at = _parse_time(row["ended_at"] or row["started_at"])
+        if sample_at <= instant:
+            eligible.append((row, sample_at))
+    latest_build = eligible[-1][0]["build_id"] if eligible else None
+    eligible = [pair for pair in eligible if pair[0]["build_id"] == latest_build]
+    if local_zone is not None and band_start is not None:
+        eligible = [
+            pair for pair in eligible
+            if pair[1].astimezone(local_zone).hour // TIME_BAND_HOURS
+            * TIME_BAND_HOURS == band_start
+        ]
+    grouped: dict[str, list[tuple[sqlite3.Row, datetime]]] = defaultdict(list)
+    for row, sample_at in eligible:
+        grouped[row["region"]].append((row, sample_at))
+    regions: list[dict[str, Any]] = []
+    for region, samples in grouped.items():
+        weights = [
+            2.0 ** (
+                -max(0.0, (instant - sample_at).total_seconds() / 3600.0)
+                / RECENCY_HALF_LIFE_HOURS
+            )
+            for _, sample_at in samples
+        ]
+        weight_sum = sum(weights)
+        effective_size = weight_sum * weight_sum / sum(weight * weight for weight in weights)
+
+        def weighted(field: str) -> float:
+            return sum(
+                weight * float(row[field])
+                for weight, (row, _) in zip(weights, samples)
+            ) / weight_sum
+
+        latencies = [
+            float(row["assignment_latency_seconds"])
+            for row, _ in samples if row["assignment_latency_seconds"] is not None
+        ]
+        regions.append(
+            {
+                "region": region,
+                "score": round(weighted("score"), 2),
+                "components": {
+                    name: round(weighted(f"{name}_score"), 2)
+                    for name in ("arrival", "concurrency", "breadth", "retention", "assignment")
+                },
+                "sample_count": len(samples),
+                "effective_sample_size": round(effective_size, 2),
+                "confidence": _confidence(len(samples), effective_size),
+                "median_assignment_latency_seconds": median(latencies) if latencies else None,
+            }
+        )
+    regions.sort(key=lambda region: (-region["score"], region["region"]))
+    return regions, {
+        "sample_count": len(eligible),
+        "build_id": latest_build,
+        "build_rule": "latest_observed_build_only",
+    }
+
+
 def recommendation_overview(
     connection: sqlite3.Connection,
     mission_node_id: int | None = None,
@@ -622,6 +897,44 @@ def recommendation_overview(
     local_at = instant.astimezone(local_zone)
     band_start = local_at.hour // TIME_BAND_HOURS * TIME_BAND_HOURS
     band_end = band_start + TIME_BAND_HOURS - 1
+    node_id = overview["mission"]["mission_node_id"] if overview["mission"] else None
+    scope = (
+        _cohort_scope(connection, node_id)
+        if node_id is not None else {
+            "type": "exact_rotation", "status": "not_evaluated",
+            "cohort_version": COHORT_VERSION, "cohort_id": None,
+            "node_ids": [], "node_count": 0, "rotation_count": 0,
+            "identity": None, "reason": "no_mission",
+        }
+    )
+    node_ids = scope["node_ids"]
+    if node_ids:
+        cohort_regions, cohort_evidence = _aggregate_sample_regions(
+            connection, node_ids, instant
+        )
+        time_regions, time_evidence = _aggregate_sample_regions(
+            connection, node_ids, instant, local_zone, band_start
+        )
+    else:
+        cohort_regions, time_regions = [], []
+        cohort_evidence = time_evidence = {
+            "sample_count": 0, "build_id": None,
+            "build_rule": "latest_observed_build_only",
+        }
+    base_recommendation = (
+        recommend_region(cohort_regions, "this comparable mission cohort")
+        if scope["type"] == "cross_rotation_cohort"
+        else overview["recommendation"]
+    )
+    if scope["type"] == "cross_rotation_cohort" and scope["rotation_count"] > 1:
+        base_recommendation = dict(base_recommendation)
+        base_recommendation["summary"] += (
+            f" Evidence spans {scope['node_count']} mission nodes across "
+            f"{scope['rotation_count']} daily rotations."
+        )
+    sufficient_regions = [
+        region for region in time_regions if region["confidence"] != "insufficient"
+    ]
     context = {
         "version": TIME_CONTEXT_VERSION,
         "timezone": timezone_name,
@@ -632,112 +945,104 @@ def recommendation_overview(
         "band_end_hour": band_end,
         "band_label": f"{band_start:02d}:00-{band_end:02d}:59",
         "minimum_samples_per_region": 3,
-        "samples_in_band": 0,
-        "regions_with_sufficient_data": 0,
+        "samples_in_band": time_evidence["sample_count"],
+        "regions_with_sufficient_data": len(sufficient_regions),
         "status": "fallback",
         "fallback_reason": None,
+        "build_id": time_evidence["build_id"],
     }
-    node_id = overview["mission"]["mission_node_id"] if overview["mission"] else None
-    time_regions: list[dict[str, Any]] = []
-    if node_id is not None:
-        rows = connection.execute(
-            """
-            SELECT r.code AS region, ma.ended_at, ma.started_at,
-                   aas.score, aas.arrival_score, aas.concurrency_score,
-                   aas.breadth_score, aas.retention_score, aas.assignment_score,
-                   a.assignment_latency_seconds
-            FROM attempt_activity_scores aas
-            JOIN mission_attempts ma ON ma.id=aas.attempt_id
-            JOIN regions r ON r.id=ma.requested_region_id
-            LEFT JOIN assignments a ON a.attempt_id=ma.id
-            WHERE ma.mission_node_id=? AND aas.score_version=?
-              AND aas.window_seconds=?
-            ORDER BY COALESCE(ma.ended_at, ma.started_at), ma.id
-            """,
-            (node_id, SCORE_VERSION, WINDOW_SECONDS),
-        ).fetchall()
-        grouped: dict[str, list[tuple[sqlite3.Row, datetime]]] = defaultdict(list)
-        for row in rows:
-            sample_at = _parse_time(row["ended_at"] or row["started_at"])
-            if sample_at > instant:
-                continue
-            local_sample = sample_at.astimezone(local_zone)
-            if local_sample.hour // TIME_BAND_HOURS * TIME_BAND_HOURS == band_start:
-                grouped[row["region"]].append((row, sample_at))
-        context["samples_in_band"] = sum(len(samples) for samples in grouped.values())
-        for region, samples in grouped.items():
-            weights = [
-                2.0
-                ** (
-                    -max(0.0, (instant - sampled_at).total_seconds() / 3600.0)
-                    / RECENCY_HALF_LIFE_HOURS
-                )
-                for _, sampled_at in samples
-            ]
-            weight_sum = sum(weights)
-            effective_size = weight_sum * weight_sum / sum(w * w for w in weights)
-
-            def weighted(field: str) -> float:
-                return sum(
-                    weight * float(row[field])
-                    for weight, (row, _) in zip(weights, samples)
-                ) / weight_sum
-
-            latencies = [
-                float(row["assignment_latency_seconds"])
-                for row, _ in samples
-                if row["assignment_latency_seconds"] is not None
-            ]
-            time_regions.append(
-                {
-                    "region": region,
-                    "score": round(weighted("score"), 2),
-                    "components": {
-                        name: round(weighted(f"{name}_score"), 2)
-                        for name in (
-                            "arrival",
-                            "concurrency",
-                            "breadth",
-                            "retention",
-                            "assignment",
-                        )
-                    },
-                    "sample_count": len(samples),
-                    "effective_sample_size": round(effective_size, 2),
-                    "confidence": _confidence(len(samples), effective_size),
-                    "median_assignment_latency_seconds": (
-                        median(latencies) if latencies else None
-                    ),
-                }
-            )
-    time_regions.sort(key=lambda row: (-row["score"], row["region"]))
-    sufficient_regions = [
-        row for row in time_regions if row["confidence"] != "insufficient"
-    ]
-    context["regions_with_sufficient_data"] = len(sufficient_regions)
-    base_recommendation = overview["recommendation"]
     if len(sufficient_regions) >= 2:
         context["status"] = "time_specific"
-        recommendation = recommend_region(time_regions)
+        recommendation = recommend_region(
+            time_regions,
+            "this comparable mission cohort"
+            if scope["type"] == "cross_rotation_cohort" else "this exact mission",
+        )
         recommendation["summary"] += (
             f" This uses observations from the local {context['band_label']} time band."
         )
+        if scope["type"] == "cross_rotation_cohort" and scope["rotation_count"] > 1:
+            recommendation["summary"] += (
+                f" Comparable evidence spans {scope['rotation_count']} rotations."
+            )
     else:
         context["fallback_reason"] = (
             "Fewer than two regions have three complete samples in this local time band."
         )
         recommendation = dict(base_recommendation)
-        recommendation["summary"] = (
-            recommendation["summary"]
-            + " Time-specific evidence is not sufficient, so this is the overall recent ranking."
+        recommendation["summary"] += (
+            " Time-specific evidence is not sufficient, so this is the overall recent ranking."
         )
     return {
-        "definition": overview["definition"],
+        "definition": (
+            "Observed matchmaking activity from this client across only confidently "
+            "matched comparable missions; this is not population, queue depth, or CCU."
+            if scope["type"] == "cross_rotation_cohort" else overview["definition"]
+        ),
         "mission": overview["mission"],
+        "scope": {key: value for key, value in scope.items() if key != "node_ids"},
         "recommendation": recommendation,
         "base_recommendation": base_recommendation,
         "time_context": context,
         "time_regions": time_regions,
+        "cohort_regions": cohort_regions,
+        "cohort_evidence": cohort_evidence,
+    }
+
+
+def cohort_catalog(connection: sqlite3.Connection) -> dict[str, Any]:
+    cohorts = [
+        {
+            "cohort_id": row["id"],
+            "cohort_version": row["cohort_version"],
+            "theater_code": row["theater_code"],
+            "objective_code": row["objective_code"],
+            "power_level": row["power_level"],
+            "is_four_player": bool(row["is_four_player"]),
+            "node_count": row["node_count"],
+            "rotation_count": row["rotation_count"],
+            "mission_node_ids": json.loads(row["node_ids_json"]),
+        }
+        for row in connection.execute(
+            """
+            SELECT mc.*,
+                   COUNT(mcm.mission_node_id) AS node_count,
+                   COUNT(DISTINCT mn.rotation_context) AS rotation_count,
+                   json_group_array(mcm.mission_node_id) AS node_ids_json
+            FROM mission_cohorts mc
+            JOIN mission_cohort_memberships mcm
+              ON mcm.cohort_id=mc.id AND mcm.status='included'
+            JOIN mission_nodes mn ON mn.id=mcm.mission_node_id
+            WHERE mc.cohort_version=?
+            GROUP BY mc.id ORDER BY rotation_count DESC, node_count DESC, mc.id
+            """,
+            (COHORT_VERSION,),
+        )
+    ]
+    excluded = [
+        {
+            "mission_node_id": row["mission_node_id"],
+            "status": row["status"],
+            "reason": json.loads(row["evidence_json"]).get("reason"),
+        }
+        for row in connection.execute(
+            """
+            SELECT mission_node_id, status, evidence_json
+            FROM mission_cohort_memberships
+            WHERE cohort_version=? AND status<>'included'
+            ORDER BY mission_node_id
+            """,
+            (COHORT_VERSION,),
+        )
+    ]
+    return {
+        "cohort_version": COHORT_VERSION,
+        "definition": (
+            "Provider-backed comparable mission identities; observed nodes remain "
+            "rotation-scoped and are never merged."
+        ),
+        "cohorts": cohorts,
+        "excluded": excluded,
     }
 
 
@@ -746,6 +1051,7 @@ def main() -> int:
     parser.add_argument("--db", type=Path, default=Path("data/stw-intelligence.sqlite3"))
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("refresh", help="recompute attempt and regional activity scores")
+    commands.add_parser("cohorts", help="inspect cross-rotation mission cohorts")
     report = commands.add_parser("report", help="print the latest regional comparison")
     report.add_argument("--mission-node", type=int)
     recommend = commands.add_parser(
@@ -762,6 +1068,8 @@ def main() -> int:
     try:
         if args.command == "refresh":
             print(json.dumps(refresh_activity(connection), indent=2))
+        elif args.command == "cohorts":
+            print(json.dumps(cohort_catalog(connection), indent=2))
         elif args.command == "report":
             print(json.dumps(activity_overview(connection, args.mission_node), indent=2))
         else:

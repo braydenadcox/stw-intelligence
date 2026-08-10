@@ -240,6 +240,7 @@ class LiveWatcherTests(unittest.TestCase):
                 "/api/correlation/current",
                 "/api/activity/current",
                 "/api/recommendation/current",
+                "/api/cohorts/current",
                 "/api/settings",
                 "/api/diagnostics",
                 "/api/health",

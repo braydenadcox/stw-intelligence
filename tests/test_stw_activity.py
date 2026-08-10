@@ -13,6 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 from stw_activity import (  # noqa: E402
     activity_overview,
+    cohort_catalog,
     recommend_region,
     recommendation_overview,
     refresh_activity,
@@ -132,6 +133,159 @@ class ActivityScoreTests(unittest.TestCase):
                         )
         connection.commit()
 
+    def _seed_second_rotation(self, connection) -> int:
+        connection.execute(
+            """
+            INSERT INTO mission_nodes(
+                theater_uuid, mission_uuid, rotation_context,
+                rotation_context_evidence, observed_rotation_start,
+                observed_rotation_end, first_seen_at, last_seen_at
+            ) VALUES ('theater', 'mission-next', '2026-08-09', 'test',
+                      '2026-08-09T00:00:00Z', '2026-08-10T00:00:00Z',
+                      '2026-08-09T18:00:00Z', '2026-08-09T19:00:00Z')
+            """
+        )
+        next_node = connection.execute(
+            "SELECT id FROM mission_nodes WHERE mission_uuid='mission-next'"
+        ).fetchone()[0]
+        connection.execute(
+            """
+            INSERT INTO capture_files(
+                content_sha256, source_path, size_bytes, modified_ns, attempt_count
+            ) VALUES ('next-rotation', 'next.log', 2, 2, 6)
+            """
+        )
+        capture_id = connection.execute(
+            "SELECT id FROM capture_files WHERE content_sha256='next-rotation'"
+        ).fetchone()[0]
+        connection.execute(
+            """
+            INSERT INTO mission_attempts(
+                capture_id, source_attempt_index, source_line_start, source_line_end,
+                mission_node_id, requested_region_id, stw_type, fill_mode, party_size,
+                started_at, ended_at, outcome, observation_seconds, build_id,
+                power_level, team_size_at_start, team_size_15s, team_size_30s,
+                team_size_60s
+            )
+            SELECT ?, source_attempt_index+100, source_line_start+10000,
+                   source_line_end+10000, ?, requested_region_id, stw_type, fill_mode,
+                   party_size, replace(started_at, '2026-08-08', '2026-08-09'),
+                   replace(ended_at, '2026-08-08', '2026-08-09'), outcome,
+                   observation_seconds, build_id, power_level, team_size_at_start,
+                   team_size_15s, team_size_30s, team_size_60s
+            FROM mission_attempts WHERE build_id='current-build'
+            """,
+            (capture_id, next_node),
+        )
+        connection.execute(
+            """
+            INSERT INTO assignments(
+                attempt_id, source_line, assigned_at, assignment_latency_seconds
+            )
+            SELECT copy.id, original_assignment.source_line+10000,
+                   replace(original_assignment.assigned_at, '2026-08-08', '2026-08-09'),
+                   original_assignment.assignment_latency_seconds
+            FROM mission_attempts copy
+            JOIN mission_attempts original
+              ON copy.source_attempt_index=original.source_attempt_index+100
+            JOIN assignments original_assignment
+              ON original_assignment.attempt_id=original.id
+            WHERE copy.capture_id=?
+            """,
+            (capture_id,),
+        )
+        connection.execute(
+            """
+            INSERT INTO membership_events(
+                attempt_id, source_line, occurred_at, phase, event_type,
+                participant_hash, replaced_participant_hash, slot, team_size_after
+            )
+            SELECT copy.id, event.source_line+10000,
+                   replace(event.occurred_at, '2026-08-08', '2026-08-09'),
+                   event.phase, event.event_type, event.participant_hash,
+                   event.replaced_participant_hash, event.slot, event.team_size_after
+            FROM mission_attempts copy
+            JOIN mission_attempts original
+              ON copy.source_attempt_index=original.source_attempt_index+100
+            JOIN membership_events event ON event.attempt_id=original.id
+            WHERE copy.capture_id=?
+            """,
+            (capture_id,),
+        )
+        connection.execute(
+            """
+            INSERT INTO providers(code, display_name, adapter_version)
+            VALUES ('test', 'Test', '1')
+            """
+        )
+        provider_id = connection.execute("SELECT id FROM providers").fetchone()[0]
+        connection.execute(
+            """
+            INSERT INTO objectives(canonical_code, display_name)
+            VALUES ('ride_the_lightning', 'Ride the Lightning')
+            """
+        )
+        objective_id = connection.execute("SELECT id FROM objectives").fetchone()[0]
+        node_ids = [
+            connection.execute(
+                "SELECT id FROM mission_nodes WHERE mission_uuid='mission'"
+            ).fetchone()[0],
+            next_node,
+        ]
+        for index, (node_id, day) in enumerate(zip(node_ids, (8, 9)), 1):
+            payload_hash = f"snapshot-{index}"
+            connection.execute(
+                """
+                INSERT INTO provider_snapshots(
+                    provider_id, fetched_at, payload_sha256, raw_payload, parse_status
+                ) VALUES (?, ?, ?, '{}', 'parsed')
+                """,
+                (provider_id, f"2026-08-{day:02d}T00:00:01Z", payload_hash),
+            )
+            snapshot_id = connection.execute(
+                "SELECT id FROM provider_snapshots WHERE payload_sha256=?",
+                (payload_hash,),
+            ).fetchone()[0]
+            connection.execute(
+                """
+                INSERT INTO mission_rotations(
+                    provider_id, provider_rotation_key, valid_from, valid_until,
+                    snapshot_id, status
+                ) VALUES (?, ?, ?, ?, ?, 'expired')
+                """,
+                (
+                    provider_id, f"rotation-{index}",
+                    f"2026-08-{day:02d}T00:00:00Z",
+                    f"2026-08-{day + 1:02d}T00:00:00Z", snapshot_id,
+                ),
+            )
+            rotation_id = connection.execute(
+                "SELECT id FROM mission_rotations WHERE snapshot_id=?", (snapshot_id,)
+            ).fetchone()[0]
+            connection.execute(
+                """
+                INSERT INTO external_missions(
+                    rotation_id, provider_mission_key, theater_code, theater_name,
+                    objective_id, power_level, is_four_player, source_ordinal
+                ) VALUES (?, ?, 'twine_peaks', 'Twine Peaks', ?, 160, 1, 0)
+                """,
+                (rotation_id, f"mission-{index}", objective_id),
+            )
+            external_id = connection.execute(
+                "SELECT id FROM external_missions WHERE rotation_id=?", (rotation_id,)
+            ).fetchone()[0]
+            connection.execute(
+                """
+                INSERT INTO mission_matches(
+                    mission_node_id, rotation_id, external_mission_id, method,
+                    confidence, status, evidence_json, matcher_version
+                ) VALUES (?, ?, ?, 'inferred', 'high', 'accepted', '{}', 'test')
+                """,
+                (node_id, rotation_id, external_id),
+            )
+        connection.commit()
+        return next_node
+
     def test_scores_components_aggregates_and_refreshes_idempotently(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             database = Path(directory) / "activity.sqlite3"
@@ -153,7 +307,9 @@ class ActivityScoreTests(unittest.TestCase):
             finally:
                 connection.close()
 
-        self.assertEqual({"attempts_scored": 6, "regions_scored": 2}, first)
+        self.assertEqual(6, first["attempts_scored"])
+        self.assertEqual(2, first["regions_scored"])
+        self.assertEqual(1, first["cohort_excluded"])
         self.assertEqual(first, second)
         self.assertEqual((6, 2), counts)
         self.assertEqual("NAE", overview["leader"]["region"])
@@ -316,6 +472,61 @@ class ActivityScoreTests(unittest.TestCase):
         self.assertEqual(0, fallback["time_context"]["samples_in_band"])
         self.assertEqual("NAE", fallback["recommendation"]["region"])
         self.assertIn("overall recent ranking", fallback["recommendation"]["summary"])
+
+    def test_cross_rotation_cohort_reuses_only_provider_backed_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "activity.sqlite3"
+            connection = connect(database)
+            try:
+                self._seed(connection)
+                next_node = self._seed_second_rotation(connection)
+                result = refresh_activity(
+                    connection, datetime(2026, 8, 9, 20, tzinfo=timezone.utc)
+                )
+                recommendation = recommendation_overview(
+                    connection,
+                    mission_node_id=next_node,
+                    at=datetime(2026, 8, 9, 20, tzinfo=timezone.utc),
+                    timezone_name="UTC",
+                )
+                catalog = cohort_catalog(connection)
+                api_status, _, api_body = ApiApplication(database).dispatch(
+                    "GET", "/api/cohorts/current"
+                )
+                connection.execute(
+                    """
+                    UPDATE external_missions SET is_four_player=0
+                    WHERE provider_mission_key='mission-2'
+                    """
+                )
+                connection.commit()
+                refresh_activity(
+                    connection, datetime(2026, 8, 9, 20, tzinfo=timezone.utc)
+                )
+                split = recommendation_overview(
+                    connection,
+                    mission_node_id=next_node,
+                    at=datetime(2026, 8, 9, 20, tzinfo=timezone.utc),
+                    timezone_name="UTC",
+                )
+            finally:
+                connection.close()
+
+        self.assertEqual(1, result["cohort_cohorts"])
+        self.assertEqual(2, result["cohort_included"])
+        self.assertEqual("cross_rotation_cohort", recommendation["scope"]["type"])
+        self.assertEqual("cross_rotation", recommendation["scope"]["status"])
+        self.assertEqual(2, recommendation["scope"]["rotation_count"])
+        self.assertEqual(2, recommendation["scope"]["node_count"])
+        self.assertEqual(12, recommendation["time_context"]["samples_in_band"])
+        self.assertEqual("NAE", recommendation["recommendation"]["region"])
+        self.assertEqual(6, recommendation["time_regions"][0]["sample_count"])
+        self.assertEqual(1, len(catalog["cohorts"]))
+        self.assertEqual(200, api_status)
+        self.assertEqual(2, json.loads(api_body)["cohorts"][0]["rotation_count"])
+        self.assertEqual("single_rotation", split["scope"]["status"])
+        self.assertEqual(1, split["scope"]["node_count"])
+        self.assertEqual(6, split["time_context"]["samples_in_band"])
 
     def test_recommendation_api_rejects_invalid_time_and_timezone(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

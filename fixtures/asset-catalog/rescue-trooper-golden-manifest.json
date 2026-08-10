@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "purpose": "Phase 1 Rescue Trooper Ramirez provenance slice",
+  "raw_exports_committed": false,
+  "build_metadata_status": "not supplied",
+  "observed_manifest_sha256": "01d28bb23a879517d4eff252710c4211358755bff50c0a67f2c0d71e5cc98678",
+  "present_exports": [
+    {
+      "relative_path": "FortniteGame/Content/Balance/DataTables/CombatEffects_HeroAbilities.json",
+      "sha256": "43430501f6f82ad08e37fb0bae0b1e8854c596c11b947604b8d9fc88e482fcb3",
+      "size_bytes": 375297
+    },
+    {
+      "relative_path": "FortniteGame/Plugins/GameFeatures/SaveTheWorld/Content/Abilities/Player/Perks/Hero/AssaultDamage/GE_Perk_H_AssaultDamage_DamageBuff_T01.json",
+      "sha256": "d15b78d022184294c9ea4a303c973e84edb13ab1264b66dbb31eb07817a3b15a",
+      "size_bytes": 8403
+    },
+    {
+      "relative_path": "FortniteGame/Plugins/GameFeatures/SaveTheWorld/Content/Heroes/Commando/GameplayDefinition/HGD_Commando_GrenadeGun.json",
+      "sha256": "9748dc67725687a7e82fb36f9277abc0ebaed9d531ed669adf3fc12df9533908",
+      "size_bytes": 2111
+    },
+    {
+      "relative_path": "FortniteGame/Plugins/GameFeatures/SaveTheWorld/Content/Heroes/Commando/ItemDefinition/HID_Commando_GrenadeGun_SR_T05.json",
+      "sha256": "f96345a5b9fe6f10a2c7ab4a31492e172d2003dc7eaaaeef9408b096ae94cf56",
+      "size_bytes": 6167
+    }
+  ],
+  "exact_required_next_exports": [
+    "/SaveTheWorld/Abilities/Player/Perks/Hero/AssaultDamage/Kit_Perk_H_AssaultDamage_T01",
+    "/SaveTheWorld/Abilities/Player/Perks/Hero/AssaultDamage/Kit_Perk_H_AssaultDamage_T02",
+    "/SaveTheWorld/GameplayEffectTemplates/Hero/GET_DamageMultiplier_Ranged_Hero",
+    "/SaveTheWorld/Abilities/Player/Commando/Actives/FragGrenade/Kit_Commando_FragGrenade",
+    "/SaveTheWorld/Abilities/Player/Commando/Actives/Shockwave/Kit_Commando_Shockwave",
+    "/SaveTheWorld/Abilities/Player/Commando/Actives/GoinCommando/Kit_Commando_GoinCommando"
+  ],
+  "follow_references_after_export": [
+    "Export the exact GameplayEffect and ability assets referenced by each T01/T02 and active AbilityKit; do not infer the T02 effect path from naming conventions."
+  ]
+}

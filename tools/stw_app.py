@@ -27,7 +27,12 @@ from stw_admin import (
     sanitize_live_spools,
     update_settings,
 )
-from stw_activity import activity_overview, recommendation_overview, refresh_activity
+from stw_activity import (
+    activity_overview,
+    cohort_catalog,
+    recommendation_overview,
+    refresh_activity,
+)
 from stw_live import LogWatcher
 from stw_pipeline import connect
 from stw_providers import (
@@ -253,6 +258,8 @@ class ApiApplication:
                 except ValueError as error:
                     return self._json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
                 return self._json(HTTPStatus.OK, result)
+            if parsed.path == "/api/cohorts/current":
+                return self._json(HTTPStatus.OK, cohort_catalog(connection))
             if parsed.path == "/api/settings":
                 return self._json(
                     HTTPStatus.OK,

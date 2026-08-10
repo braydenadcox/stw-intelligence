@@ -170,10 +170,15 @@ class StwProviderTests(unittest.TestCase):
             finally:
                 connection.close()
 
-        self.assertEqual(5, version)
+        self.assertEqual(7, version)
         self.assertIn("mission_attempts", tables)
         self.assertIn("provider_snapshots", tables)
         self.assertIn("mission_matches", tables)
+        self.assertIn("mission_cohorts", tables)
+        self.assertIn("mission_cohort_memberships", tables)
+        self.assertIn("asset_snapshots", tables)
+        self.assertIn("asset_references", tables)
+        self.assertIn("catalog_heroes", tables)
 
     def test_fixture_snapshot_is_idempotent_and_normalizes_details(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

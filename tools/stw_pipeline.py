@@ -374,6 +374,215 @@ MIGRATIONS = [
     ALTER TABLE regional_activity ADD COLUMN coverage_15 REAL NOT NULL DEFAULT 0;
     ALTER TABLE regional_activity ADD COLUMN coverage_30 REAL NOT NULL DEFAULT 0;
     ALTER TABLE regional_activity ADD COLUMN coverage_60 REAL NOT NULL DEFAULT 0;
+    """,
+    """
+    CREATE TABLE mission_cohorts (
+        id INTEGER PRIMARY KEY,
+        cohort_version TEXT NOT NULL,
+        identity_key TEXT NOT NULL,
+        theater_code TEXT NOT NULL,
+        objective_code TEXT NOT NULL,
+        power_level INTEGER NOT NULL,
+        is_four_player INTEGER NOT NULL CHECK (is_four_player IN (0, 1)),
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE (cohort_version, identity_key),
+        UNIQUE (
+            cohort_version, theater_code, objective_code,
+            power_level, is_four_player
+        )
+    );
+    CREATE TABLE mission_cohort_memberships (
+        id INTEGER PRIMARY KEY,
+        mission_node_id INTEGER NOT NULL REFERENCES mission_nodes(id),
+        cohort_id INTEGER REFERENCES mission_cohorts(id),
+        cohort_version TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('included', 'excluded', 'conflict')),
+        mission_match_id INTEGER REFERENCES mission_matches(id) ON DELETE SET NULL,
+        external_mission_id INTEGER REFERENCES external_missions(id),
+        evidence_json TEXT NOT NULL,
+        evaluated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE (mission_node_id, cohort_version),
+        CHECK (
+            (status = 'included' AND cohort_id IS NOT NULL)
+            OR (status <> 'included' AND cohort_id IS NULL)
+        )
+    );
+    CREATE INDEX mission_cohort_memberships_lookup_idx
+        ON mission_cohort_memberships(cohort_id, status, mission_node_id);
+    """,
+    """
+    CREATE TABLE game_builds (
+        id INTEGER PRIMARY KEY,
+        build_key TEXT NOT NULL UNIQUE,
+        game_version TEXT,
+        changelist TEXT,
+        metadata_json TEXT NOT NULL DEFAULT '{}',
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE TABLE asset_snapshots (
+        id INTEGER PRIMARY KEY,
+        game_build_id INTEGER NOT NULL REFERENCES game_builds(id),
+        source_root TEXT NOT NULL,
+        exporter_name TEXT NOT NULL,
+        exporter_version TEXT,
+        manifest_sha256 TEXT NOT NULL,
+        file_count INTEGER NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('ingesting', 'ready', 'failed')),
+        error_text TEXT,
+        ingested_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE (game_build_id, manifest_sha256)
+    );
+    CREATE TABLE asset_files (
+        id INTEGER PRIMARY KEY,
+        snapshot_id INTEGER NOT NULL REFERENCES asset_snapshots(id) ON DELETE CASCADE,
+        relative_path TEXT NOT NULL,
+        source_path TEXT NOT NULL,
+        content_sha256 TEXT NOT NULL,
+        size_bytes INTEGER NOT NULL,
+        UNIQUE (snapshot_id, relative_path)
+    );
+    CREATE TABLE asset_objects (
+        id INTEGER PRIMARY KEY,
+        snapshot_id INTEGER NOT NULL REFERENCES asset_snapshots(id) ON DELETE CASCADE,
+        asset_file_id INTEGER NOT NULL REFERENCES asset_files(id) ON DELETE CASCADE,
+        export_index INTEGER NOT NULL,
+        package_path TEXT,
+        object_name TEXT NOT NULL,
+        object_type TEXT NOT NULL,
+        class_path TEXT,
+        object_key TEXT NOT NULL,
+        UNIQUE (asset_file_id, export_index),
+        UNIQUE (snapshot_id, object_key)
+    );
+    CREATE TABLE asset_references (
+        id INTEGER PRIMARY KEY,
+        snapshot_id INTEGER NOT NULL REFERENCES asset_snapshots(id) ON DELETE CASCADE,
+        source_object_id INTEGER NOT NULL REFERENCES asset_objects(id) ON DELETE CASCADE,
+        property_path TEXT NOT NULL,
+        target_path TEXT NOT NULL,
+        target_package_path TEXT NOT NULL,
+        target_object_id INTEGER REFERENCES asset_objects(id),
+        resolution_status TEXT NOT NULL
+            CHECK (resolution_status IN ('resolved', 'unresolved', 'ambiguous')),
+        UNIQUE (source_object_id, property_path, target_path)
+    );
+    CREATE INDEX asset_references_target_idx
+        ON asset_references(snapshot_id, target_package_path, resolution_status);
+
+    CREATE TABLE catalog_curve_tables (
+        id INTEGER PRIMARY KEY,
+        snapshot_id INTEGER NOT NULL REFERENCES asset_snapshots(id) ON DELETE CASCADE,
+        source_object_id INTEGER NOT NULL UNIQUE REFERENCES asset_objects(id),
+        package_path TEXT NOT NULL,
+        table_name TEXT NOT NULL
+    );
+    CREATE TABLE catalog_curve_rows (
+        id INTEGER PRIMARY KEY,
+        curve_table_id INTEGER NOT NULL REFERENCES catalog_curve_tables(id) ON DELETE CASCADE,
+        row_name TEXT NOT NULL,
+        UNIQUE (curve_table_id, row_name)
+    );
+    CREATE TABLE catalog_curve_points (
+        id INTEGER PRIMARY KEY,
+        curve_row_id INTEGER NOT NULL REFERENCES catalog_curve_rows(id) ON DELETE CASCADE,
+        point_ordinal INTEGER NOT NULL,
+        time_value REAL NOT NULL,
+        output_value REAL NOT NULL,
+        interpolation TEXT,
+        UNIQUE (curve_row_id, point_ordinal)
+    );
+    CREATE TABLE catalog_gameplay_effects (
+        id INTEGER PRIMARY KEY,
+        snapshot_id INTEGER NOT NULL REFERENCES asset_snapshots(id) ON DELETE CASCADE,
+        source_object_id INTEGER NOT NULL UNIQUE REFERENCES asset_objects(id),
+        package_path TEXT NOT NULL,
+        effect_name TEXT NOT NULL,
+        template_path TEXT,
+        stacking_type TEXT,
+        stack_limit INTEGER
+    );
+    CREATE TABLE catalog_effect_modifiers (
+        id INTEGER PRIMARY KEY,
+        gameplay_effect_id INTEGER NOT NULL
+            REFERENCES catalog_gameplay_effects(id) ON DELETE CASCADE,
+        modifier_ordinal INTEGER NOT NULL,
+        attribute_name TEXT,
+        modifier_operation TEXT,
+        magnitude_kind TEXT,
+        literal_value REAL,
+        curve_table_path TEXT,
+        curve_row_name TEXT,
+        curve_row_id INTEGER REFERENCES catalog_curve_rows(id),
+        source_required_tags_json TEXT NOT NULL DEFAULT '[]',
+        source_ignored_tags_json TEXT NOT NULL DEFAULT '[]',
+        target_required_tags_json TEXT NOT NULL DEFAULT '[]',
+        target_ignored_tags_json TEXT NOT NULL DEFAULT '[]',
+        interpretation_status TEXT NOT NULL
+            CHECK (interpretation_status IN ('supported', 'partial', 'unsupported')),
+        UNIQUE (gameplay_effect_id, modifier_ordinal)
+    );
+    CREATE TABLE catalog_ability_kits (
+        id INTEGER PRIMARY KEY,
+        snapshot_id INTEGER NOT NULL REFERENCES asset_snapshots(id) ON DELETE CASCADE,
+        source_object_id INTEGER NOT NULL UNIQUE REFERENCES asset_objects(id),
+        package_path TEXT NOT NULL,
+        kit_name TEXT NOT NULL
+    );
+    CREATE TABLE catalog_ability_kit_grants (
+        id INTEGER PRIMARY KEY,
+        ability_kit_id INTEGER NOT NULL REFERENCES catalog_ability_kits(id) ON DELETE CASCADE,
+        source_reference_id INTEGER NOT NULL UNIQUE REFERENCES asset_references(id),
+        grant_kind TEXT NOT NULL CHECK (grant_kind IN ('gameplay_effect', 'ability', 'reference')),
+        target_path TEXT NOT NULL,
+        gameplay_effect_id INTEGER REFERENCES catalog_gameplay_effects(id)
+    );
+    CREATE TABLE catalog_heroes (
+        id INTEGER PRIMARY KEY,
+        snapshot_id INTEGER NOT NULL REFERENCES asset_snapshots(id) ON DELETE CASCADE,
+        source_object_id INTEGER NOT NULL UNIQUE REFERENCES asset_objects(id),
+        hero_key TEXT NOT NULL,
+        display_name TEXT NOT NULL,
+        hero_class TEXT,
+        statline_tags_json TEXT NOT NULL DEFAULT '[]',
+        UNIQUE (snapshot_id, hero_key)
+    );
+    CREATE TABLE catalog_hero_variants (
+        id INTEGER PRIMARY KEY,
+        hero_id INTEGER NOT NULL REFERENCES catalog_heroes(id) ON DELETE CASCADE,
+        source_object_id INTEGER NOT NULL UNIQUE REFERENCES asset_objects(id),
+        variant_key TEXT NOT NULL,
+        display_name TEXT NOT NULL,
+        rarity TEXT,
+        tier TEXT,
+        attribute_init_key TEXT,
+        UNIQUE (hero_id, variant_key)
+    );
+    CREATE TABLE catalog_hero_abilities (
+        id INTEGER PRIMARY KEY,
+        hero_id INTEGER NOT NULL REFERENCES catalog_heroes(id) ON DELETE CASCADE,
+        ability_ordinal INTEGER NOT NULL,
+        ability_kit_path TEXT NOT NULL,
+        ability_kit_id INTEGER REFERENCES catalog_ability_kits(id),
+        minimum_rarity TEXT,
+        UNIQUE (hero_id, ability_ordinal)
+    );
+    CREATE TABLE catalog_perks (
+        id INTEGER PRIMARY KEY,
+        snapshot_id INTEGER NOT NULL REFERENCES asset_snapshots(id) ON DELETE CASCADE,
+        perk_family TEXT NOT NULL,
+        perk_tier TEXT NOT NULL,
+        ability_kit_path TEXT NOT NULL,
+        ability_kit_id INTEGER REFERENCES catalog_ability_kits(id),
+        UNIQUE (snapshot_id, perk_family, perk_tier)
+    );
+    CREATE TABLE catalog_hero_perks (
+        id INTEGER PRIMARY KEY,
+        hero_id INTEGER NOT NULL REFERENCES catalog_heroes(id) ON DELETE CASCADE,
+        perk_id INTEGER NOT NULL REFERENCES catalog_perks(id) ON DELETE CASCADE,
+        perk_mode TEXT NOT NULL CHECK (perk_mode IN ('support', 'commander')),
+        UNIQUE (hero_id, perk_mode)
+    );
+    CREATE INDEX catalog_hero_name_idx ON catalog_heroes(snapshot_id, display_name);
     """
 ]
 

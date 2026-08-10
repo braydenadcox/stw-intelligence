@@ -982,6 +982,9 @@ MIGRATIONS = [
         ON catalog_weapon_variants(slot_loadout_id);
     CREATE INDEX catalog_weapon_variants_baseline_loadout_idx
         ON catalog_weapon_variants(baseline_slot_loadout_id);
+    """,
+    """
+    ALTER TABLE catalog_ability_kit_grants ADD COLUMN grant_level REAL;
     """
 ]
 

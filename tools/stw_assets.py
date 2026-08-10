@@ -18,7 +18,7 @@ from stw_pipeline import connect
 
 
 PERK_KIT_RE = re.compile(r"^Kit_Perk_H_(?P<family>.+)_(?P<tier>T\d+)$")
-NORMALIZER_VERSION = "phase2-v13"
+NORMALIZER_VERSION = "phase2-v14"
 ROSTER_PLAN_VERSION = "phase2-roster-v1"
 
 STW_HERO_CLASSES = ("Commando", "Constructor", "Ninja", "Outlander")
@@ -616,7 +616,13 @@ def _normalize_curves(
                         curve_row_id, point_ordinal, time_value, output_value, interpolation
                     ) VALUES (?, ?, ?, ?, ?)
                     """,
-                    (row_id, ordinal, time_value, output_value, point.get("InterpMode")),
+                    (
+                        row_id,
+                        ordinal,
+                        time_value,
+                        output_value,
+                        point.get("InterpMode") or row_payload.get("InterpMode"),
+                    ),
                 )
 
 
@@ -1222,6 +1228,32 @@ def _is_ability_kit(
     )
 
 
+def _ability_kit_grant_level(
+    export: dict[str, Any], property_path: str
+) -> float | None:
+    properties = export.get("Properties") or {}
+    for collection_name in (
+        "GrantedGameplayEffects",
+        "GrantedAbilities",
+        "GrantedGameplayAbilities",
+        "GameplayAbilities",
+        "Gadgets",
+    ):
+        match = re.search(
+            rf"{re.escape(collection_name)}\[(\d+)\]",
+            property_path,
+            flags=re.IGNORECASE,
+        )
+        collection = properties.get(collection_name)
+        if not match or not isinstance(collection, list):
+            continue
+        index = int(match.group(1))
+        if index >= len(collection) or not isinstance(collection[index], dict):
+            return None
+        return _real_value(collection[index].get("Level"))
+    return None
+
+
 def _normalize_ability_kits(
     connection: sqlite3.Connection,
     snapshot_id: int,
@@ -1319,8 +1351,8 @@ def _normalize_ability_kits(
                 """
                 INSERT INTO catalog_ability_kit_grants(
                     ability_kit_id, source_reference_id, grant_kind,
-                    target_path, gameplay_effect_id, ability_id
-                ) VALUES (?, ?, ?, ?, ?, ?)
+                    target_path, gameplay_effect_id, ability_id, grant_level
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     kit_id,
@@ -1329,6 +1361,7 @@ def _normalize_ability_kits(
                     reference["target_path"],
                     gameplay_effect_id,
                     ability_id,
+                    _ability_kit_grant_level(export, reference["property_path"]),
                 ),
             )
     _normalize_linked_abilities(connection, snapshot_id, payloads)

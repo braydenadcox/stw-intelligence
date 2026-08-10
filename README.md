@@ -154,6 +154,18 @@ It never evaluates partial/opaque perk families or invents a cross-mechanic powe
 See [deterministic loadout reasoning](docs/deterministic-loadout-reasoning.md) for the
 current boundaries and query rules.
 
+The first deterministic combat evaluator turns one exact weapon configuration, hero
+loadout, and declared scenario into auditable catalog-stat damage metrics:
+
+```powershell
+python tools/stw_combat.py --db data/phase2-real-validation.sqlite3 nocturno-demo
+```
+
+It evaluates proven weapon and hero GameplayEffects, tags, conditions, curves, stacking,
+shot profiles, and burst/sustained throughput while explicitly isolating unknown runtime
+scaling and Blueprint behavior. See [deterministic combat evaluation](docs/deterministic-combat-evaluation.md)
+for a fully specified Nocturno command and the evidence boundary.
+
 ## Live local application
 
 On Windows, the default command watches Fortnite's standard log location, loads the

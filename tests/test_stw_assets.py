@@ -234,6 +234,7 @@ def write_weapon_slice(root: Path) -> list[Path]:
     alteration_package = "/SaveTheWorld/Items/Alteration_v2/AttributeAlterations/Damage/AID_Att_Damage_T05"
     ability_set_package = "/SaveTheWorld/Items/Alteration_v2/AttributeAlterations/Damage/AS_Att_Damage_T05"
     effect_package = "/SaveTheWorld/Items/Alteration_v2/AttributeAlterations/Damage/GE_Att_Damage"
+    magnitude_package = "/Game/Balance/DataTables/CombatEffectMagnitude"
     return [
         _write_export(
             root,
@@ -356,6 +357,7 @@ def write_weapon_slice(root: Path) -> list[Path]:
                             "ImpactDmgScale": 0.05,
                             "DiceCritChance": 0.2,
                             "DiceCritDamageMultiplier": 0.75,
+                            "DamageZone_Critical": 1.5,
                             "FiringRate": 8.0,
                             "ReloadTime": 2.5,
                             "ClipSize": 30,
@@ -468,7 +470,7 @@ def write_weapon_slice(root: Path) -> list[Path]:
                                 "GameplayEffect": _reference(
                                     effect_package, "GE_Att_Damage_C"
                                 ),
-                                "Level": 0,
+                                "Level": 12,
                             }
                         ]
                     },
@@ -486,14 +488,42 @@ def write_weapon_slice(root: Path) -> list[Path]:
                     "Properties": {
                         "Modifiers": [
                             {
-                                "Attribute": {"AttributeName": "WeaponDamageMultiplier"},
-                                "ModifierOp": "EGameplayModOp::Additive",
+                                "Attribute": {"AttributeName": "OutgoingAbilityDamage"},
+                                "ModifierOp": "EGameplayModOp::Multiplicitive",
                                 "ModifierMagnitude": {
                                     "MagnitudeCalculationType": "EGameplayEffectMagnitudeCalculation::ScalableFloat",
-                                    "ScalableFloatMagnitude": {"Value": 0.3},
+                                    "ScalableFloatMagnitude": {
+                                        "Value": 1.0,
+                                        "Curve": {
+                                            "CurveTable": {
+                                                "ObjectPath": f"{magnitude_package}.0"
+                                            },
+                                            "RowName": "Item.All.Damage.Normal",
+                                        },
+                                    },
                                 },
                             }
                         ]
+                    },
+                }
+            ],
+        ),
+        _write_export(
+            root,
+            "Tables/CombatEffectMagnitude.json",
+            [
+                {
+                    "Type": "CurveTable",
+                    "Name": "CombatEffectMagnitude",
+                    "Package": magnitude_package,
+                    "Rows": {
+                        "Item.All.Damage.Normal": {
+                            "InterpMode": "ERichCurveInterpMode::RCIM_Linear",
+                            "Keys": [
+                                {"Time": 0.0, "Value": 1.0},
+                                {"Time": 10000.0, "Value": 251.0},
+                            ],
+                        }
                     },
                 }
             ],
@@ -756,6 +786,12 @@ class AssetCatalogTests(unittest.TestCase):
                 search = weapon_catalog_search(
                     connection, "Rifle", summary["snapshot_id"]
                 )
+                grant = connection.execute(
+                    "SELECT grant_level FROM catalog_ability_kit_grants"
+                ).fetchone()
+                interpolation = connection.execute(
+                    "SELECT DISTINCT interpolation FROM catalog_curve_points"
+                ).fetchone()
             finally:
                 connection.close()
 
@@ -774,6 +810,10 @@ class AssetCatalogTests(unittest.TestCase):
         option = detail["matches"][0]["slot_loadouts"][0]["slots"][0]["options"][0]
         self.assertEqual("+30% Damage", option["description"])
         self.assertEqual("supported", option["semantic_status"])
+        self.assertEqual(12.0, grant["grant_level"])
+        self.assertEqual(
+            "ERichCurveInterpMode::RCIM_Linear", interpolation["interpolation"]
+        )
 
     def test_weapon_schematic_stays_unresolved_without_explicit_asset_identity(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1700,7 +1740,7 @@ class AssetCatalogTests(unittest.TestCase):
         self.assertEqual(before, after)
         self.assertEqual("37.00", build["game_version"])
         self.assertEqual("123456", build["changelist"])
-        self.assertEqual("phase2-v13", second["normalization"]["normalizer_version"])
+        self.assertEqual("phase2-v14", second["normalization"]["normalizer_version"])
 
     def test_ingestion_preserves_duplicate_object_names_within_a_package(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1782,7 +1822,7 @@ class AssetCatalogTests(unittest.TestCase):
         self.assertEqual(first["snapshot_id"], second["snapshot_id"])
         self.assertFalse(second["idempotent"])
         self.assertGreater(tag_count, 0)
-        self.assertEqual([("phase2-v13", "ready")], [tuple(row) for row in runs])
+        self.assertEqual([("phase2-v14", "ready")], [tuple(row) for row in runs])
 
     def test_unresolved_references_are_reported_without_inference(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

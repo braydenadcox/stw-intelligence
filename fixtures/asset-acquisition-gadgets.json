@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "scopes": [
+    {
+      "kind": "folder",
+      "path": "/SaveTheWorld/Abilities/Player/Generic/Gadgets"
+    },
+    { "kind": "package", "path": "/SaveTheWorld/Items/HomebaseNodes/SkillTree_AdrenalineRush" },
+    { "kind": "package", "path": "/SaveTheWorld/Items/HomebaseNodes/SkillTree_Airstrike" },
+    { "kind": "package", "path": "/SaveTheWorld/Items/HomebaseNodes/SkillTree_Banner" },
+    { "kind": "package", "path": "/SaveTheWorld/Items/HomebaseNodes/SkillTree_HoverTurret" },
+    { "kind": "package", "path": "/SaveTheWorld/Items/HomebaseNodes/SkillTree_ProximityMine" },
+    { "kind": "package", "path": "/SaveTheWorld/Items/HomebaseNodes/SkillTree_SlowField" },
+    { "kind": "package", "path": "/SaveTheWorld/Items/HomebaseNodes/SkillTree_SupplyDrop" },
+    { "kind": "package", "path": "/SaveTheWorld/Items/HomebaseNodes/SkillTree_Teleporter" },
+    { "kind": "package", "path": "/Game/Abilities/Player/Generic/Gadgets/AdrenalineRush/G_Generic_AdrenalineRush" },
+    { "kind": "package", "path": "/Game/Abilities/Player/Generic/Gadgets/AirStrike/G_AirStrike" },
+    { "kind": "package", "path": "/Game/Abilities/Player/Generic/Gadgets/Banner/GE_Banner_RespawnPoint" },
+    { "kind": "package", "path": "/Game/Abilities/Player/Generic/Gadgets/Proximity_Mines/GE_Generic_ProximityMine_Damage" },
+    { "kind": "package", "path": "/SaveTheWorld/Items/Ammo/AmmoDataBotTurret" },
+    { "kind": "package", "path": "/SaveTheWorld/Items/Ammo/AmmoDataProximityMines" },
+    { "kind": "package", "path": "/Game/Abilities/Player/Generic/Gadgets/AdrenalineRush/GA_Generic_AdrenalineRush" },
+    { "kind": "package", "path": "/Game/Abilities/Player/Generic/Gadgets/AirStrike/GA_AirStrike" },
+    { "kind": "package", "path": "/Game/Abilities/Player/Generic/Gadgets/AdrenalineRush/GE_Generic_AdrenalineRush" },
+    { "kind": "package", "path": "/Game/Abilities/Player/Generic/Gadgets/AdrenalineRush/GE_Generic_AdrenalineRushCooldown" },
+    { "kind": "package", "path": "/Game/Abilities/Player/Generic/Gadgets/AdrenalineRush/GE_Generic_AdrenalineRushInstant" },
+    { "kind": "package", "path": "/Game/Abilities/Player/Generic/Gadgets/AirStrike/GE_AirStrike_Cooldown" },
+    { "kind": "package", "path": "/Game/Abilities/Player/Generic/Gadgets/AirStrike/GE_AirStrike_Damage" },
+    { "kind": "package", "path": "/Game/GameplayEffectTemplates/GET_DirectBallisticDamage" }
+  ]
+}

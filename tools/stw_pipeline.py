@@ -1080,6 +1080,39 @@ MIGRATIONS = [
         ON catalog_active_abilities(snapshot_id, display_name);
     CREATE INDEX catalog_active_ability_grants_ability_idx
         ON catalog_active_ability_grants(active_ability_id, grant_domain);
+    """,
+    """
+    CREATE TABLE catalog_gadgets (
+        id INTEGER PRIMARY KEY,
+        snapshot_id INTEGER NOT NULL REFERENCES asset_snapshots(id) ON DELETE CASCADE,
+        source_object_id INTEGER NOT NULL UNIQUE REFERENCES asset_objects(id),
+        ability_kit_id INTEGER NOT NULL UNIQUE REFERENCES catalog_ability_kits(id),
+        gadget_key TEXT NOT NULL,
+        display_name TEXT NOT NULL,
+        package_path TEXT NOT NULL,
+        semantic_status TEXT NOT NULL
+            CHECK (semantic_status IN ('supported', 'partial', 'opaque')),
+        UNIQUE (snapshot_id, gadget_key)
+    );
+    CREATE TABLE catalog_gadget_levels (
+        id INTEGER PRIMARY KEY,
+        gadget_id INTEGER NOT NULL REFERENCES catalog_gadgets(id) ON DELETE CASCADE,
+        level_ordinal INTEGER NOT NULL,
+        display_data_id TEXT,
+        minimum_commander_level INTEGER,
+        ability_kit_path TEXT,
+        ability_kit_id INTEGER REFERENCES catalog_ability_kits(id),
+        gameplay_effect_rows_json TEXT NOT NULL DEFAULT '[]',
+        cost_json TEXT NOT NULL DEFAULT '[]',
+        unlock_facts_json TEXT NOT NULL DEFAULT '{}',
+        interpretation_status TEXT NOT NULL
+            CHECK (interpretation_status IN ('supported', 'partial', 'opaque')),
+        UNIQUE (gadget_id, level_ordinal)
+    );
+    CREATE INDEX catalog_gadgets_snapshot_idx
+        ON catalog_gadgets(snapshot_id, display_name);
+    CREATE INDEX catalog_gadget_levels_gadget_idx
+        ON catalog_gadget_levels(gadget_id, level_ordinal);
     """
 ]
 

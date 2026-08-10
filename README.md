@@ -204,6 +204,19 @@ initial acquisition scope is
 subsequent dependencies come only from exact structural references. See
 [hero active-ability semantics](docs/hero-active-ability-semantics.md).
 
+Player-selectable gadgets are discovered from Homebase unlock-node grants and use the
+same AbilityKit/GameplayAbility/GameplayEffect interaction machinery:
+
+```powershell
+python tools/stw_interactions.py --db data/phase2-real-validation.sqlite3 gadgets
+python tools/stw_interactions.py --db data/phase2-real-validation.sqlite3 gadget "Hover Turret"
+```
+
+The catalog keeps all six upgrade levels, commander-level requirements, cooldown/cost
+mechanics, effects, spawned entities, tags, executions, and Blueprint/native boundaries.
+Internal/debug gadget kits are excluded unless a selectable unlock node structurally grants
+them. See [gadget interaction semantics](docs/gadget-interaction-semantics.md).
+
 ## Live local application
 
 On Windows, the default command watches Fortnite's standard log location, loads the

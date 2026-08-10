@@ -12,6 +12,8 @@ from stw_assets import ingest_asset_directory  # noqa: E402
 from stw_interactions import (  # noqa: E402
     active_ability_coverage,
     active_ability_report,
+    gadget_coverage,
+    gadget_report,
     team_perk_coverage,
     team_perk_report,
 )
@@ -20,6 +22,7 @@ from stw_pipeline import connect  # noqa: E402
 
 ROOT = "/SaveTheWorld/Abilities/Player/Perks/Leader/TestInteraction"
 ACTIVE_ROOT = "/SaveTheWorld/Abilities/Player/Commando/Actives/TestBlast"
+GADGET_ROOT = "/SaveTheWorld/Abilities/Player/Generic/Gadgets/TestDeployable"
 
 
 def _ref(package: str, name: str) -> dict[str, str]:
@@ -332,6 +335,118 @@ def write_active_ability_slice(root: Path) -> None:
     )
 
 
+def write_gadget_slice(root: Path) -> None:
+    node = "/SaveTheWorld/Items/HomebaseNodes/SkillTree_TestDeployable"
+    kit = f"{GADGET_ROOT}/Kit_Generic_TestDeployable"
+    ability = f"{GADGET_ROOT}/GA_Generic_TestDeployable"
+    effect = f"{GADGET_ROOT}/GE_Generic_TestDeployableDamage"
+    actor = f"{GADGET_ROOT}/B_TestDeployable"
+    _write(
+        root,
+        "SkillTree_TestDeployable",
+        [{
+            "Type": "FortHomebaseNodeItemDefinition",
+            "Name": "SkillTree_TestDeployable",
+            "Package": node,
+            "Properties": {
+                "ItemName": {"LocalizedString": "Test Deployable"},
+                "LevelData": [
+                    {
+                        "DisplayDataId": "G_TestDeployable_0",
+                        "MinCommanderLevel": 1,
+                        "Cost": [],
+                        "GameplayEffectRowNames": [],
+                        "AbilityKit": _ref(kit, "Kit_Generic_TestDeployable"),
+                        "UnlockedSquadSlots": [],
+                    },
+                    {
+                        "DisplayDataId": "G_TestDeployable_1",
+                        "MinCommanderLevel": 40,
+                        "Cost": [],
+                        "GameplayEffectRowNames": ["GE_GadgetUpgrade_TestDeployable_T1"],
+                        "AbilityKit": {"AssetPathName": "", "SubPathString": ""},
+                        "UnlockedSquadSlots": [],
+                    },
+                ],
+            },
+        }],
+    )
+    _write(
+        root,
+        "Kit_Generic_TestDeployable",
+        [{
+            "Type": "FortAbilityKit",
+            "Name": "Kit_Generic_TestDeployable",
+            "Package": kit,
+            "Properties": {
+                "DisplayName": {"LocalizedString": "Test Deployable"},
+                "GameplayAbilities": [{"ObjectPath": f"{ability}.0"}],
+                "GrantedGameplayEffects": [
+                    {"GameplayEffect": {"ObjectPath": f"{effect}.0"}, "Level": 1.0}
+                ],
+            },
+        }],
+    )
+    _write(
+        root,
+        "Kit_InternalDebugGadget",
+        [{
+            "Type": "FortAbilityKit",
+            "Name": "Kit_InternalDebugGadget",
+            "Package": f"{GADGET_ROOT}/Kit_InternalDebugGadget",
+            "Properties": {"DisplayName": {"LocalizedString": "Not Selectable"}},
+        }],
+    )
+    _write(
+        root,
+        "GA_Generic_TestDeployable",
+        [{
+            "Type": "GA_Generic_TestDeployable_C",
+            "Name": "Default__GA_Generic_TestDeployable_C",
+            "Package": ability,
+            "Class": "BlueprintGeneratedClass'GA_Generic_TestDeployable_C'",
+            "Properties": {
+                "CooldownDuration": {"Value": 30.0, "Curve": {"CurveTable": None, "RowName": "None"}},
+                "MaxCharges": 2,
+                "DamageRadius": 512.0,
+                "SpawnedActorClass": _ref(actor, "B_TestDeployable_C"),
+                "ActivationRequiredTags": [{"TagName": "State.InMission"}],
+            },
+        }],
+    )
+    _write(
+        root,
+        "GE_Generic_TestDeployableDamage",
+        [{
+            "Type": "GE_Generic_TestDeployableDamage_C",
+            "Name": "Default__GE_Generic_TestDeployableDamage_C",
+            "Package": effect,
+            "Properties": {
+                "DurationPolicy": "EGameplayEffectDurationType::Instant",
+                "Modifiers": [{
+                    "Attribute": {"AttributeName": "Health"},
+                    "ModifierOp": "EGameplayModOp::Additive",
+                    "ModifierMagnitude": {
+                        "MagnitudeCalculationType": "EGameplayEffectMagnitudeCalculation::ScalableFloat",
+                        "ScalableFloatMagnitude": {"Value": -100.0, "Curve": {"CurveTable": None, "RowName": "None"}},
+                    },
+                }],
+            },
+        }],
+    )
+    _write(
+        root,
+        "B_TestDeployable",
+        [{
+            "Type": "B_TestDeployable_C",
+            "Name": "Default__B_TestDeployable_C",
+            "Package": actor,
+            "Class": "BlueprintGeneratedClass'B_TestDeployable_C'",
+            "Properties": {},
+        }],
+    )
+
+
 class TeamPerkInteractionTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
@@ -339,6 +454,7 @@ class TeamPerkInteractionTests(unittest.TestCase):
         exports = root / "exports"
         write_team_perk_slice(exports)
         write_active_ability_slice(exports)
+        write_gadget_slice(exports)
         self.connection = connect(root / "catalog.sqlite3")
         self.first = ingest_asset_directory(
             self.connection, exports, build_key="team-perk-test", exporter_version="test"
@@ -443,6 +559,30 @@ class TeamPerkInteractionTests(unittest.TestCase):
         self.assertEqual(1.0, coverage["coverage"]["semantic_grants_resolved"])
         self.assertEqual(1.0, coverage["coverage"]["damage_stat_rows_resolved"])
         self.assertEqual(0, coverage["counts"]["deduplicated_missing_dependencies"])
+
+    def test_selectable_gadget_identity_levels_and_shared_semantics(self) -> None:
+        report = gadget_report(self.connection, "Test Deployable")
+
+        self.assertEqual("SkillTree_TestDeployable", report["identity"]["gadget_key"])
+        self.assertEqual(2, len(report["levels"]))
+        self.assertEqual(40, report["levels"][1]["minimum_commander_level"])
+        self.assertEqual(
+            ["GE_GadgetUpgrade_TestDeployable_T1"],
+            report["levels"][1]["gameplay_effect_rows"],
+        )
+        mechanic_types = {item["mechanic_type"] for item in report["semantics"]["mechanics"]}
+        self.assertTrue({"cooldown", "activation_condition", "parameter", "spawned_entity"} <= mechanic_types)
+        self.assertEqual("partial", report["semantics"]["status"])
+        self.assertTrue(report["identity"]["source"]["content_sha256"])
+
+        coverage = gadget_coverage(self.connection)
+        self.assertEqual(1, coverage["counts"]["gadget_identities"])
+        self.assertEqual(2, coverage["counts"]["levels"])
+        self.assertEqual(1.0, coverage["ratios"]["structural_coverage"])
+        names = [row[0] for row in self.connection.execute(
+            "SELECT display_name FROM catalog_gadgets ORDER BY display_name"
+        )]
+        self.assertEqual(["Test Deployable"], names)
 
 
 if __name__ == "__main__":

@@ -468,6 +468,338 @@ def team_perk_coverage(connection, snapshot_id: int | None = None) -> dict[str, 
     }
 
 
+def _ability_kit_interaction_semantics(
+    connection,
+    snapshot_id: int,
+    ability_kit_id: int,
+    root_object_ids: set[int],
+    graph_index: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Report shared AbilityKit/Ability/Effect semantics for any interaction owner."""
+    kit = connection.execute(
+        "SELECT source_object_id FROM catalog_ability_kits WHERE id=?",
+        (ability_kit_id,),
+    ).fetchone()
+    roots = set(root_object_ids)
+    if kit:
+        roots.add(kit["source_object_id"])
+    closure, dependencies = _semantic_closure(
+        connection, snapshot_id, roots, graph_index
+    )
+    grants = [
+        dict(row)
+        for row in connection.execute(
+            """
+            SELECT grant_kind, grant_operation, target_path, grant_level,
+                   ability_id, gameplay_effect_id,
+                   CASE WHEN ability_id IS NOT NULL OR gameplay_effect_id IS NOT NULL
+                        THEN 1 ELSE 0 END AS resolved
+            FROM catalog_ability_kit_grants
+            WHERE ability_kit_id=? ORDER BY id
+            """,
+            (ability_kit_id,),
+        )
+    ]
+    mechanics: list[dict[str, Any]] = []
+    modifiers: list[dict[str, Any]] = []
+    effects: list[dict[str, Any]] = []
+    tags: list[dict[str, Any]] = []
+    opaque: list[dict[str, Any]] = []
+    if closure:
+        placeholders = ",".join("?" for _ in closure)
+        params = sorted(closure)
+        mechanics = [
+            {
+                **dict(row),
+                "conditions": _json(row["conditions_json"], {}),
+                "value": _json(row["value_json"], {}),
+                "source": _source(connection, row["source_object_id"]),
+            }
+            for row in connection.execute(
+                f"""
+                SELECT mechanic.source_object_id, object.package_path,
+                       object.object_name, object.object_type,
+                       mechanic.owner_domain, mechanic.mechanic_type,
+                       mechanic.property_path, mechanic.conditions_json,
+                       mechanic.value_json, mechanic.interpretation_status,
+                       magnitude.calculation_type AS magnitude_calculation_type,
+                       magnitude.literal_value AS magnitude_literal_value,
+                       magnitude.coefficient AS magnitude_coefficient,
+                       magnitude.pre_additive AS magnitude_pre_additive,
+                       magnitude.post_additive AS magnitude_post_additive,
+                       magnitude.curve_table_path AS magnitude_curve_table_path,
+                       magnitude.curve_row_name AS magnitude_curve_row_name,
+                       magnitude.custom_calculation_path AS magnitude_custom_calculation_path,
+                       magnitude.set_by_caller_tag AS magnitude_set_by_caller_tag,
+                       magnitude.interpretation_status AS magnitude_status
+                FROM catalog_mechanics mechanic
+                JOIN asset_objects object ON object.id=mechanic.source_object_id
+                LEFT JOIN catalog_magnitudes magnitude ON magnitude.id=mechanic.magnitude_id
+                WHERE mechanic.source_object_id IN ({placeholders})
+                ORDER BY object.package_path, mechanic.property_path
+                """,
+                params,
+            )
+        ]
+        modifiers = [
+            {
+                **dict(row),
+                "source": _source(connection, row["source_object_id"]),
+            }
+            for row in connection.execute(
+                f"""
+                SELECT effect.source_object_id, effect.effect_name,
+                       modifier.attribute_name, modifier.modifier_operation,
+                       modifier.evaluation_channel,
+                       modifier.source_required_tags_json,
+                       modifier.source_ignored_tags_json,
+                       modifier.target_required_tags_json,
+                       modifier.target_ignored_tags_json,
+                       modifier.interpretation_status,
+                       magnitude.calculation_type, magnitude.literal_value,
+                       magnitude.coefficient, magnitude.pre_additive,
+                       magnitude.post_additive, magnitude.curve_table_path,
+                       magnitude.curve_row_name, magnitude.custom_calculation_path,
+                       magnitude.set_by_caller_tag,
+                       magnitude.interpretation_status AS magnitude_status
+                FROM catalog_effect_modifiers modifier
+                JOIN catalog_gameplay_effects effect ON effect.id=modifier.gameplay_effect_id
+                LEFT JOIN catalog_magnitudes magnitude ON magnitude.id=modifier.magnitude_id
+                WHERE effect.source_object_id IN ({placeholders})
+                ORDER BY effect.effect_name, modifier.modifier_ordinal
+                """,
+                params,
+            )
+        ]
+        effects = [
+            {
+                **dict(row),
+                "source": _source(connection, row["source_object_id"]),
+            }
+            for row in connection.execute(
+                f"""
+                SELECT source_object_id, effect_name, package_path, template_path,
+                       stacking_type, stack_limit
+                FROM catalog_gameplay_effects
+                WHERE source_object_id IN ({placeholders})
+                ORDER BY package_path, effect_name
+                """,
+                params,
+            )
+        ]
+        tags = [
+            dict(row)
+            for row in connection.execute(
+                f"""
+                SELECT occurrence.source_object_id, tag.tag_name,
+                       occurrence.property_path, occurrence.semantic_role
+                FROM catalog_gameplay_tag_occurrences occurrence
+                JOIN catalog_gameplay_tags tag ON tag.id=occurrence.tag_id
+                WHERE occurrence.source_object_id IN ({placeholders})
+                ORDER BY tag.tag_name, occurrence.property_path
+                """,
+                params,
+            )
+        ]
+        opaque = [
+            {
+                **dict(row),
+                "source": _source(connection, row["source_object_id"]),
+            }
+            for row in connection.execute(
+                f"""
+                SELECT source_object_id, property_path, mechanic_kind,
+                       referenced_path, reason
+                FROM catalog_opaque_mechanics
+                WHERE source_object_id IN ({placeholders})
+                ORDER BY source_object_id, property_path
+                """,
+                params,
+            )
+        ]
+    supported_facts = sum(
+        item["interpretation_status"] == "supported"
+        and item["magnitude_status"] in (None, "supported")
+        for item in mechanics + modifiers
+    )
+    incomplete = bool(dependencies or opaque) or any(
+        item["interpretation_status"] != "supported"
+        or item["magnitude_status"] not in (None, "supported")
+        for item in mechanics + modifiers
+    ) or any(not item["resolved"] for item in grants)
+    status = "partial" if supported_facts and incomplete else (
+        "supported" if supported_facts else "opaque"
+    )
+    return {
+        "status": status,
+        "grants": grants,
+        "gameplay_effects": effects,
+        "mechanics": mechanics,
+        "modifiers": modifiers,
+        "gameplay_tags": tags,
+        "opaque_boundaries": opaque,
+        "transitive_asset_objects": len(closure),
+        "unresolved_dependencies": dependencies,
+    }
+
+
+def _gadget_row(connection, snapshot_id: int, name: str):
+    rows = connection.execute(
+        """
+        SELECT * FROM catalog_gadgets
+        WHERE snapshot_id=? AND
+          (lower(gadget_key)=lower(?) OR lower(display_name)=lower(?))
+        ORDER BY id
+        """,
+        (snapshot_id, name, name),
+    ).fetchall()
+    if len(rows) != 1:
+        matches = [row["gadget_key"] for row in rows]
+        suffix = f"; matching keys: {matches}" if matches else ""
+        raise ValueError(f"gadget must resolve exactly once: {name!r}{suffix}")
+    return rows[0]
+
+
+def gadget_report(
+    connection,
+    name: str,
+    snapshot_id: int | None = None,
+    *,
+    graph_index: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    snapshot_id = snapshot_id or latest_asset_snapshot_id(connection)
+    if snapshot_id is None:
+        raise ValueError("no ready asset snapshot")
+    gadget = _gadget_row(connection, snapshot_id, name)
+    levels = []
+    for row in connection.execute(
+        "SELECT * FROM catalog_gadget_levels WHERE gadget_id=? ORDER BY level_ordinal",
+        (gadget["id"],),
+    ):
+        item = dict(row)
+        item["gameplay_effect_rows"] = _json(item.pop("gameplay_effect_rows_json"), [])
+        item["cost"] = _json(item.pop("cost_json"), [])
+        item["unlock_facts"] = _json(item.pop("unlock_facts_json"), {})
+        levels.append(item)
+    semantics = _ability_kit_interaction_semantics(
+        connection,
+        snapshot_id,
+        gadget["ability_kit_id"],
+        {gadget["source_object_id"]},
+        graph_index,
+    )
+    unresolved_upgrade_rows = sorted(
+        {value for level in levels for value in level["gameplay_effect_rows"]}
+    )
+    if unresolved_upgrade_rows and semantics["status"] == "supported":
+        semantics["status"] = "partial"
+    return {
+        "snapshot_id": snapshot_id,
+        "identity": {
+            "gadget_key": gadget["gadget_key"],
+            "display_name": gadget["display_name"],
+            "package_path": gadget["package_path"],
+            "source": _source(connection, gadget["source_object_id"]),
+        },
+        "levels": levels,
+        "semantics": {
+            **semantics,
+            "normalized_direct_status": gadget["semantic_status"],
+            "unresolved_upgrade_effect_rows": unresolved_upgrade_rows,
+        },
+        "unresolved_dependencies": semantics["unresolved_dependencies"],
+    }
+
+
+def gadget_coverage(connection, snapshot_id: int | None = None) -> dict[str, Any]:
+    started = time.perf_counter()
+    snapshot_id = snapshot_id or latest_asset_snapshot_id(connection)
+    if snapshot_id is None:
+        return {"snapshot_id": None, "counts": {}, "gadgets": []}
+    graph_index = _semantic_graph_index(connection, snapshot_id)
+    keys = [
+        row[0]
+        for row in connection.execute(
+            "SELECT gadget_key FROM catalog_gadgets WHERE snapshot_id=? ORDER BY display_name",
+            (snapshot_id,),
+        )
+    ]
+    reports = [
+        gadget_report(connection, key, snapshot_id, graph_index=graph_index)
+        for key in keys
+    ]
+    status_counts = {status: 0 for status in ("supported", "partial", "opaque")}
+    fact_counts = {status: 0 for status in ("supported", "partial", "opaque")}
+    mechanic_types: dict[str, int] = {}
+    missing: dict[str, dict[str, Any]] = {}
+    level_total = level_supported = 0
+    opaque_boundaries = unresolved_upgrade_rows = 0
+    for report in reports:
+        status_counts[report["semantics"]["status"]] += 1
+        for level in report["levels"]:
+            level_total += 1
+            level_supported += int(level["interpretation_status"] == "supported")
+            unresolved_upgrade_rows += len(level["gameplay_effect_rows"])
+        opaque_boundaries += len(report["semantics"]["opaque_boundaries"])
+        for item in report["semantics"]["mechanics"] + report["semantics"]["modifiers"]:
+            status = item["interpretation_status"]
+            if item["magnitude_status"] in ("partial", "opaque"):
+                status = item["magnitude_status"]
+            fact_counts[status] += 1
+            mechanic = item.get("mechanic_type") or "effect_modifier"
+            mechanic_types[mechanic] = mechanic_types.get(mechanic, 0) + 1
+        for dependency in report["unresolved_dependencies"]:
+            current = missing.get(dependency["package_path"])
+            if current is None or dependency["priority"] < current["priority"]:
+                missing[dependency["package_path"]] = dependency
+    total = len(reports)
+    complete = status_counts["supported"]
+    known = complete + status_counts["partial"]
+    fact_total = sum(fact_counts.values())
+    return {
+        "snapshot_id": snapshot_id,
+        "counts": {
+            "gadget_identities": total,
+            "levels": level_total,
+            "supported_levels": level_supported,
+            "supported_gadgets": complete,
+            "partial_gadgets": status_counts["partial"],
+            "opaque_gadgets": status_counts["opaque"],
+            "supported_facts": fact_counts["supported"],
+            "partial_facts": fact_counts["partial"],
+            "opaque_facts": fact_counts["opaque"],
+            "opaque_boundaries": opaque_boundaries,
+            "unresolved_upgrade_effect_rows": unresolved_upgrade_rows,
+            "unresolved_dependencies": len(missing),
+        },
+        "ratios": {
+            "structural_coverage": known / total if total else None,
+            "semantic_coverage": complete / total if total else None,
+            "semantic_known_or_partial": known / total if total else None,
+            "supported_interaction_fact_coverage": (
+                fact_counts["supported"] / fact_total if fact_total else None
+            ),
+            "level_interpretation_coverage": level_supported / level_total if level_total else None,
+        },
+        "mechanic_types": dict(sorted(mechanic_types.items())),
+        "gadgets": [
+            {
+                "gadget_key": report["identity"]["gadget_key"],
+                "display_name": report["identity"]["display_name"],
+                "semantic_status": report["semantics"]["status"],
+                "level_count": len(report["levels"]),
+                "unresolved_dependency_count": len(report["unresolved_dependencies"]),
+                "opaque_boundary_count": len(report["semantics"]["opaque_boundaries"]),
+            }
+            for report in reports
+        ],
+        "unresolved_dependencies": sorted(
+            missing.values(), key=lambda item: (item["priority"], item["package_path"])
+        ),
+        "elapsed_ms": (time.perf_counter() - started) * 1000.0,
+    }
+
+
 def _active_ability_row(connection, snapshot_id: int, name: str):
     rows = connection.execute(
         """
@@ -960,6 +1292,11 @@ def _parser() -> argparse.ArgumentParser:
     ability = commands.add_parser("ability", help="show one active ability's interaction graph")
     ability.add_argument("name")
     ability.add_argument("--snapshot-id", type=int)
+    gadgets = commands.add_parser("gadgets", help="report selectable gadget coverage")
+    gadgets.add_argument("--snapshot-id", type=int)
+    gadget = commands.add_parser("gadget", help="show one gadget's interaction graph")
+    gadget.add_argument("name")
+    gadget.add_argument("--snapshot-id", type=int)
     return parser
 
 
@@ -973,8 +1310,12 @@ def main(argv: Iterable[str] | None = None) -> int:
             payload = team_perk_report(connection, args.name, args.snapshot_id)
         elif args.command == "abilities":
             payload = active_ability_coverage(connection, args.snapshot_id)
-        else:
+        elif args.command == "ability":
             payload = active_ability_report(connection, args.name, args.snapshot_id)
+        elif args.command == "gadgets":
+            payload = gadget_coverage(connection, args.snapshot_id)
+        else:
+            payload = gadget_report(connection, args.name, args.snapshot_id)
     finally:
         connection.close()
     print(json.dumps(payload, indent=2, sort_keys=True))

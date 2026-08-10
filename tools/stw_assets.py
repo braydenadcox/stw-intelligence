@@ -18,7 +18,7 @@ from stw_pipeline import connect
 
 
 PERK_KIT_RE = re.compile(r"^Kit_Perk_H_(?P<family>.+)_(?P<tier>T\d+)$")
-NORMALIZER_VERSION = "interaction-v4"
+NORMALIZER_VERSION = "interaction-v5"
 ROSTER_PLAN_VERSION = "phase2-roster-v1"
 
 RUNTIME_DATA_ROW_STRUCTS = {
@@ -438,6 +438,8 @@ def _clear_normalized_snapshot(
         "(SELECT id FROM catalog_team_perks WHERE snapshot_id=?)",
         "DELETE FROM catalog_active_ability_grants WHERE active_ability_id IN "
         "(SELECT id FROM catalog_active_abilities WHERE snapshot_id=?)",
+        "DELETE FROM catalog_gadget_levels WHERE gadget_id IN "
+        "(SELECT id FROM catalog_gadgets WHERE snapshot_id=?)",
     )
     for statement in leaf_deletes:
         connection.execute(statement, (snapshot_id,))
@@ -454,6 +456,7 @@ def _clear_normalized_snapshot(
         "catalog_gameplay_tags",
         "catalog_team_perks",
         "catalog_active_abilities",
+        "catalog_gadgets",
         "catalog_heroes",
         "catalog_perks",
         "catalog_ability_kits",
@@ -572,6 +575,7 @@ def _normalize_snapshot(
         ("hero class kits", _normalize_hero_class_kits, (connection, snapshot_id)),
         ("heroes", _normalize_heroes, (connection, snapshot_id, payloads)),
         ("active abilities", _normalize_active_abilities, (connection, snapshot_id)),
+        ("gadgets", _normalize_gadgets, (connection, snapshot_id, payloads)),
         ("weapons", _normalize_weapon_catalog, (connection, snapshot_id, payloads)),
         ("gameplay tags", _normalize_gameplay_tags, (connection, snapshot_id, payloads)),
         ("modifier curves", _link_modifier_curves, (connection, snapshot_id)),
@@ -2082,11 +2086,16 @@ def _normalize_ability_mechanics(
             recognized = True
             target_package = canonical_package_path(direct_path)
             target_name = (target_package or "").rsplit("/", 1)[-1]
-            mechanic_type = (
-                "referenced_effect"
-                if target_name.startswith(("GE_", "GET_"))
-                else "referenced_asset"
-            )
+            if target_name.startswith(("GE_", "GET_")):
+                mechanic_type = "referenced_effect"
+            elif re.search(
+                r"(actor|pawn|projectile|building|deploy|spawn|placement)",
+                key,
+                flags=re.IGNORECASE,
+            ):
+                mechanic_type = "spawned_entity"
+            else:
+                mechanic_type = "referenced_asset"
             _insert_mechanic(
                 connection,
                 snapshot_id,
@@ -2442,6 +2451,140 @@ def _normalize_active_abilities(
                 grant["source_reference_id"],
             ),
         )
+
+
+def _normalize_gadgets(
+    connection: sqlite3.Connection,
+    snapshot_id: int,
+    payloads: dict[int, dict[str, Any]],
+) -> None:
+    """Catalog selectable gadgets from structural Homebase unlock grants.
+
+    A FortHomebaseNodeItemDefinition is the selectability boundary. Nearby
+    AbilityKits in the gadget archive family are intentionally not identities
+    unless a node level grants them.
+    """
+    for object_id, export in payloads.items():
+        if export.get("Type") != "FortHomebaseNodeItemDefinition":
+            continue
+        properties = export.get("Properties") or {}
+        levels = properties.get("LevelData") or []
+        if not isinstance(levels, list):
+            continue
+        granted: list[tuple[int, dict[str, Any], str, int]] = []
+        inherited_kit_path: str | None = None
+        inherited_kit_id: int | None = None
+        for ordinal, level in enumerate(levels):
+            if not isinstance(level, dict):
+                continue
+            path = _object_path(level.get("AbilityKit"))
+            if path:
+                inherited_kit_path = path
+                inherited_kit_id = _kit_id_for_path(connection, snapshot_id, path)
+            if inherited_kit_path and inherited_kit_id is not None:
+                granted.append(
+                    (ordinal, level, inherited_kit_path, inherited_kit_id)
+                )
+        if not granted:
+            continue
+        kit_ids = {item[3] for item in granted}
+        if len(kit_ids) != 1:
+            # Multiple independently selectable kits in one node require a
+            # structural discriminator that this catalog does not yet possess.
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO catalog_opaque_mechanics(
+                    snapshot_id, source_object_id, property_path,
+                    mechanic_kind, reason
+                ) VALUES (?, ?, '$.Properties.LevelData',
+                          'gadget_identity', ?)
+                """,
+                (
+                    snapshot_id,
+                    object_id,
+                    "Homebase node grants multiple AbilityKits; identity split is opaque",
+                ),
+            )
+            continue
+        kit_id = next(iter(kit_ids))
+        kit = connection.execute(
+            "SELECT * FROM catalog_ability_kits WHERE id=?", (kit_id,)
+        ).fetchone()
+        object_row = connection.execute(
+            "SELECT package_path FROM asset_objects WHERE id=?", (object_id,)
+        ).fetchone()
+        display = (
+            _localized_text(properties.get("ItemName"))
+            or kit["display_name"]
+            or kit["kit_name"]
+        )
+        has_unresolved_upgrades = any(
+            bool(level.get("GameplayEffectRowNames"))
+            for _, level, _, _ in granted
+        )
+        direct_status = _team_perk_semantic_status(connection, kit_id)
+        status = "partial" if has_unresolved_upgrades else direct_status
+        gadget_id = connection.execute(
+            """
+            INSERT INTO catalog_gadgets(
+                snapshot_id, source_object_id, ability_kit_id, gadget_key,
+                display_name, package_path, semantic_status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                snapshot_id,
+                object_id,
+                kit_id,
+                export.get("Name", object_row["package_path"].rsplit("/", 1)[-1]),
+                display,
+                object_row["package_path"],
+                status,
+            ),
+        ).lastrowid
+        for ordinal, level, kit_path, resolved_kit_id in granted:
+            effect_rows = [
+                str(value)
+                for value in (level.get("GameplayEffectRowNames") or [])
+                if isinstance(value, str) and value
+            ]
+            known_fields = {
+                "DisplayDataId",
+                "MinCommanderLevel",
+                "Cost",
+                "GameplayEffectRowNames",
+                "AbilityKit",
+                "UnlockedSquadSlots",
+            }
+            extra = {key: value for key, value in level.items() if key not in known_fields}
+            level_status = "partial" if effect_rows or extra else "supported"
+            connection.execute(
+                """
+                INSERT INTO catalog_gadget_levels(
+                    gadget_id, level_ordinal, display_data_id,
+                    minimum_commander_level, ability_kit_path, ability_kit_id,
+                    gameplay_effect_rows_json, cost_json, unlock_facts_json,
+                    interpretation_status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    gadget_id,
+                    ordinal,
+                    level.get("DisplayDataId"),
+                    _integer_value(level.get("MinCommanderLevel")),
+                    kit_path,
+                    resolved_kit_id,
+                    json.dumps(effect_rows, separators=(",", ":")),
+                    json.dumps(level.get("Cost") or [], separators=(",", ":")),
+                    json.dumps(
+                        {
+                            "unlocked_squad_slots": level.get("UnlockedSquadSlots") or [],
+                            "additional_fields": extra,
+                        },
+                        separators=(",", ":"),
+                    ),
+                    level_status,
+                ),
+            )
 
 
 def _localized_text(value: Any) -> str | None:
@@ -5222,6 +5365,12 @@ def catalog_coverage(
         "active_ability_identities": """
             SELECT COUNT(*) FROM catalog_active_abilities WHERE snapshot_id=?
         """,
+        "gadget_identities": "SELECT COUNT(*) FROM catalog_gadgets WHERE snapshot_id=?",
+        "gadget_levels": """
+            SELECT COUNT(*) FROM catalog_gadget_levels level
+            JOIN catalog_gadgets gadget ON gadget.id=level.gadget_id
+            WHERE gadget.snapshot_id=?
+        """,
         "hero_loadout_ability_identities": """
             SELECT COUNT(DISTINCT active.id)
             FROM catalog_active_abilities active
@@ -5466,6 +5615,7 @@ def _snapshot_summary(
             "catalog_gameplay_tags",
             "catalog_team_perks",
             "catalog_active_abilities",
+            "catalog_gadgets",
             "catalog_magnitudes",
             "catalog_mechanics",
             "catalog_opaque_mechanics",

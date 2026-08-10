@@ -1043,6 +1043,43 @@ MIGRATIONS = [
         ON catalog_team_perks(ability_kit_id);
     CREATE INDEX catalog_team_perk_rules_perk_idx
         ON catalog_team_perk_eligibility_rules(team_perk_id);
+    """,
+    """
+    CREATE TABLE catalog_active_abilities (
+        id INTEGER PRIMARY KEY,
+        snapshot_id INTEGER NOT NULL REFERENCES asset_snapshots(id) ON DELETE CASCADE,
+        source_object_id INTEGER NOT NULL UNIQUE REFERENCES asset_objects(id),
+        ability_kit_id INTEGER NOT NULL UNIQUE REFERENCES catalog_ability_kits(id),
+        active_ability_key TEXT NOT NULL,
+        display_name TEXT NOT NULL,
+        package_path TEXT NOT NULL,
+        semantic_status TEXT NOT NULL
+            CHECK (semantic_status IN ('supported', 'partial', 'opaque')),
+        UNIQUE (snapshot_id, active_ability_key)
+    );
+    CREATE TABLE catalog_active_ability_grants (
+        id INTEGER PRIMARY KEY,
+        active_ability_id INTEGER NOT NULL
+            REFERENCES catalog_active_abilities(id) ON DELETE CASCADE,
+        grant_domain TEXT NOT NULL
+            CHECK (grant_domain IN ('hero_loadout', 'hero_class')),
+        grantee_key TEXT NOT NULL,
+        hero_id INTEGER REFERENCES catalog_heroes(id) ON DELETE CASCADE,
+        hero_class_id INTEGER REFERENCES catalog_hero_classes(id) ON DELETE CASCADE,
+        grant_ordinal INTEGER NOT NULL,
+        minimum_rarity TEXT,
+        source_reference_id INTEGER REFERENCES asset_references(id),
+        UNIQUE (active_ability_id, grant_domain, grantee_key, grant_ordinal),
+        CHECK (
+            (grant_domain='hero_loadout' AND hero_id IS NOT NULL AND hero_class_id IS NULL)
+            OR
+            (grant_domain='hero_class' AND hero_id IS NULL AND hero_class_id IS NOT NULL)
+        )
+    );
+    CREATE INDEX catalog_active_abilities_snapshot_idx
+        ON catalog_active_abilities(snapshot_id, display_name);
+    CREATE INDEX catalog_active_ability_grants_ability_idx
+        ON catalog_active_ability_grants(active_ability_id, grant_domain);
     """
 ]
 

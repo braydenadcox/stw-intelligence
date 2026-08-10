@@ -188,6 +188,22 @@ set-by-caller values, conditions, executions, and explicit Blueprint opacity are
 partial or opaque team perks are never treated as zero-value mechanics. See
 [team-perk interaction semantics](docs/team-perk-interaction-semantics.md) for details.
 
+Hero active abilities and structurally granted class kits use that same interaction graph:
+
+```powershell
+python tools/stw_interactions.py --db data/phase2-real-validation.sqlite3 abilities
+python tools/stw_interactions.py --db data/phase2-real-validation.sqlite3 ability "Frag Grenade"
+python tools/stw_interactions.py --db data/phase2-real-validation.sqlite3 ability "B.A.S.E."
+```
+
+The report connects HGD/ClassAbilityKit grants to AbilityKits, gadgets,
+GameplayAbilities, GameplayEffects, costs, cooldowns, stat rows, targeting containers,
+tags, executions, coefficients, and explicit Blueprint/native boundaries. The controlled
+initial acquisition scope is
+[`asset-acquisition-active-abilities.json`](fixtures/asset-acquisition-active-abilities.json);
+subsequent dependencies come only from exact structural references. See
+[hero active-ability semantics](docs/hero-active-ability-semantics.md).
+
 ## Live local application
 
 On Windows, the default command watches Fortnite's standard log location, loads the

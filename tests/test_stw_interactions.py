@@ -9,11 +9,17 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 from stw_assets import ingest_asset_directory  # noqa: E402
-from stw_interactions import team_perk_coverage, team_perk_report  # noqa: E402
+from stw_interactions import (  # noqa: E402
+    active_ability_coverage,
+    active_ability_report,
+    team_perk_coverage,
+    team_perk_report,
+)
 from stw_pipeline import connect  # noqa: E402
 
 
 ROOT = "/SaveTheWorld/Abilities/Player/Perks/Leader/TestInteraction"
+ACTIVE_ROOT = "/SaveTheWorld/Abilities/Player/Commando/Actives/TestBlast"
 
 
 def _ref(package: str, name: str) -> dict[str, str]:
@@ -163,12 +169,176 @@ def write_team_perk_slice(root: Path) -> None:
         )
 
 
+def write_active_ability_slice(root: Path) -> None:
+    hgd = "/SaveTheWorld/Heroes/Test/HGD_TestHero"
+    hcgd = "/SaveTheWorld/Heroes/Classes/HCGD_TestCommando"
+    kit = f"{ACTIVE_ROOT}/Kit_Commando_TestBlast"
+    gadget = f"{ACTIVE_ROOT}/G_Commando_TestBlast"
+    ability = f"{ACTIVE_ROOT}/GA_Commando_TestBlast"
+    cooldown = f"{ACTIVE_ROOT}/GE_Commando_TestBlastCooldown"
+    damage = f"{ACTIVE_ROOT}/GE_Commando_TestBlastDamage"
+    stats = "/Game/Balance/DataTables/GadgetScaling"
+    _write(
+        root,
+        "HCGD_TestCommando",
+        [{
+            "Type": "FortHeroClassGameplayDefinition",
+            "Name": "HCGD_TestCommando",
+            "Package": hcgd,
+            "Properties": {
+                "DisplayName": {"LocalizedString": "Test Commando"},
+                "ClassAbilityKits": [_ref(kit, "Kit_Commando_TestBlast")],
+            },
+        }],
+    )
+    _write(
+        root,
+        "HGD_TestHero",
+        [{
+            "Type": "FortHeroGameplayDefinition",
+            "Name": "HGD_TestHero",
+            "Package": hgd,
+            "Properties": {
+                "HeroClassGameplayDefinition": _ref(hcgd, "HCGD_TestCommando"),
+                "TierAbilityKits": [{
+                    "GrantedAbilityKit": _ref(kit, "Kit_Commando_TestBlast"),
+                    "MinimumHeroRarity": "EFortRarity::Rare",
+                }],
+            },
+        }],
+    )
+    _write(
+        root,
+        "Kit_Commando_TestBlast",
+        [{
+            "Type": "FortAbilityKit",
+            "Name": "Kit_Commando_TestBlast",
+            "Package": kit,
+            "Properties": {
+                "DisplayName": {"LocalizedString": "Test Blast"},
+                "Gadgets": [_ref(gadget, "G_Commando_TestBlast")],
+                "GrantedGameplayEffects": [
+                    {"GameplayEffect": _ref(damage, "GE_Commando_TestBlastDamage_C")}
+                ],
+            },
+        }],
+    )
+    _write(
+        root,
+        "G_Commando_TestBlast",
+        [{
+            "Type": "FortGadgetItemDefinition",
+            "Name": "G_Commando_TestBlast",
+            "Package": gadget,
+            "Properties": {
+                "ItemName": {"LocalizedString": "Test Blast"},
+                "GameplayAbility": _ref(ability, "GA_Commando_TestBlast_C"),
+                "DamageStatHandle": {
+                    "DataTable": _ref(stats, "GadgetScaling"),
+                    "RowName": "Commando_TestBlast",
+                },
+            },
+        }],
+    )
+    _write(
+        root,
+        "GA_Commando_TestBlast",
+        [{
+            "Type": "GA_Commando_TestBlast_C",
+            "Name": "Default__GA_Commando_TestBlast_C",
+            "Package": ability,
+            "Class": "BlueprintGeneratedClass",
+            "Properties": {
+                "AbilityDuration": 5.0,
+                "AbilityTags": ["Ability.Commando.TestBlast"],
+                "ActivationBlockedTags": ["Granted.Status.AbilityBlock"],
+                "CooldownGameplayEffectClass": _ref(
+                    cooldown, "GE_Commando_TestBlastCooldown_C"
+                ),
+                "Costs": [{
+                    "CostValue": {
+                        "Value": 20.0,
+                        "Curve": {"CurveTable": None, "RowName": "None"},
+                    }
+                }],
+                "DamageStatHandle": {
+                    "DataTable": _ref(stats, "GadgetScaling"),
+                    "RowName": "Commando_TestBlast",
+                },
+                "EffectContainers": {
+                    "ApplicationTag": {"TagName": "Ability.TestBlast.Damage"},
+                    "TargetGameplayEffectClasses": [
+                        _ref(damage, "GE_Commando_TestBlastDamage_C")
+                    ],
+                },
+                "ExplosionRadiusDefault": 512.0,
+            },
+        }],
+    )
+    _write(
+        root,
+        "GE_Commando_TestBlastCooldown",
+        [{
+            "Type": "GE_Commando_TestBlastCooldown_C",
+            "Name": "Default__GE_Commando_TestBlastCooldown_C",
+            "Package": cooldown,
+            "Properties": {
+                "DurationPolicy": "EGameplayEffectDurationType::HasDuration",
+                "DurationMagnitude": {
+                    "Value": 12.0,
+                    "Curve": {"CurveTable": None, "RowName": "None"},
+                },
+            },
+        }],
+    )
+    _write(
+        root,
+        "GE_Commando_TestBlastDamage",
+        [{
+            "Type": "GE_Commando_TestBlastDamage_C",
+            "Name": "Default__GE_Commando_TestBlastDamage_C",
+            "Package": damage,
+            "Properties": {
+                "Modifiers": [{
+                    "Attribute": {"AttributeName": "Health"},
+                    "ModifierOp": "EGameplayModOp::Additive",
+                    "ModifierMagnitude": {
+                        "MagnitudeCalculationType": "EGameplayEffectMagnitudeCalculation::ScalableFloat",
+                        "ScalableFloatMagnitude": {
+                            "Value": -2.5,
+                            "Curve": {"CurveTable": None, "RowName": "None"},
+                        },
+                    },
+                }]
+            },
+        }],
+    )
+    _write(
+        root,
+        "GadgetScaling",
+        [{
+            "Type": "DataTable",
+            "Name": "GadgetScaling",
+            "Package": stats,
+            "Properties": {"RowStruct": {"ObjectPath": "/Script/FortniteGame.FortBaseWeaponStats"}},
+            "Rows": {
+                "Commando_TestBlast": {
+                    "DmgPB": 42.0,
+                    "DmgScale": 1.5,
+                    "EnvDmgPB": 7.0,
+                }
+            },
+        }],
+    )
+
+
 class TeamPerkInteractionTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         root = Path(self.temporary.name)
         exports = root / "exports"
         write_team_perk_slice(exports)
+        write_active_ability_slice(exports)
         self.connection = connect(root / "catalog.sqlite3")
         self.first = ingest_asset_directory(
             self.connection, exports, build_key="team-perk-test", exporter_version="test"
@@ -222,6 +392,57 @@ class TeamPerkInteractionTests(unittest.TestCase):
         self.assertEqual(1, coverage["counts"]["team_perks"])
         self.assertEqual(1.0, coverage["coverage"]["identity"])
         self.assertEqual(1.0, coverage["coverage"]["eligibility_supported"])
+
+    def test_active_ability_catalog_preserves_grants_runtime_facts_and_opacity(self) -> None:
+        report = active_ability_report(self.connection, "Test Blast")
+
+        self.assertEqual("Kit_Commando_TestBlast", report["identity"]["active_ability_key"])
+        self.assertEqual(
+            {"hero_loadout", "hero_class"},
+            {grant["domain"] for grant in report["grantees"]},
+        )
+        hero = next(g for g in report["grantees"] if g["domain"] == "hero_loadout")
+        self.assertEqual("EFortRarity::Rare", hero["minimum_rarity"])
+        self.assertEqual("resolved", hero["evidence"]["resolution_status"])
+        self.assertTrue(all(grant["resolved"] for grant in report["semantics"]["grants"]))
+        self.assertEqual(
+            "Default__GA_Commando_TestBlast_C",
+            report["semantics"]["gameplay_ability_links"][0]["target_key"],
+        )
+        mechanic_types = {m["mechanic_type"] for m in report["semantics"]["mechanics"]}
+        self.assertTrue(
+            {"cooldown_effect", "cost", "duration", "damage_stat_row", "effect_container", "parameter"}
+            <= mechanic_types
+        )
+        stat = next(
+            m for m in report["semantics"]["mechanics"]
+            if m["mechanic_type"] == "damage_stat_row" and m.get("resolved_data_row")
+        )
+        self.assertEqual("resolved", stat["resolved_data_row"]["status"])
+        self.assertEqual(42.0, stat["resolved_data_row"]["row"]["DmgPB"])
+        self.assertIn(
+            "Ability.Commando.TestBlast",
+            {tag["tag_name"] for tag in report["semantics"]["gameplay_tags"]},
+        )
+        self.assertIn(
+            "blueprint_execution",
+            {boundary["mechanic_kind"] for boundary in report["semantics"]["opaque_boundaries"]},
+        )
+        self.assertEqual("partial", report["semantics"]["status"])
+        self.assertTrue(report["identity"]["source"]["content_sha256"])
+
+    def test_active_ability_coverage_is_idempotent_and_auditable(self) -> None:
+        coverage = active_ability_coverage(self.connection)
+
+        self.assertEqual(1, coverage["counts"]["active_ability_identities"])
+        self.assertEqual(1, coverage["counts"]["hero_loadout_ability_identities"])
+        self.assertEqual(1, coverage["counts"]["class_granted_kit_identities"])
+        self.assertEqual(2, coverage["counts"]["structural_grants"])
+        self.assertEqual(1.0, coverage["coverage"]["structural_grants_resolved"])
+        self.assertEqual(1.0, coverage["coverage"]["identity"])
+        self.assertEqual(1.0, coverage["coverage"]["semantic_grants_resolved"])
+        self.assertEqual(1.0, coverage["coverage"]["damage_stat_rows_resolved"])
+        self.assertEqual(0, coverage["counts"]["deduplicated_missing_dependencies"])
 
 
 if __name__ == "__main__":

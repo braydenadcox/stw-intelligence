@@ -18,7 +18,7 @@ from stw_pipeline import connect
 
 
 PERK_KIT_RE = re.compile(r"^Kit_Perk_H_(?P<family>.+)_(?P<tier>T\d+)$")
-NORMALIZER_VERSION = "interaction-v3"
+NORMALIZER_VERSION = "interaction-v4"
 ROSTER_PLAN_VERSION = "phase2-roster-v1"
 
 RUNTIME_DATA_ROW_STRUCTS = {
@@ -436,6 +436,8 @@ def _clear_normalized_snapshot(
         "(SELECT id FROM catalog_gameplay_tags WHERE snapshot_id=?)",
         "DELETE FROM catalog_team_perk_eligibility_rules WHERE team_perk_id IN "
         "(SELECT id FROM catalog_team_perks WHERE snapshot_id=?)",
+        "DELETE FROM catalog_active_ability_grants WHERE active_ability_id IN "
+        "(SELECT id FROM catalog_active_abilities WHERE snapshot_id=?)",
     )
     for statement in leaf_deletes:
         connection.execute(statement, (snapshot_id,))
@@ -451,6 +453,7 @@ def _clear_normalized_snapshot(
         "catalog_ability_links",
         "catalog_gameplay_tags",
         "catalog_team_perks",
+        "catalog_active_abilities",
         "catalog_heroes",
         "catalog_perks",
         "catalog_ability_kits",
@@ -568,6 +571,7 @@ def _normalize_snapshot(
         ("team perks", _normalize_team_perks, (connection, snapshot_id, payloads)),
         ("hero class kits", _normalize_hero_class_kits, (connection, snapshot_id)),
         ("heroes", _normalize_heroes, (connection, snapshot_id, payloads)),
+        ("active abilities", _normalize_active_abilities, (connection, snapshot_id)),
         ("weapons", _normalize_weapon_catalog, (connection, snapshot_id, payloads)),
         ("gameplay tags", _normalize_gameplay_tags, (connection, snapshot_id, payloads)),
         ("modifier curves", _link_modifier_curves, (connection, snapshot_id)),
@@ -1966,8 +1970,9 @@ def _normalize_ability_mechanics(
         ("ActivationBlockedTags", "activation_condition", "supported"),
         ("AbilityTags", "ability_tags", "supported"),
         ("ActivationOwnedTags", "owned_tags", "supported"),
-        ("DamageStatHandle", "damage_stat_row", "partial"),
-        ("EffectContainers", "effect_container", "partial"),
+        ("BlockAbilitiesWithTag", "blocked_ability_tags", "supported"),
+        ("CancelAbilitiesWithTag", "cancelled_ability_tags", "supported"),
+        ("DamageStatHandle", "damage_stat_row", "supported"),
     ):
         if key not in properties:
             continue
@@ -1984,6 +1989,23 @@ def _normalize_ability_mechanics(
             conditions=properties[key] if "Tags" in key else None,
             value=properties[key] if "Tags" not in key else None,
             status=mechanic_status,
+        )
+
+    for key, value in properties.items():
+        if not key.startswith("EffectContainers"):
+            continue
+        recognized = True
+        recognized_keys.add(key)
+        _insert_mechanic(
+            connection,
+            snapshot_id,
+            source_object_id,
+            "ability",
+            ability_id,
+            "effect_container",
+            f"$.Properties.{key}",
+            value=value,
+            status="partial",
         )
 
     # Hero perks commonly grant a GameplayAbility whose Blueprint defaults hold
@@ -2020,6 +2042,38 @@ def _normalize_ability_mechanics(
                 magnitude_id=magnitude_id,
                 value={"name": key},
                 status="supported" if magnitude_id is not None else "partial",
+            )
+            continue
+
+        semantic_parameter = re.search(
+            r"(damage|heal|duration|period|cooldown|cost|radius|range|distance|chance|"
+            r"coefficient|multiplier|fire.?rate|life.?span|impact|stun|knockback|"
+            r"ammo|charge|shots|scale|speed)",
+            key,
+            flags=re.IGNORECASE,
+        )
+        presentation_parameter = re.search(
+            r"(camera|camshake|montage|animation|particle|feedback|tooltip|offset|"
+            r"transform|timerhandle|ubergraph|dialog|sound|cue)",
+            key,
+            flags=re.IGNORECASE,
+        )
+        if (
+            semantic_parameter
+            and not presentation_parameter
+            and isinstance(value, (int, float, bool, str))
+        ):
+            recognized = True
+            _insert_mechanic(
+                connection,
+                snapshot_id,
+                source_object_id,
+                "ability",
+                ability_id,
+                "parameter",
+                property_path,
+                value={"name": key, "literal": value},
+                status="partial",
             )
             continue
 
@@ -2264,6 +2318,129 @@ def _normalize_heroes(
         )
         connection.execute(
             "UPDATE catalog_heroes SET display_name=? WHERE id=?", (display, hero_id)
+        )
+
+
+def _normalize_active_abilities(
+    connection: sqlite3.Connection, snapshot_id: int
+) -> None:
+    """Catalog ability-kit identities proven by hero or hero-class grants.
+
+    TierAbilityKits and ClassAbilityKits are the evidence boundary.  The
+    normalizer deliberately does not decide whether a class kit is player-
+    activated or passive from its filename; reports retain the grant domain so
+    callers can distinguish selectable hero abilities from class interactions.
+    """
+    kit_ids = {
+        row["ability_kit_id"]
+        for row in connection.execute(
+            """
+            SELECT DISTINCT ha.ability_kit_id
+            FROM catalog_hero_abilities ha
+            JOIN catalog_heroes hero ON hero.id=ha.hero_id
+            WHERE hero.snapshot_id=? AND ha.ability_kit_id IS NOT NULL
+            UNION
+            SELECT DISTINCT ability_kit_id
+            FROM catalog_hero_class_kits
+            WHERE snapshot_id=? AND ability_kit_id IS NOT NULL
+            """,
+            (snapshot_id, snapshot_id),
+        )
+    }
+    identities: dict[int, int] = {}
+    for kit_id in sorted(kit_ids):
+        kit = connection.execute(
+            """
+            SELECT kit.*, object.object_name
+            FROM catalog_ability_kits kit
+            JOIN asset_objects object ON object.id=kit.source_object_id
+            WHERE kit.id=?
+            """,
+            (kit_id,),
+        ).fetchone()
+        display_name = kit["display_name"] or kit["kit_name"]
+        active_id = connection.execute(
+            """
+            INSERT INTO catalog_active_abilities(
+                snapshot_id, source_object_id, ability_kit_id,
+                active_ability_key, display_name, package_path, semantic_status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                snapshot_id,
+                kit["source_object_id"],
+                kit_id,
+                kit["kit_name"],
+                display_name,
+                kit["package_path"],
+                _team_perk_semantic_status(connection, kit_id),
+            ),
+        ).lastrowid
+        identities[kit_id] = active_id
+
+    hero_grants = connection.execute(
+        """
+        SELECT ha.*, hero.hero_key, hero.source_object_id AS hero_object_id,
+               kit.package_path AS kit_package
+        FROM catalog_hero_abilities ha
+        JOIN catalog_heroes hero ON hero.id=ha.hero_id
+        JOIN catalog_ability_kits kit ON kit.id=ha.ability_kit_id
+        WHERE hero.snapshot_id=?
+        ORDER BY hero.id, ha.ability_ordinal
+        """,
+        (snapshot_id,),
+    ).fetchall()
+    for grant in hero_grants:
+        reference = connection.execute(
+            """
+            SELECT id FROM asset_references
+            WHERE source_object_id=? AND target_package_path=?
+              AND lower(property_path) LIKE '%tierabilitykits%'
+            ORDER BY id LIMIT 1
+            """,
+            (grant["hero_object_id"], grant["kit_package"]),
+        ).fetchone()
+        connection.execute(
+            """
+            INSERT INTO catalog_active_ability_grants(
+                active_ability_id, grant_domain, grantee_key, hero_id,
+                hero_class_id, grant_ordinal, minimum_rarity, source_reference_id
+            ) VALUES (?, 'hero_loadout', ?, ?, NULL, ?, ?, ?)
+            """,
+            (
+                identities[grant["ability_kit_id"]],
+                grant["hero_key"],
+                grant["hero_id"],
+                grant["ability_ordinal"],
+                grant["minimum_rarity"],
+                reference["id"] if reference else None,
+            ),
+        )
+
+    for grant in connection.execute(
+        """
+        SELECT class_kit.*, hero_class.class_key
+        FROM catalog_hero_class_kits class_kit
+        JOIN catalog_hero_classes hero_class ON hero_class.id=class_kit.hero_class_id
+        WHERE class_kit.snapshot_id=? AND class_kit.ability_kit_id IS NOT NULL
+        ORDER BY hero_class.id, class_kit.kit_ordinal
+        """,
+        (snapshot_id,),
+    ):
+        connection.execute(
+            """
+            INSERT INTO catalog_active_ability_grants(
+                active_ability_id, grant_domain, grantee_key, hero_id,
+                hero_class_id, grant_ordinal, minimum_rarity, source_reference_id
+            ) VALUES (?, 'hero_class', ?, NULL, ?, ?, NULL, ?)
+            """,
+            (
+                identities[grant["ability_kit_id"]],
+                grant["class_key"],
+                grant["hero_class_id"],
+                grant["kit_ordinal"],
+                grant["source_reference_id"],
+            ),
         )
 
 
@@ -5042,6 +5219,23 @@ def catalog_coverage(
             WHERE snapshot_id=? AND ability_kit_id IS NOT NULL
         """,
         "abilities": "SELECT COUNT(*) FROM catalog_abilities WHERE snapshot_id=?",
+        "active_ability_identities": """
+            SELECT COUNT(*) FROM catalog_active_abilities WHERE snapshot_id=?
+        """,
+        "hero_loadout_ability_identities": """
+            SELECT COUNT(DISTINCT active.id)
+            FROM catalog_active_abilities active
+            JOIN catalog_active_ability_grants grant_row
+              ON grant_row.active_ability_id=active.id
+            WHERE active.snapshot_id=? AND grant_row.grant_domain='hero_loadout'
+        """,
+        "class_granted_kit_identities": """
+            SELECT COUNT(DISTINCT active.id)
+            FROM catalog_active_abilities active
+            JOIN catalog_active_ability_grants grant_row
+              ON grant_row.active_ability_id=active.id
+            WHERE active.snapshot_id=? AND grant_row.grant_domain='hero_class'
+        """,
         "team_perks": "SELECT COUNT(*) FROM catalog_team_perks WHERE snapshot_id=?",
         "team_perks_with_resolved_kits": """
             SELECT COUNT(*) FROM catalog_team_perks
@@ -5271,6 +5465,7 @@ def _snapshot_summary(
             "catalog_data_tables",
             "catalog_gameplay_tags",
             "catalog_team_perks",
+            "catalog_active_abilities",
             "catalog_magnitudes",
             "catalog_mechanics",
             "catalog_opaque_mechanics",

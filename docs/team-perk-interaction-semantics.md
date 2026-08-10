@@ -42,12 +42,12 @@ execute Blueprint bytecode.
 
 ## Current real-build measurement
 
-Snapshot 26 (`interaction-v3`) measures:
+Snapshot 26 (`interaction-v4`) measures:
 
 - 27/27 identities and AbilityKits cataloged;
 - 27/27 eligibility compositions supported;
 - 55/55 direct semantic grants resolved;
-- 175 supported, 247 partial, and 56 opaque interaction-fact occurrences across the
+- 178 supported, 247 partial, and 56 opaque interaction-fact occurrences across the
   per-perk transitive graphs;
 - all 27 perks partially interpretable, with none falsely labeled fully supported;
 - three deduplicated priority-zero shared GameplayEffect templates still queued.

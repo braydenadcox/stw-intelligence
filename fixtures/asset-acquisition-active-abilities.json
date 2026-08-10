@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "scopes": [
+    {
+      "kind": "folder",
+      "path": "/SaveTheWorld/Abilities/Player/Commando/Actives"
+    },
+    {
+      "kind": "folder",
+      "path": "/SaveTheWorld/Abilities/Player/Constructor/Actives"
+    },
+    {
+      "kind": "folder",
+      "path": "/SaveTheWorld/Abilities/Player/Ninja/Actives"
+    },
+    {
+      "kind": "folder",
+      "path": "/SaveTheWorld/Abilities/Player/Outlander/Actives"
+    },
+    {
+      "kind": "folder",
+      "path": "/SaveTheWorld/Abilities/Player/Perks/Class"
+    }
+  ]
+}

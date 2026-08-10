@@ -9,7 +9,11 @@ import time
 from pathlib import Path
 from typing import Any, Iterable
 
-from stw_assets import _queue_classification, latest_asset_snapshot_id
+from stw_assets import (
+    _queue_classification,
+    canonical_package_path,
+    latest_asset_snapshot_id,
+)
 from stw_pipeline import connect
 
 
@@ -464,6 +468,484 @@ def team_perk_coverage(connection, snapshot_id: int | None = None) -> dict[str, 
     }
 
 
+def _active_ability_row(connection, snapshot_id: int, name: str):
+    rows = connection.execute(
+        """
+        SELECT * FROM catalog_active_abilities
+        WHERE snapshot_id=? AND
+          (lower(active_ability_key)=lower(?) OR lower(display_name)=lower(?))
+        ORDER BY id
+        """,
+        (snapshot_id, name, name),
+    ).fetchall()
+    if len(rows) != 1:
+        matches = [row["active_ability_key"] for row in rows]
+        suffix = f"; matching keys: {matches}" if matches else ""
+        raise ValueError(f"active ability must resolve exactly once: {name!r}{suffix}")
+    return rows[0]
+
+
+def _resolved_data_row(connection, snapshot_id: int, handle: Any) -> dict[str, Any] | None:
+    if not isinstance(handle, dict):
+        return None
+    table_reference = handle.get("DataTable") or {}
+    table_path = canonical_package_path(
+        table_reference.get("ObjectPath") or table_reference.get("AssetPathName")
+    )
+    row_name = handle.get("RowName")
+    if not table_path or not row_name:
+        return None
+    row = connection.execute(
+        """
+        SELECT data_row.row_name, data_row.row_json,
+               data_table.source_object_id, data_table.package_path,
+               data_table.table_name
+        FROM catalog_data_rows data_row
+        JOIN catalog_data_tables data_table ON data_table.id=data_row.data_table_id
+        WHERE data_table.snapshot_id=? AND data_table.package_path=?
+          AND data_row.row_name=?
+        """,
+        (snapshot_id, table_path, row_name),
+    ).fetchone()
+    if row is None:
+        return {
+            "status": "unresolved",
+            "table_path": table_path,
+            "row_name": row_name,
+        }
+    return {
+        "status": "resolved",
+        "table_path": row["package_path"],
+        "table_name": row["table_name"],
+        "row_name": row["row_name"],
+        "row": _json(row["row_json"], {}),
+        "source": _source(connection, row["source_object_id"]),
+    }
+
+
+def active_ability_report(
+    connection,
+    name: str,
+    snapshot_id: int | None = None,
+    *,
+    graph_index: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    snapshot_id = snapshot_id or latest_asset_snapshot_id(connection)
+    if snapshot_id is None:
+        raise ValueError("no ready asset snapshot")
+    active = _active_ability_row(connection, snapshot_id, name)
+    closure, dependencies = _semantic_closure(
+        connection,
+        snapshot_id,
+        {active["source_object_id"]},
+        graph_index,
+    )
+
+    grantees = []
+    for row in connection.execute(
+        """
+        SELECT grant.*, hero.display_name AS hero_name,
+               hero.hero_class, hero.source_object_id AS hero_object_id,
+               hero_class.display_name AS class_name,
+               hero_class.source_object_id AS class_object_id,
+               reference.property_path AS evidence_property_path,
+               reference.target_path AS evidence_target_path,
+               reference.resolution_status AS evidence_resolution_status
+        FROM catalog_active_ability_grants grant
+        LEFT JOIN catalog_heroes hero ON hero.id=grant.hero_id
+        LEFT JOIN catalog_hero_classes hero_class ON hero_class.id=grant.hero_class_id
+        LEFT JOIN asset_references reference ON reference.id=grant.source_reference_id
+        WHERE grant.active_ability_id=?
+        ORDER BY grant.grant_domain, grant.grantee_key, grant.grant_ordinal
+        """,
+        (active["id"],),
+    ):
+        object_id = row["hero_object_id"] or row["class_object_id"]
+        grantees.append(
+            {
+                "domain": row["grant_domain"],
+                "grantee_key": row["grantee_key"],
+                "display_name": row["hero_name"] or row["class_name"],
+                "hero_class": row["hero_class"],
+                "ordinal": row["grant_ordinal"],
+                "minimum_rarity": row["minimum_rarity"],
+                "evidence": {
+                    "property_path": row["evidence_property_path"],
+                    "target_path": row["evidence_target_path"],
+                    "resolution_status": row["evidence_resolution_status"],
+                    "source": _source(connection, object_id) if object_id else None,
+                },
+            }
+        )
+
+    grants = []
+    implementation_ids: set[int] = set()
+    for row in connection.execute(
+        """
+        SELECT grant.grant_kind, grant.grant_operation, grant.target_path,
+               grant.grant_level, grant.ability_id, grant.gameplay_effect_id,
+               ability.ability_key, ability.display_name AS ability_name,
+               ability.semantic_status AS ability_status,
+               ability.source_object_id AS ability_object_id,
+               effect.effect_name, effect.source_object_id AS effect_object_id
+        FROM catalog_ability_kit_grants grant
+        LEFT JOIN catalog_abilities ability ON ability.id=grant.ability_id
+        LEFT JOIN catalog_gameplay_effects effect ON effect.id=grant.gameplay_effect_id
+        WHERE grant.ability_kit_id=?
+          AND grant.grant_kind IN ('ability', 'gameplay_effect')
+        ORDER BY grant.id
+        """,
+        (active["ability_kit_id"],),
+    ):
+        object_id = row["ability_object_id"] or row["effect_object_id"]
+        if row["ability_id"] is not None:
+            implementation_ids.add(row["ability_id"])
+        grants.append(
+            {
+                "kind": row["grant_kind"],
+                "operation": row["grant_operation"],
+                "target_path": row["target_path"],
+                "grant_level": row["grant_level"],
+                "name": row["ability_name"] or row["ability_key"] or row["effect_name"],
+                "semantic_status": row["ability_status"],
+                "resolved": object_id is not None,
+                "source": _source(connection, object_id) if object_id else None,
+            }
+        )
+
+    links = []
+    frontier = list(implementation_ids)
+    while frontier:
+        source_id = frontier.pop()
+        for row in connection.execute(
+            """
+            SELECT link.target_path, link.resolution_status,
+                   source.ability_key AS source_key,
+                   target.id AS target_id, target.ability_key AS target_key,
+                   target.display_name, target.semantic_status,
+                   target.source_object_id
+            FROM catalog_ability_links link
+            JOIN catalog_abilities source ON source.id=link.source_ability_id
+            LEFT JOIN catalog_abilities target ON target.id=link.target_ability_id
+            WHERE link.source_ability_id=? ORDER BY link.id
+            """,
+            (source_id,),
+        ):
+            if row["target_id"] is not None and row["target_id"] not in implementation_ids:
+                implementation_ids.add(row["target_id"])
+                frontier.append(row["target_id"])
+            links.append(
+                {
+                    "source_key": row["source_key"],
+                    "target_path": row["target_path"],
+                    "target_key": row["target_key"],
+                    "display_name": row["display_name"],
+                    "resolution_status": row["resolution_status"],
+                    "semantic_status": row["semantic_status"],
+                    "source": (
+                        _source(connection, row["source_object_id"])
+                        if row["source_object_id"] else None
+                    ),
+                }
+            )
+
+    mechanics: list[dict[str, Any]] = []
+    modifiers: list[dict[str, Any]] = []
+    effects: list[dict[str, Any]] = []
+    tags: list[dict[str, Any]] = []
+    opaque: list[dict[str, Any]] = []
+    if closure:
+        placeholders = ",".join("?" for _ in closure)
+        for row in connection.execute(
+            f"""
+            SELECT mechanic.source_object_id, object.package_path,
+                   object.object_name, object.object_type,
+                   mechanic.owner_domain, mechanic.mechanic_type,
+                   mechanic.property_path, mechanic.conditions_json,
+                   mechanic.value_json, mechanic.interpretation_status,
+                   magnitude.calculation_type AS magnitude_calculation_type,
+                   magnitude.literal_value AS magnitude_literal_value,
+                   magnitude.coefficient AS magnitude_coefficient,
+                   magnitude.pre_additive AS magnitude_pre_additive,
+                   magnitude.post_additive AS magnitude_post_additive,
+                   magnitude.curve_table_path AS magnitude_curve_table_path,
+                   magnitude.curve_row_name AS magnitude_curve_row_name,
+                   magnitude.custom_calculation_path AS magnitude_custom_calculation_path,
+                   magnitude.set_by_caller_tag AS magnitude_set_by_caller_tag,
+                   magnitude.interpretation_status AS magnitude_status
+            FROM catalog_mechanics mechanic
+            JOIN asset_objects object ON object.id=mechanic.source_object_id
+            LEFT JOIN catalog_magnitudes magnitude ON magnitude.id=mechanic.magnitude_id
+            WHERE mechanic.source_object_id IN ({placeholders})
+            ORDER BY object.package_path, mechanic.property_path
+            """,
+            sorted(closure),
+        ):
+            item = {
+                **dict(row),
+                "conditions": _json(row["conditions_json"], {}),
+                "value": _json(row["value_json"], {}),
+                "source": _source(connection, row["source_object_id"]),
+            }
+            item.pop("conditions_json", None)
+            item.pop("value_json", None)
+            if row["mechanic_type"] == "damage_stat_row":
+                item["resolved_data_row"] = _resolved_data_row(
+                    connection, snapshot_id, item["value"]
+                )
+            mechanics.append(item)
+        modifiers = [
+            {
+                **dict(row),
+                "source": _source(connection, row["source_object_id"]),
+            }
+            for row in connection.execute(
+                f"""
+                SELECT effect.source_object_id, effect.effect_name,
+                       modifier.attribute_name, modifier.modifier_operation,
+                       modifier.evaluation_channel,
+                       modifier.source_required_tags_json,
+                       modifier.source_ignored_tags_json,
+                       modifier.target_required_tags_json,
+                       modifier.target_ignored_tags_json,
+                       modifier.interpretation_status,
+                       magnitude.calculation_type, magnitude.literal_value,
+                       magnitude.coefficient, magnitude.pre_additive,
+                       magnitude.post_additive, magnitude.curve_table_path,
+                       magnitude.curve_row_name, magnitude.custom_calculation_path,
+                       magnitude.set_by_caller_tag,
+                       magnitude.interpretation_status AS magnitude_status
+                FROM catalog_effect_modifiers modifier
+                JOIN catalog_gameplay_effects effect ON effect.id=modifier.gameplay_effect_id
+                LEFT JOIN catalog_magnitudes magnitude ON magnitude.id=modifier.magnitude_id
+                WHERE effect.source_object_id IN ({placeholders})
+                ORDER BY effect.effect_name, modifier.modifier_ordinal
+                """,
+                sorted(closure),
+            )
+        ]
+        effects = [
+            {
+                **dict(row),
+                "source": _source(connection, row["source_object_id"]),
+            }
+            for row in connection.execute(
+                f"""
+                SELECT source_object_id, effect_name, package_path, template_path,
+                       stacking_type, stack_limit
+                FROM catalog_gameplay_effects
+                WHERE source_object_id IN ({placeholders})
+                ORDER BY package_path, effect_name
+                """,
+                sorted(closure),
+            )
+        ]
+        tags = [
+            dict(row)
+            for row in connection.execute(
+                f"""
+                SELECT occurrence.source_object_id, tag.tag_name,
+                       occurrence.property_path, occurrence.semantic_role
+                FROM catalog_gameplay_tag_occurrences occurrence
+                JOIN catalog_gameplay_tags tag ON tag.id=occurrence.tag_id
+                WHERE occurrence.source_object_id IN ({placeholders})
+                ORDER BY tag.tag_name, occurrence.property_path
+                """,
+                sorted(closure),
+            )
+        ]
+        opaque = [
+            {
+                **dict(row),
+                "source": _source(connection, row["source_object_id"]),
+            }
+            for row in connection.execute(
+                f"""
+                SELECT source_object_id, property_path, mechanic_kind,
+                       referenced_path, reason
+                FROM catalog_opaque_mechanics
+                WHERE source_object_id IN ({placeholders})
+                ORDER BY source_object_id, property_path
+                """,
+                sorted(closure),
+            )
+        ]
+
+    supported_facts = sum(
+        row["interpretation_status"] == "supported"
+        and row["magnitude_status"] in (None, "supported")
+        for row in mechanics
+    ) + sum(
+        row["interpretation_status"] == "supported"
+        and row["magnitude_status"] in (None, "supported")
+        for row in modifiers
+    )
+    incomplete = bool(dependencies or opaque) or any(
+        row["interpretation_status"] != "supported"
+        or row["magnitude_status"] not in (None, "supported")
+        for row in mechanics + modifiers
+    ) or any(not grant["resolved"] for grant in grants) or any(
+        link["resolution_status"] != "resolved" for link in links
+    )
+    status = (
+        "partial" if supported_facts and incomplete
+        else "supported" if supported_facts
+        else "opaque"
+    )
+    return {
+        "snapshot_id": snapshot_id,
+        "identity": {
+            "active_ability_key": active["active_ability_key"],
+            "display_name": active["display_name"],
+            "package_path": active["package_path"],
+            "source": _source(connection, active["source_object_id"]),
+        },
+        "grantees": grantees,
+        "semantics": {
+            "status": status,
+            "normalized_direct_status": active["semantic_status"],
+            "grants": grants,
+            "gameplay_ability_links": links,
+            "gameplay_effects": effects,
+            "mechanics": mechanics,
+            "modifiers": modifiers,
+            "gameplay_tags": tags,
+            "opaque_boundaries": opaque,
+            "transitive_asset_objects": len(closure),
+        },
+        "unresolved_dependencies": dependencies,
+    }
+
+
+def active_ability_coverage(
+    connection, snapshot_id: int | None = None
+) -> dict[str, Any]:
+    started = time.perf_counter()
+    snapshot_id = snapshot_id or latest_asset_snapshot_id(connection)
+    if snapshot_id is None:
+        return {"snapshot_id": None, "counts": {}, "active_abilities": []}
+    keys = [
+        row[0]
+        for row in connection.execute(
+            """
+            SELECT active_ability_key FROM catalog_active_abilities
+            WHERE snapshot_id=? ORDER BY display_name, active_ability_key
+            """,
+            (snapshot_id,),
+        )
+    ]
+    graph_index = _semantic_graph_index(connection, snapshot_id)
+    reports = [
+        active_ability_report(connection, key, snapshot_id, graph_index=graph_index)
+        for key in keys
+    ]
+    status_counts = {status: 0 for status in ("supported", "partial", "opaque")}
+    fact_status = {status: 0 for status in ("supported", "partial", "opaque")}
+    mechanic_types: dict[str, int] = {}
+    missing: dict[str, dict[str, Any]] = {}
+    grant_total = grant_resolved = data_rows = data_rows_resolved = 0
+    hero_loadout_keys: set[str] = set()
+    class_keys: set[str] = set()
+    hero_grantees: set[str] = set()
+    class_grantees: set[str] = set()
+    structural_grants = resolved_structural_grants = 0
+    for report in reports:
+        status_counts[report["semantics"]["status"]] += 1
+        for grantee in report["grantees"]:
+            (hero_loadout_keys if grantee["domain"] == "hero_loadout" else class_keys).add(
+                report["identity"]["active_ability_key"]
+            )
+            (hero_grantees if grantee["domain"] == "hero_loadout" else class_grantees).add(
+                grantee["grantee_key"]
+            )
+            structural_grants += 1
+            resolved_structural_grants += int(
+                grantee["evidence"]["resolution_status"] == "resolved"
+            )
+        for mechanic in report["semantics"]["mechanics"]:
+            mechanic_types[mechanic["mechanic_type"]] = (
+                mechanic_types.get(mechanic["mechanic_type"], 0) + 1
+            )
+            status = mechanic["interpretation_status"]
+            if mechanic["magnitude_status"] in ("partial", "opaque"):
+                status = mechanic["magnitude_status"]
+            fact_status[status] += 1
+            if mechanic["mechanic_type"] == "damage_stat_row":
+                data_rows += 1
+                data_rows_resolved += int(
+                    (mechanic.get("resolved_data_row") or {}).get("status") == "resolved"
+                )
+        for modifier in report["semantics"]["modifiers"]:
+            status = modifier["interpretation_status"]
+            if modifier["magnitude_status"] in ("partial", "opaque"):
+                status = modifier["magnitude_status"]
+            fact_status["partial" if status == "unsupported" else status] += 1
+        fact_status["opaque"] += len(report["semantics"]["opaque_boundaries"])
+        grant_total += len(report["semantics"]["grants"])
+        grant_resolved += sum(g["resolved"] for g in report["semantics"]["grants"])
+        for dependency in report["unresolved_dependencies"]:
+            missing.setdefault(dependency["package_path"], dependency)
+    total_facts = sum(fact_status.values())
+    return {
+        "snapshot_id": snapshot_id,
+        "catalog_scope": {
+            "identity_evidence": ["TierAbilityKits", "ClassAbilityKits"],
+            "catalog_awareness_complete": bool(reports),
+        },
+        "counts": {
+            "active_ability_identities": len(reports),
+            "hero_loadout_ability_identities": len(hero_loadout_keys),
+            "class_granted_kit_identities": len(class_keys),
+            "heroes_with_loadout_abilities": len(hero_grantees),
+            "hero_classes_with_granted_kits": len(class_grantees),
+            "structural_grants": structural_grants,
+            "resolved_structural_grants": resolved_structural_grants,
+            "semantic_status": status_counts,
+            "interaction_mechanic_types": mechanic_types,
+            "interaction_fact_status_occurrences": fact_status,
+            "semantic_grants": grant_total,
+            "resolved_semantic_grants": grant_resolved,
+            "damage_stat_rows": data_rows,
+            "resolved_damage_stat_rows": data_rows_resolved,
+            "deduplicated_missing_dependencies": len(missing),
+        },
+        "coverage": {
+            "identity": 1.0 if reports else None,
+            "structural_grants_resolved": (
+                resolved_structural_grants / structural_grants
+                if structural_grants else None
+            ),
+            "semantics_fully_supported": status_counts["supported"] / len(reports) if reports else None,
+            "semantics_known_or_partial": (
+                status_counts["supported"] + status_counts["partial"]
+            ) / len(reports) if reports else None,
+            "semantic_grants_resolved": grant_resolved / grant_total if grant_total else None,
+            "damage_stat_rows_resolved": data_rows_resolved / data_rows if data_rows else None,
+            "supported_interaction_fact_occurrences": (
+                fact_status["supported"] / total_facts if total_facts else None
+            ),
+        },
+        "active_abilities": [
+            {
+                "active_ability_key": report["identity"]["active_ability_key"],
+                "display_name": report["identity"]["display_name"],
+                "grant_domains": sorted({g["domain"] for g in report["grantees"]}),
+                "hero_grant_count": sum(g["domain"] == "hero_loadout" for g in report["grantees"]),
+                "semantic_status": report["semantics"]["status"],
+                "mechanic_count": len(report["semantics"]["mechanics"]),
+                "modifier_count": len(report["semantics"]["modifiers"]),
+                "opaque_boundary_count": len(report["semantics"]["opaque_boundaries"]),
+                "unresolved_dependency_count": len(report["unresolved_dependencies"]),
+            }
+            for report in reports
+        ],
+        "unresolved_dependencies": sorted(
+            missing.values(), key=lambda item: (item["priority"], item["package_path"])
+        ),
+        "elapsed_ms": (time.perf_counter() - started) * 1000.0,
+    }
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--db", type=Path, default=Path("data/phase2-real-validation.sqlite3"))
@@ -473,6 +955,11 @@ def _parser() -> argparse.ArgumentParser:
     detail = commands.add_parser("team-perk", help="show one team perk's interaction graph")
     detail.add_argument("name")
     detail.add_argument("--snapshot-id", type=int)
+    abilities = commands.add_parser("abilities", help="report hero/class active-ability coverage")
+    abilities.add_argument("--snapshot-id", type=int)
+    ability = commands.add_parser("ability", help="show one active ability's interaction graph")
+    ability.add_argument("name")
+    ability.add_argument("--snapshot-id", type=int)
     return parser
 
 
@@ -480,11 +967,14 @@ def main(argv: Iterable[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     connection = connect(args.db)
     try:
-        payload = (
-            team_perk_coverage(connection, args.snapshot_id)
-            if args.command == "team-perks"
-            else team_perk_report(connection, args.name, args.snapshot_id)
-        )
+        if args.command == "team-perks":
+            payload = team_perk_coverage(connection, args.snapshot_id)
+        elif args.command == "team-perk":
+            payload = team_perk_report(connection, args.name, args.snapshot_id)
+        elif args.command == "abilities":
+            payload = active_ability_coverage(connection, args.snapshot_id)
+        else:
+            payload = active_ability_report(connection, args.name, args.snapshot_id)
     finally:
         connection.close()
     print(json.dumps(payload, indent=2, sort_keys=True))

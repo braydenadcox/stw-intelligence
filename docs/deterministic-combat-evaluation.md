@@ -53,11 +53,15 @@ data-row provenance and the source export hash. The versioned engine rule for de
 GameplayEffect aggregation and the analytic fire-rate model are listed separately under
 `assumptions`.
 
+The shared-runtime audit now resolves exact CritRating and item-rating curve values, but
+deliberately does not infer the native rule that combines or consumes them. See
+[shared runtime combat semantics](shared-runtime-combat-semantics.md).
+
 The evaluator deliberately does not infer:
 
 - weapon item-level/DmgScale application, hero F.O.R.T. offense, mission scaling, enemy
   resistance, or elemental matchup multipliers;
-- Fortnite's CritRating-to-chance conversion;
+- the native combination of the proven CritRating curve result with base crit chance;
 - the conversion from modified `WeaponReloadSpeed` to runtime reload seconds;
 - fractional magazine rounding;
 - animation timing, projectile travel, spread, accuracy, or ammo economy;

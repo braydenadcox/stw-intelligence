@@ -235,8 +235,10 @@ class CombatEvaluationTests(unittest.TestCase):
         self.assertEqual(30.0, unknown.metrics["crit_rating"])
         self.assertIsNone(unknown.metrics["effective_crit_probability"])
         self.assertIn(
-            "crit_rating_conversion_unavailable", {issue.code for issue in unknown.issues}
+            "crit_chance_combination_rule_unavailable",
+            {issue.code for issue in unknown.issues},
         )
+        self.assertAlmostEqual(0.375, unknown.metrics["crit_rating_bonus_chance"])
         self.assertAlmostEqual(1.8, explicit.attributes["ZoneCritMultiplier"]["value"])
         self.assertAlmostEqual(1.25, explicit.attributes["DiceCritMultiplier"]["value"])
         self.assertAlmostEqual(263.25, explicit.metrics["configured_damage_per_shot"])
@@ -252,6 +254,23 @@ class CombatEvaluationTests(unittest.TestCase):
                 LoadoutContext(),
                 CombatScenario(),
             )
+
+    def test_item_level_resolves_rating_but_does_not_invent_damage_scaling(self) -> None:
+        result = evaluate_combat(
+            self.connection,
+            WeaponConfiguration(
+                self.configuration.variant_key,
+                self.configuration.perks,
+                item_level=30,
+            ),
+            LoadoutContext(),
+            CombatScenario(),
+        )
+        self.assertAlmostEqual(130.0, result.metrics["item_rating"])
+        self.assertAlmostEqual(130.0, result.metrics["configured_damage_per_shot"])
+        self.assertIn(
+            "item_level_formula_unavailable", {issue.code for issue in result.issues}
+        )
 
     def test_result_preserves_asset_and_curve_provenance(self) -> None:
         result = evaluate_combat(

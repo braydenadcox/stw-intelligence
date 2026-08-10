@@ -166,6 +166,16 @@ shot profiles, and burst/sustained throughput while explicitly isolating unknown
 scaling and Blueprint behavior. See [deterministic combat evaluation](docs/deterministic-combat-evaluation.md)
 for a fully specified Nocturno command and the evidence boundary.
 
+Shared runtime lookups and native-code boundaries can be audited with:
+
+```powershell
+python tools/stw_runtime.py --db data/phase2-real-validation.sqlite3 report
+```
+
+See [shared runtime combat semantics](docs/shared-runtime-combat-semantics.md) for the
+proven CritRating/item-rating/difficulty lookups, Nocturno signature classification, and
+the formulas that remain inside native Fortnite code.
+
 ## Live local application
 
 On Windows, the default command watches Fortnite's standard log location, loads the

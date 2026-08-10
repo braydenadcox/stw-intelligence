@@ -19,6 +19,7 @@ from typing import Any, Iterable, Sequence
 
 from stw_assets import latest_asset_snapshot_id
 from stw_pipeline import connect
+from stw_runtime import crit_rating_to_chance, curve_lookup
 
 
 SUPPORTED_OPERATIONS = {
@@ -537,6 +538,7 @@ def _resolve_schematics(
         """
         SELECT schematic.schematic_key, schematic.link_status,
                schematic.result_primary_asset_name, schematic.source_object_id
+               , schematic.rating_curve_path, schematic.rating_row_name
         FROM catalog_schematics schematic
         WHERE schematic.snapshot_id=? AND schematic.weapon_variant_id=?
         ORDER BY schematic.schematic_key
@@ -554,6 +556,8 @@ def _resolve_schematics(
                 "schematic_key": row["schematic_key"],
                 "result_primary_asset_name": row["result_primary_asset_name"],
                 "link_status": row["link_status"],
+                "rating_row_name": row["rating_row_name"],
+                "rating_curve_path": row["rating_curve_path"],
                 "source": source,
             }
         )
@@ -728,6 +732,40 @@ def evaluate_combat(
     ]
 
     raw_stats = _json(variant["raw_stats_json"], {})
+    item_rating = None
+    if configuration.item_level is not None:
+        rating_rows = {
+            schematic["rating_row_name"]
+            for schematic in schematics
+            if schematic["rating_row_name"]
+        }
+        if len(rating_rows) == 1:
+            item_rating, rating_source, rating_error = curve_lookup(
+                connection,
+                snapshot_id,
+                next(iter(rating_rows)),
+                configuration.item_level,
+                next(
+                    (
+                        schematic["rating_curve_path"]
+                        for schematic in schematics
+                        if schematic["rating_row_name"] in rating_rows
+                    ),
+                    None,
+                ),
+            )
+            if rating_source:
+                state.add_provenance(rating_source)
+            if rating_error:
+                state.issue(
+                    "item_rating_lookup_unavailable",
+                    f"Item rating lookup could not be evaluated: {rating_error}.",
+                )
+        else:
+            state.issue(
+                "item_rating_row_unavailable",
+                "The linked schematic does not expose one exact item-rating curve row.",
+            )
     bases = {
         "OutgoingAbilityDamage": 1.0,
         "WeaponRateOfFire": float(variant["fire_rate"] or 0.0),
@@ -761,6 +799,18 @@ def evaluate_combat(
 
     crit_rating = attributes["CritRating"]["value"]
     base_crit_chance = float(variant["crit_chance"] or 0.0)
+    crit_rating_bonus = None
+    if crit_rating != 0.0:
+        crit_rating_bonus, crit_source, crit_error = crit_rating_to_chance(
+            connection, snapshot_id, crit_rating
+        )
+        if crit_source:
+            state.add_provenance(crit_source)
+        if crit_error:
+            state.issue(
+                "crit_rating_curve_unavailable",
+                f"CritRating lookup could not be evaluated: {crit_error}.",
+            )
     crit_probability = scenario.crit_probability
     if crit_probability is not None:
         state.assumptions.append(
@@ -772,8 +822,8 @@ def evaluate_combat(
         )
     elif crit_rating != 0.0:
         state.issue(
-            "crit_rating_conversion_unavailable",
-            "The catalog proves the CritRating total but not Fortnite's rating-to-chance conversion.",
+            "crit_chance_combination_rule_unavailable",
+            "The CritRating-to-chance curve is proven, but its native combination with DiceCritChance is not.",
         )
     else:
         crit_probability = base_crit_chance
@@ -902,9 +952,11 @@ def evaluate_combat(
         "unit": "catalog_weapon_stat_damage",
         "range_band": scenario.range_band,
         "base_damage": float(damage_base),
+        "item_rating": item_rating,
         "damage_profiles": profiles,
         "base_crit_chance": base_crit_chance,
         "crit_rating": crit_rating,
+        "crit_rating_bonus_chance": crit_rating_bonus,
         "effective_crit_probability": crit_probability,
         "expected_body_damage": expected_body,
         "expected_headshot_damage": expected_headshot,
@@ -1030,6 +1082,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     subparsers = parser.add_subparsers(dest="command", required=True)
     evaluate = subparsers.add_parser("evaluate", help="evaluate one exact weapon/loadout scenario")
     evaluate.add_argument("--variant", required=True)
+    evaluate.add_argument("--item-level", type=int)
     evaluate.add_argument("--perk", type=_perk_argument, action="append", default=[])
     evaluate.add_argument("--commander")
     evaluate.add_argument("--support", action="append", default=[])
@@ -1052,7 +1105,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         else:
             result = evaluate_combat(
                 connection,
-                WeaponConfiguration(args.variant, tuple(args.perk)),
+                WeaponConfiguration(args.variant, tuple(args.perk), args.item_level),
                 LoadoutContext(args.commander, tuple(args.support)),
                 CombatScenario(
                     range_band=args.range_band,

@@ -18,8 +18,13 @@ from stw_pipeline import connect
 
 
 PERK_KIT_RE = re.compile(r"^Kit_Perk_H_(?P<family>.+)_(?P<tier>T\d+)$")
-NORMALIZER_VERSION = "phase2-v14"
+NORMALIZER_VERSION = "phase2-v15"
 ROSTER_PLAN_VERSION = "phase2-roster-v1"
+
+RUNTIME_DATA_ROW_STRUCTS = {
+    "HomebaseRatingDifficultyMappingData",
+    "GameDifficultyGrowthBounds",
+}
 
 STW_HERO_CLASSES = ("Commando", "Constructor", "Ninja", "Outlander")
 SEMANTIC_DEPENDENCY_CATEGORIES = {
@@ -655,6 +660,11 @@ def _normalize_data_tables(
             "SELECT package_path FROM asset_objects WHERE id=?", (object_id,)
         ).fetchone()
         package = object_row["package_path"]
+        row_struct = export.get("Properties", {}).get("RowStruct") or {}
+        row_struct_name = str(row_struct.get("ObjectName") or "")
+        preserve_all_rows = any(
+            name in row_struct_name for name in RUNTIME_DATA_ROW_STRUCTS
+        )
         table_id = connection.execute(
             """
             INSERT INTO catalog_data_tables(
@@ -664,7 +674,7 @@ def _normalize_data_tables(
             (snapshot_id, object_id, package, export.get("Name", "Unknown")),
         ).lastrowid
         for row_name, row_payload in export["Rows"].items():
-            if (package, row_name) not in requested_rows:
+            if not preserve_all_rows and (package, row_name) not in requested_rows:
                 continue
             connection.execute(
                 """

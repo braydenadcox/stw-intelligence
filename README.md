@@ -106,6 +106,21 @@ GameplayEffect/ability bases, and the hero-perk balance table), then groups any 
 transitive references into deduplicated follow-up folders. Cosmetics, UI, progression,
 and unrelated active-ability assets are excluded from this workflow.
 
+The first deterministic consumer can search optimization-ready perk families and assemble
+an auditable commander/support result from exact normalized attributes, tags, and mechanics:
+
+```powershell
+python tools/stw_loadouts.py --db data/phase2-real-validation.sqlite3 vocabulary
+python tools/stw_loadouts.py --db data/phase2-real-validation.sqlite3 search `
+  --attribute OutgoingAbilityDamage --tag Weapon.Ranged.Assault
+python tools/stw_loadouts.py --db data/phase2-real-validation.sqlite3 recommend `
+  --attribute OutgoingAbilityDamage
+```
+
+It never evaluates partial/opaque perk families or invents a cross-mechanic power score.
+See [deterministic loadout reasoning](docs/deterministic-loadout-reasoning.md) for the
+current boundaries and query rules.
+
 ## Live local application
 
 On Windows, the default command watches Fortnite's standard log location, loads the

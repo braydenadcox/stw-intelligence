@@ -1113,6 +1113,50 @@ MIGRATIONS = [
         ON catalog_gadgets(snapshot_id, display_name);
     CREATE INDEX catalog_gadget_levels_gadget_idx
         ON catalog_gadget_levels(gadget_id, level_ordinal);
+    """,
+    """
+    CREATE TABLE catalog_signature_effects (
+        id INTEGER PRIMARY KEY,
+        snapshot_id INTEGER NOT NULL REFERENCES asset_snapshots(id) ON DELETE CASCADE,
+        source_alteration_id INTEGER NOT NULL UNIQUE
+            REFERENCES catalog_alterations(id) ON DELETE CASCADE,
+        source_object_id INTEGER NOT NULL UNIQUE REFERENCES asset_objects(id),
+        ability_kit_id INTEGER NOT NULL REFERENCES catalog_ability_kits(id),
+        signature_key TEXT NOT NULL,
+        display_name TEXT,
+        description TEXT,
+        signature_kind TEXT NOT NULL
+            CHECK (signature_kind IN ('sixth_perk', 'intrinsic_signature', 'both')),
+        semantic_status TEXT NOT NULL
+            CHECK (semantic_status IN ('supported', 'partial', 'opaque')),
+        UNIQUE (snapshot_id, signature_key)
+    );
+    CREATE TABLE catalog_signature_weapon_owners (
+        id INTEGER PRIMARY KEY,
+        signature_effect_id INTEGER NOT NULL
+            REFERENCES catalog_signature_effects(id) ON DELETE CASCADE,
+        weapon_identity_id INTEGER NOT NULL
+            REFERENCES catalog_weapon_identities(id) ON DELETE CASCADE,
+        weapon_variant_id INTEGER NOT NULL
+            REFERENCES catalog_weapon_variants(id) ON DELETE CASCADE,
+        weapon_slot_id INTEGER NOT NULL
+            REFERENCES catalog_weapon_slots(id) ON DELETE CASCADE,
+        weapon_slot_option_id INTEGER NOT NULL
+            REFERENCES catalog_weapon_slot_options(id) ON DELETE CASCADE,
+        slot_ordinal INTEGER NOT NULL,
+        perk_rarity TEXT NOT NULL,
+        ownership_kind TEXT NOT NULL
+            CHECK (ownership_kind IN ('sixth_perk', 'intrinsic_signature')),
+        UNIQUE (signature_effect_id, weapon_variant_id, weapon_slot_option_id)
+    );
+    CREATE INDEX catalog_signature_effects_snapshot_idx
+        ON catalog_signature_effects(snapshot_id, display_name);
+    CREATE INDEX catalog_signature_effects_kit_idx
+        ON catalog_signature_effects(ability_kit_id);
+    CREATE INDEX catalog_signature_owners_effect_idx
+        ON catalog_signature_weapon_owners(signature_effect_id);
+    CREATE INDEX catalog_signature_owners_weapon_idx
+        ON catalog_signature_weapon_owners(weapon_identity_id, weapon_variant_id);
     """
 ]
 

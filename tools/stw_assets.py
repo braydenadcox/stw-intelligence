@@ -18,7 +18,7 @@ from stw_pipeline import connect
 
 
 PERK_KIT_RE = re.compile(r"^Kit_Perk_H_(?P<family>.+)_(?P<tier>T\d+)$")
-NORMALIZER_VERSION = "interaction-v5"
+NORMALIZER_VERSION = "interaction-v6"
 ROSTER_PLAN_VERSION = "phase2-roster-v1"
 
 RUNTIME_DATA_ROW_STRUCTS = {
@@ -440,6 +440,8 @@ def _clear_normalized_snapshot(
         "(SELECT id FROM catalog_active_abilities WHERE snapshot_id=?)",
         "DELETE FROM catalog_gadget_levels WHERE gadget_id IN "
         "(SELECT id FROM catalog_gadgets WHERE snapshot_id=?)",
+        "DELETE FROM catalog_signature_weapon_owners WHERE signature_effect_id IN "
+        "(SELECT id FROM catalog_signature_effects WHERE snapshot_id=?)",
     )
     for statement in leaf_deletes:
         connection.execute(statement, (snapshot_id,))
@@ -457,6 +459,7 @@ def _clear_normalized_snapshot(
         "catalog_team_perks",
         "catalog_active_abilities",
         "catalog_gadgets",
+        "catalog_signature_effects",
         "catalog_heroes",
         "catalog_perks",
         "catalog_ability_kits",
@@ -577,6 +580,7 @@ def _normalize_snapshot(
         ("active abilities", _normalize_active_abilities, (connection, snapshot_id)),
         ("gadgets", _normalize_gadgets, (connection, snapshot_id, payloads)),
         ("weapons", _normalize_weapon_catalog, (connection, snapshot_id, payloads)),
+        ("signature effects", _normalize_signature_effects, (connection, snapshot_id)),
         ("gameplay tags", _normalize_gameplay_tags, (connection, snapshot_id, payloads)),
         ("modifier curves", _link_modifier_curves, (connection, snapshot_id)),
         ("magnitude curves", _link_magnitude_curves, (connection, snapshot_id)),
@@ -3197,6 +3201,105 @@ def _normalize_weapon_catalog(
     _normalize_schematics(connection, snapshot_id, payloads, tables, variants)
 
 
+def _normalize_signature_effects(
+    connection: sqlite3.Connection, snapshot_id: int
+) -> None:
+    """Catalog sixth-slot and structurally ability-backed intrinsic effects.
+
+    Slot ordinal five is direct sixth-slot evidence. Outside that slot, an
+    effect is included only when the slot is non-respeccable and its exact
+    AbilityKit grants runtime ability behavior or carries an explicit opaque
+    boundary. Names and descriptions are never used for discovery.
+    """
+    rows = connection.execute(
+        """
+        SELECT alteration.id AS alteration_id, alteration.source_object_id,
+               alteration.ability_kit_id, alteration.alteration_key,
+               alteration.display_name, alteration.description,
+               alteration.semantic_status,
+               identity.id AS weapon_identity_id,
+               variant.id AS weapon_variant_id,
+               slot.id AS weapon_slot_id, option_row.id AS option_id,
+               slot.slot_ordinal, slot.respeccable, option_row.perk_rarity,
+               CASE WHEN slot.slot_ordinal=5 THEN 'sixth_perk'
+                    ELSE 'intrinsic_signature' END AS ownership_kind
+        FROM catalog_weapon_variants variant
+        JOIN catalog_weapon_identities identity ON identity.id=variant.identity_id
+        JOIN catalog_weapon_slots slot ON slot.slot_loadout_id=variant.slot_loadout_id
+        JOIN catalog_weapon_slot_options option_row ON option_row.weapon_slot_id=slot.id
+        JOIN catalog_alterations alteration ON alteration.id=option_row.alteration_id
+        JOIN catalog_ability_kits kit ON kit.id=alteration.ability_kit_id
+        WHERE variant.snapshot_id=?
+          AND (
+            slot.slot_ordinal=5
+            OR (
+              slot.respeccable=0
+              AND (
+                EXISTS (
+                  SELECT 1 FROM catalog_ability_kit_grants grant_row
+                  WHERE grant_row.ability_kit_id=kit.id
+                    AND grant_row.grant_kind='ability'
+                )
+                OR EXISTS (
+                  SELECT 1 FROM catalog_opaque_mechanics opaque
+                  WHERE opaque.source_object_id=kit.source_object_id
+                )
+              )
+            )
+          )
+        ORDER BY alteration.id, variant.id, option_row.id
+        """,
+        (snapshot_id,),
+    ).fetchall()
+    by_alteration: dict[int, list[sqlite3.Row]] = {}
+    for row in rows:
+        by_alteration.setdefault(row["alteration_id"], []).append(row)
+    for alteration_id, ownership_rows in by_alteration.items():
+        first = ownership_rows[0]
+        kinds = {row["ownership_kind"] for row in ownership_rows}
+        signature_kind = "both" if len(kinds) > 1 else next(iter(kinds))
+        signature_id = connection.execute(
+            """
+            INSERT INTO catalog_signature_effects(
+                snapshot_id, source_alteration_id, source_object_id,
+                ability_kit_id, signature_key, display_name, description,
+                signature_kind, semantic_status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                snapshot_id,
+                alteration_id,
+                first["source_object_id"],
+                first["ability_kit_id"],
+                first["alteration_key"],
+                first["display_name"],
+                first["description"],
+                signature_kind,
+                first["semantic_status"],
+            ),
+        ).lastrowid
+        for row in ownership_rows:
+            connection.execute(
+                """
+                INSERT INTO catalog_signature_weapon_owners(
+                    signature_effect_id, weapon_identity_id, weapon_variant_id,
+                    weapon_slot_id, weapon_slot_option_id, slot_ordinal,
+                    perk_rarity, ownership_kind
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    signature_id,
+                    row["weapon_identity_id"],
+                    row["weapon_variant_id"],
+                    row["weapon_slot_id"],
+                    row["option_id"],
+                    row["slot_ordinal"],
+                    row["perk_rarity"],
+                    row["ownership_kind"],
+                ),
+            )
+
+
 def _link_modifier_curves(connection: sqlite3.Connection, snapshot_id: int) -> None:
     connection.execute(
         """
@@ -5124,6 +5227,13 @@ def weapon_catalog_coverage(
             WHERE loadout.snapshot_id=? AND option_row.alteration_id IS NOT NULL
         """,
         "alterations": "SELECT COUNT(*) FROM catalog_alterations WHERE snapshot_id=?",
+        "signature_effects": "SELECT COUNT(*) FROM catalog_signature_effects WHERE snapshot_id=?",
+        "signature_weapon_owners": """
+            SELECT COUNT(*) FROM catalog_signature_weapon_owners owner
+            JOIN catalog_signature_effects signature
+              ON signature.id=owner.signature_effect_id
+            WHERE signature.snapshot_id=?
+        """,
         "supported_alterations": """
             SELECT COUNT(*) FROM catalog_alterations
             WHERE snapshot_id=? AND semantic_status='supported'
@@ -5624,6 +5734,7 @@ def _snapshot_summary(
             "catalog_weapon_variants",
             "catalog_schematics",
             "catalog_alterations",
+            "catalog_signature_effects",
             "catalog_weapon_slot_loadouts",
         )
     }

@@ -217,6 +217,20 @@ mechanics, effects, spawned entities, tags, executions, and Blueprint/native bou
 Internal/debug gadget kits are excluded unless a selectable unlock node structurally grants
 them. See [gadget interaction semantics](docs/gadget-interaction-semantics.md).
 
+Signature weapon effects and sixth perks are discovered from actual weapon slot ownership,
+then interpreted through the same alteration and interaction graph:
+
+```powershell
+python tools/stw_signatures.py --db data/phase2-real-validation.sqlite3 signatures
+python tools/stw_signatures.py --db data/phase2-real-validation.sqlite3 signature "Paint the Field"
+python tools/stw_signatures.py --db data/phase2-real-validation.sqlite3 signature "aid_g_onkill_chainlightning"
+```
+
+Reports retain eligible weapon variants and schematics, triggers, effects, executions,
+stacking, status/element tags, coefficients, source hashes, and explicit Blueprint/native
+boundaries. See
+[signature weapon interaction semantics](docs/signature-weapon-interaction-semantics.md).
+
 ## Live local application
 
 On Windows, the default command watches Fortnite's standard log location, loads the

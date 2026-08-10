@@ -66,7 +66,7 @@ class StwPipelineTests(unittest.TestCase):
             finally:
                 connection.close()
 
-        self.assertEqual(18, version)
+        self.assertEqual(19, version)
         self.assertEqual("mission_attempts", index_table)
         self.assertEqual("preserved.log", preserved)
 
@@ -203,7 +203,7 @@ class StwPipelineTests(unittest.TestCase):
         self.assertNotIn(replacement, dump)
         self.assertNotIn("private-owner", dump)
         self.assertNotIn("private-token", dump)
-        self.assertEqual(18, version)
+        self.assertEqual(19, version)
 
     def test_daily_reset_creates_distinct_nodes_sessions_and_maps(self) -> None:
         captures = [

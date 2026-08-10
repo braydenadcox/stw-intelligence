@@ -8,3 +8,7 @@ data/live/
 data/backups/
 data/*.lock
 data/*.stop
+data/*asset-queue*.json
+.tools/
+**/bin/
+**/obj/

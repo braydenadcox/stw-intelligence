@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "scopes": [
+    {
+      "kind": "package",
+      "path": "/SaveTheWorld/Heroes/Commando/GameplayDefinition/HGD_Commando_GrenadeGun"
+    }
+  ]
+}

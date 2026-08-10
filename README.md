@@ -97,6 +97,27 @@ stacking, cooldown/trigger facts, and inheritance are normalized for downstream 
 Custom magnitude and execution calculations remain explicitly opaque until a dedicated
 interpreter exists.
 
+### Automatic local acquisition
+
+The catalog can now read the installed Fortnite archives directly through a small
+CUE4Parse adapter. It uses the game path, mapping, and AES configuration already held by
+FModel, but never prints or copies credentials into Git. Close FModel before a write run,
+then use:
+
+```powershell
+python tools/stw_asset_acquisition.py doctor
+python tools/stw_asset_acquisition.py build --restore
+python tools/stw_asset_acquisition.py close --confirm-export
+```
+
+`close` repeatedly exports only the exact priority 0-2 packages proven necessary by the
+current reference graph, ingests them, and recomputes the queue until it closes, stalls,
+or reaches its round cap. Raw JSON remains in FModel's configured output directory and
+the SQLite catalog remains ignored by Git. Folder manifests are also supported for
+controlled discovery; every run previews its package count and enforces a configurable
+safety cap. See [automatic asset acquisition](docs/automatic-asset-acquisition.md) for
+setup, security boundaries, and manifest examples.
+
 The controlled roster workflow treats each exported `FortHeroGameplayDefinition` as one
 canonical gameplay identity and links every `FortHeroType` rarity/evolution record as a
 variant. `roster` reports missing mappings and classifies every perk family as resolved,

@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "scopes": [
+    {"kind": "folder", "path": "/SaveTheWorld/Items"},
+    {"kind": "folder", "path": "/SaveTheWorld/Weapons"},
+    {"kind": "folder", "path": "/SaveTheWorld/Characters"},
+    {"kind": "folder", "path": "/SaveTheWorld/Abilities"},
+    {"kind": "folder", "path": "/SaveTheWorld/Balance"},
+    {"kind": "folder", "path": "/SaveTheWorld/DataTables"}
+  ]
+}

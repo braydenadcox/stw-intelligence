@@ -170,7 +170,7 @@ class StwProviderTests(unittest.TestCase):
             finally:
                 connection.close()
 
-        self.assertEqual(7, version)
+        self.assertEqual(8, version)
         self.assertIn("mission_attempts", tables)
         self.assertIn("provider_snapshots", tables)
         self.assertIn("mission_matches", tables)

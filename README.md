@@ -71,12 +71,27 @@ python tools/stw_assets.py ingest `
 
 python tools/stw_assets.py hero "Rescue Trooper Ramirez"
 python tools/stw_assets.py unresolved
+python tools/stw_assets.py coverage
+python tools/stw_assets.py queue
+python tools/stw_assets.py queue --max-priority 0 --paths-only
 ```
 
 The checked-in Rescue Trooper golden manifest contains hashes and required follow-up
 asset paths only; it contains no Fortnite asset payloads. The focused unit-test fixture
 is synthetic and validates `AssaultDamage T01/T02` as `+17% / +33%` only when an
 AbilityKit, GameplayEffect modifier, and curve row resolve into a complete evidence chain.
+
+The Phase 2 queue is reference-driven: it deduplicates unresolved package/object paths
+that already occur in exported data and prioritizes hero perks, active abilities,
+GameplayEffects, inherited templates, curves, and custom calculations. It never creates
+a path from a filename convention. Export the listed assets beneath the same FModel
+export root and ingest that root again; the changed manifest creates a new immutable
+snapshot and the next queue follows the newly exposed references recursively.
+
+Gameplay tags, literal and curve-backed magnitudes, duration, period, application chance,
+stacking, cooldown/trigger facts, and inheritance are normalized for downstream rules.
+Custom magnitude and execution calculations remain explicitly opaque until a dedicated
+interpreter exists.
 
 ## Live local application
 

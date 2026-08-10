@@ -583,6 +583,132 @@ MIGRATIONS = [
         UNIQUE (hero_id, perk_mode)
     );
     CREATE INDEX catalog_hero_name_idx ON catalog_heroes(snapshot_id, display_name);
+    """,
+    """
+    CREATE TABLE catalog_hero_classes (
+        id INTEGER PRIMARY KEY,
+        snapshot_id INTEGER NOT NULL REFERENCES asset_snapshots(id) ON DELETE CASCADE,
+        source_object_id INTEGER NOT NULL UNIQUE REFERENCES asset_objects(id),
+        class_key TEXT NOT NULL,
+        display_name TEXT,
+        package_path TEXT NOT NULL,
+        UNIQUE (snapshot_id, class_key)
+    );
+    CREATE TABLE asset_normalization_runs (
+        id INTEGER PRIMARY KEY,
+        snapshot_id INTEGER NOT NULL REFERENCES asset_snapshots(id) ON DELETE CASCADE,
+        normalizer_version TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('running', 'ready', 'failed')),
+        error_text TEXT,
+        started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        completed_at TEXT,
+        UNIQUE (snapshot_id, normalizer_version)
+    );
+    ALTER TABLE catalog_heroes ADD COLUMN hero_class_path TEXT;
+    ALTER TABLE catalog_heroes ADD COLUMN hero_class_id INTEGER
+        REFERENCES catalog_hero_classes(id);
+
+    CREATE TABLE catalog_abilities (
+        id INTEGER PRIMARY KEY,
+        snapshot_id INTEGER NOT NULL REFERENCES asset_snapshots(id) ON DELETE CASCADE,
+        source_object_id INTEGER NOT NULL UNIQUE REFERENCES asset_objects(id),
+        ability_key TEXT NOT NULL,
+        display_name TEXT,
+        package_path TEXT NOT NULL,
+        semantic_status TEXT NOT NULL DEFAULT 'partial'
+            CHECK (semantic_status IN ('supported', 'partial', 'opaque')),
+        UNIQUE (snapshot_id, ability_key)
+    );
+    ALTER TABLE catalog_ability_kit_grants ADD COLUMN ability_id INTEGER
+        REFERENCES catalog_abilities(id);
+    ALTER TABLE catalog_perks ADD COLUMN perk_key TEXT;
+    ALTER TABLE catalog_perks ADD COLUMN identity_status TEXT NOT NULL DEFAULT 'structured_identifier'
+        CHECK (identity_status IN ('structured_identifier', 'explicit_unparsed'));
+    ALTER TABLE catalog_perks ADD COLUMN source_reference_id INTEGER
+        REFERENCES asset_references(id);
+
+    CREATE TABLE catalog_inheritance_edges (
+        id INTEGER PRIMARY KEY,
+        snapshot_id INTEGER NOT NULL REFERENCES asset_snapshots(id) ON DELETE CASCADE,
+        source_object_id INTEGER NOT NULL REFERENCES asset_objects(id) ON DELETE CASCADE,
+        source_reference_id INTEGER NOT NULL UNIQUE REFERENCES asset_references(id),
+        relation TEXT NOT NULL CHECK (relation IN ('template', 'super', 'archetype')),
+        target_path TEXT NOT NULL,
+        target_object_id INTEGER REFERENCES asset_objects(id),
+        resolution_status TEXT NOT NULL
+            CHECK (resolution_status IN ('resolved', 'unresolved', 'ambiguous'))
+    );
+
+    CREATE TABLE catalog_gameplay_tags (
+        id INTEGER PRIMARY KEY,
+        snapshot_id INTEGER NOT NULL REFERENCES asset_snapshots(id) ON DELETE CASCADE,
+        tag_name TEXT NOT NULL,
+        UNIQUE (snapshot_id, tag_name)
+    );
+    CREATE TABLE catalog_gameplay_tag_occurrences (
+        id INTEGER PRIMARY KEY,
+        tag_id INTEGER NOT NULL REFERENCES catalog_gameplay_tags(id) ON DELETE CASCADE,
+        source_object_id INTEGER NOT NULL REFERENCES asset_objects(id) ON DELETE CASCADE,
+        property_path TEXT NOT NULL,
+        semantic_role TEXT NOT NULL,
+        UNIQUE (tag_id, source_object_id, property_path, semantic_role)
+    );
+    CREATE INDEX catalog_gameplay_tag_lookup_idx
+        ON catalog_gameplay_tags(snapshot_id, tag_name);
+
+    CREATE TABLE catalog_magnitudes (
+        id INTEGER PRIMARY KEY,
+        snapshot_id INTEGER NOT NULL REFERENCES asset_snapshots(id) ON DELETE CASCADE,
+        source_object_id INTEGER NOT NULL REFERENCES asset_objects(id) ON DELETE CASCADE,
+        property_path TEXT NOT NULL,
+        purpose TEXT NOT NULL,
+        calculation_type TEXT,
+        literal_value REAL,
+        coefficient REAL,
+        pre_additive REAL,
+        post_additive REAL,
+        curve_table_path TEXT,
+        curve_row_name TEXT,
+        curve_row_id INTEGER REFERENCES catalog_curve_rows(id),
+        custom_calculation_path TEXT,
+        set_by_caller_tag TEXT,
+        interpretation_status TEXT NOT NULL
+            CHECK (interpretation_status IN ('supported', 'partial', 'opaque')),
+        shape_json TEXT NOT NULL,
+        UNIQUE (source_object_id, property_path, purpose)
+    );
+    ALTER TABLE catalog_effect_modifiers ADD COLUMN magnitude_id INTEGER
+        REFERENCES catalog_magnitudes(id);
+    ALTER TABLE catalog_effect_modifiers ADD COLUMN evaluation_channel TEXT;
+
+    CREATE TABLE catalog_mechanics (
+        id INTEGER PRIMARY KEY,
+        snapshot_id INTEGER NOT NULL REFERENCES asset_snapshots(id) ON DELETE CASCADE,
+        source_object_id INTEGER NOT NULL REFERENCES asset_objects(id) ON DELETE CASCADE,
+        owner_domain TEXT NOT NULL
+            CHECK (owner_domain IN ('gameplay_effect', 'ability', 'ability_kit', 'hero_class', 'other')),
+        owner_id INTEGER,
+        mechanic_type TEXT NOT NULL,
+        property_path TEXT NOT NULL,
+        magnitude_id INTEGER REFERENCES catalog_magnitudes(id),
+        conditions_json TEXT NOT NULL DEFAULT '{}',
+        value_json TEXT NOT NULL DEFAULT '{}',
+        interpretation_status TEXT NOT NULL
+            CHECK (interpretation_status IN ('supported', 'partial', 'opaque')),
+        UNIQUE (source_object_id, property_path, mechanic_type)
+    );
+    CREATE TABLE catalog_opaque_mechanics (
+        id INTEGER PRIMARY KEY,
+        snapshot_id INTEGER NOT NULL REFERENCES asset_snapshots(id) ON DELETE CASCADE,
+        source_object_id INTEGER NOT NULL REFERENCES asset_objects(id) ON DELETE CASCADE,
+        property_path TEXT NOT NULL,
+        mechanic_kind TEXT NOT NULL,
+        referenced_path TEXT,
+        reason TEXT NOT NULL,
+        UNIQUE (source_object_id, property_path, mechanic_kind)
+    );
+    CREATE INDEX catalog_opaque_mechanics_snapshot_idx
+        ON catalog_opaque_mechanics(snapshot_id, mechanic_kind);
     """
 ]
 

@@ -9,6 +9,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 from stw_assets import (  # noqa: E402
+    asset_export_queue,
+    catalog_coverage,
     hero_provenance,
     ingest_asset_directory,
     unresolved_reference_report,
@@ -208,7 +210,304 @@ def write_golden_slice(root: Path) -> list[Path]:
     return files
 
 
+def extend_with_phase_two_semantics(root: Path) -> list[Path]:
+    template_package = "/SaveTheWorld/GameplayEffectTemplates/Hero/GET_DamageMultiplier_Ranged_Hero"
+    class_package = "/SaveTheWorld/Abilities/Player/Perks/Class/Commando/HCGD_Commando"
+    frag_kit_package = (
+        "/SaveTheWorld/Abilities/Player/Commando/Actives/FragGrenade/Kit_Commando_FragGrenade"
+    )
+    frag_ability_package = (
+        "/SaveTheWorld/Abilities/Player/Commando/Actives/FragGrenade/GA_Commando_FragGrenade"
+    )
+    files = [
+        _write_export(
+            root,
+            "Templates/GET_DamageMultiplier_Ranged_Hero.json",
+            [
+                {
+                    "Type": "GET_DamageMultiplier_Ranged_Hero_C",
+                    "Name": "Default__GET_DamageMultiplier_Ranged_Hero_C",
+                    "Package": template_package,
+                    "Properties": {
+                        "DurationPolicy": "EGameplayEffectDurationType::Infinite",
+                        "StackingType": "EGameplayEffectStackingType::AggregateByTarget",
+                        "StackLimitCount": 1,
+                        "Modifiers": [],
+                    },
+                }
+            ],
+        ),
+        _write_export(
+            root,
+            "Classes/HCGD_Commando.json",
+            [
+                {
+                    "Type": "FortHeroClassGameplayDefinition",
+                    "Name": "HCGD_Commando",
+                    "Package": class_package,
+                    "Properties": {
+                        "DisplayName": {"SourceString": "Soldier"},
+                        "ClassTags": ["Hero.Class.Commando"],
+                    },
+                }
+            ],
+        ),
+        _write_export(
+            root,
+            "Abilities/Kit_Commando_FragGrenade.json",
+            [
+                {
+                    "Type": "FortAbilityKit",
+                    "Name": "Kit_Commando_FragGrenade",
+                    "Package": frag_kit_package,
+                    "Properties": {
+                        "GrantedAbilities": [
+                            _reference(frag_ability_package, "GA_Commando_FragGrenade_C")
+                        ]
+                    },
+                }
+            ],
+        ),
+        _write_export(
+            root,
+            "Abilities/GA_Commando_FragGrenade.json",
+            [
+                {
+                    "Type": "GA_Commando_FragGrenade_C",
+                    "Name": "Default__GA_Commando_FragGrenade_C",
+                    "Package": frag_ability_package,
+                    "Properties": {
+                        "DisplayName": {"SourceString": "Frag Grenade"},
+                        "CooldownDuration": 8.0,
+                        "AbilityTriggers": [
+                            {"TriggerTag": {"TagName": "Event.Ability.FragGrenade"}}
+                        ],
+                        "ActivationRequiredTags": ["Hero.Class.Commando"],
+                    },
+                }
+            ],
+        ),
+        _write_export(
+            root,
+            "Effects/GE_CustomProc.json",
+            [
+                {
+                    "Type": "GE_CustomProc_C",
+                    "Name": "Default__GE_CustomProc_C",
+                    "Package": "/Test/Effects/GE_CustomProc",
+                    "Properties": {
+                        "DurationPolicy": "EGameplayEffectDurationType::HasDuration",
+                        "DurationMagnitude": {"Value": 5.0, "Curve": {}},
+                        "Period": 1.0,
+                        "ChanceToApplyToTarget": 0.25,
+                        "Modifiers": [
+                            {
+                                "Attribute": {"AttributeName": "OutgoingAbilityDamage"},
+                                "ModifierOp": "EGameplayModOp::Additive",
+                                "ModifierMagnitude": {
+                                    "MagnitudeCalculationType": "EGameplayEffectMagnitudeCalculation::CustomCalculationClass",
+                                    "CustomMagnitude": {
+                                        "CalculationClassMagnitude": {
+                                            "ObjectPath": "/Test/Calculations/MMC_CustomProc.0"
+                                        }
+                                    },
+                                },
+                                "SourceTags": {
+                                    "RequireTags": ["Weapon.Ranged.Assault"],
+                                    "IgnoreTags": [],
+                                },
+                                "TargetTags": {
+                                    "RequireTags": ["Enemy.MistMonster"],
+                                    "IgnoreTags": [],
+                                },
+                            }
+                        ],
+                        "Executions": [
+                            {
+                                "CalculationClass": {
+                                    "ObjectPath": "/Test/Calculations/Exec_CustomProc.0"
+                                }
+                            }
+                        ],
+                    },
+                }
+            ],
+        ),
+        _write_export(
+            root,
+            "Effects/GE_Literal.json",
+            [
+                {
+                    "Type": "GE_Literal_C",
+                    "Name": "Default__GE_Literal_C",
+                    "Package": "/Test/Effects/GE_Literal",
+                    "Properties": {
+                        "Modifiers": [
+                            {
+                                "Attribute": {"AttributeName": "Armor"},
+                                "ModifierOp": "EGameplayModOp::Additive",
+                                "ModifierMagnitude": {
+                                    "MagnitudeCalculationType": "EGameplayEffectMagnitudeCalculation::ScalableFloat",
+                                    "ScalableFloatMagnitude": {"Value": 0.2, "Curve": {}},
+                                },
+                                "SourceTags": {"RequireTags": [], "IgnoreTags": []},
+                                "TargetTags": {"RequireTags": [], "IgnoreTags": []},
+                            }
+                        ]
+                    },
+                }
+            ],
+        ),
+        _write_export(
+            root,
+            "Abilities/Kit_StructuralTest.json",
+            [
+                {
+                    "Type": "FortAbilityKit",
+                    "Name": "Kit_StructuralTest",
+                    "Package": "/Test/Kits/Kit_StructuralTest",
+                    "Properties": {
+                        "References": [
+                            _reference(
+                                "/Test/Missing/GE_NameAloneIsNotEvidence",
+                                "GE_NameAloneIsNotEvidence_C",
+                            )
+                        ]
+                    },
+                }
+            ],
+        ),
+    ]
+    return files
+
+
 class AssetCatalogTests(unittest.TestCase):
+    def test_phase_two_normalizes_structural_semantics_and_opacity(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "exports"
+            write_golden_slice(root)
+            extend_with_phase_two_semantics(root)
+            connection = connect(Path(directory) / "catalog.sqlite3")
+            try:
+                summary = ingest_asset_directory(
+                    connection, root, build_key="phase-two-semantics"
+                )
+                hero = hero_provenance(connection, "Rescue Trooper Ramirez")
+                coverage = catalog_coverage(connection, summary["snapshot_id"])
+                tags = {
+                    (row["tag_name"], row["semantic_role"])
+                    for row in connection.execute(
+                        """
+                        SELECT gt.tag_name, occurrence.semantic_role
+                        FROM catalog_gameplay_tags gt
+                        JOIN catalog_gameplay_tag_occurrences occurrence
+                          ON occurrence.tag_id=gt.id
+                        """
+                    )
+                }
+                inheritance = connection.execute(
+                    """
+                    SELECT relation, resolution_status
+                    FROM catalog_inheritance_edges
+                    WHERE target_path LIKE '%GET_DamageMultiplier_Ranged_Hero%'
+                    """
+                ).fetchall()
+                mechanics = {
+                    row["mechanic_type"]
+                    for row in connection.execute(
+                        "SELECT mechanic_type FROM catalog_mechanics"
+                    )
+                }
+                opaque = {
+                    row["mechanic_kind"]
+                    for row in connection.execute(
+                        "SELECT mechanic_kind FROM catalog_opaque_mechanics"
+                    )
+                }
+                literal = connection.execute(
+                    """
+                    SELECT m.literal_value, m.interpretation_status
+                    FROM catalog_magnitudes m
+                    JOIN asset_objects ao ON ao.id=m.source_object_id
+                    WHERE ao.package_path='/Test/Effects/GE_Literal'
+                    """
+                ).fetchone()
+                name_only_grant = connection.execute(
+                    """
+                    SELECT grant_kind, gameplay_effect_id, ability_id
+                    FROM catalog_ability_kit_grants grant_row
+                    JOIN catalog_ability_kits kit ON kit.id=grant_row.ability_kit_id
+                    WHERE kit.kit_name='Kit_StructuralTest'
+                    """
+                ).fetchone()
+            finally:
+                connection.close()
+
+        assert hero is not None
+        self.assertEqual("resolved", hero["hero"]["class_status"])
+        self.assertEqual("resolved", hero["abilities"][0]["status"])
+        self.assertGreaterEqual(coverage["counts"]["hero_classes"], 1)
+        self.assertGreaterEqual(coverage["counts"]["abilities"], 1)
+        self.assertGreaterEqual(coverage["counts"]["gameplay_tags"], 4)
+        self.assertIn(("Weapon.Ranged.Assault", "source_required"), tags)
+        self.assertIn(("Enemy.MistMonster", "target_required"), tags)
+        self.assertTrue(any(row["resolution_status"] == "resolved" for row in inheritance))
+        self.assertTrue(
+            {
+                "duration",
+                "period",
+                "application_chance",
+                "execution",
+                "cooldown",
+                "trigger",
+                "stacking",
+            }
+            <= mechanics
+        )
+        self.assertIn("custom_magnitude", opaque)
+        self.assertIn("execution_calculation", opaque)
+        self.assertEqual(0.2, literal["literal_value"])
+        self.assertEqual("supported", literal["interpretation_status"])
+        self.assertEqual("reference", name_only_grant["grant_kind"])
+        self.assertIsNone(name_only_grant["gameplay_effect_id"])
+        self.assertIsNone(name_only_grant["ability_id"])
+
+    def test_export_queue_is_exact_deduplicated_and_does_not_invent_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "exports"
+            source_files = write_golden_slice(root)
+            for path in source_files:
+                if path.name.startswith("Kit_Perk_H_AssaultDamage_"):
+                    path.unlink()
+                if path.name == "GE_Perk_H_AssaultDamage_DamageBuff_T02.json":
+                    path.unlink()
+            connection = connect(Path(directory) / "catalog.sqlite3")
+            try:
+                summary = ingest_asset_directory(
+                    connection, root, build_key="queue-test"
+                )
+                queue = asset_export_queue(connection, summary["snapshot_id"])
+            finally:
+                connection.close()
+
+        packages = [asset["package_path"] for asset in queue["assets"]]
+        self.assertEqual(len(packages), len(set(packages)))
+        self.assertIn(
+            "/SaveTheWorld/Abilities/Player/Perks/Hero/AssaultDamage/Kit_Perk_H_AssaultDamage_T01",
+            packages,
+        )
+        self.assertIn(
+            "/SaveTheWorld/Abilities/Player/Perks/Hero/AssaultDamage/Kit_Perk_H_AssaultDamage_T02",
+            packages,
+        )
+        self.assertIn(
+            "/SaveTheWorld/GameplayEffectTemplates/Hero/GET_DamageMultiplier_Ranged_Hero",
+            packages,
+        )
+        self.assertFalse(any("DamageBuff_T02" in package for package in packages))
+        self.assertTrue(all(asset["priority"] <= 2 for asset in queue["assets"]))
+        self.assertIn("never synthesized", queue["selection_rule"])
+
     def test_rescue_trooper_chain_is_normalized_with_provenance(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "exports"
@@ -280,6 +579,7 @@ class AssetCatalogTests(unittest.TestCase):
                         "asset_files",
                         "asset_objects",
                         "asset_references",
+                        "asset_normalization_runs",
                         "catalog_heroes",
                         "catalog_perks",
                         "catalog_effect_modifiers",
@@ -305,6 +605,47 @@ class AssetCatalogTests(unittest.TestCase):
         self.assertEqual(before, after)
         self.assertEqual("37.00", build["game_version"])
         self.assertEqual("123456", build["changelist"])
+        self.assertEqual("phase2-v1", second["normalization"]["normalizer_version"])
+
+    def test_existing_raw_snapshot_is_rederived_for_a_new_normalizer(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "exports"
+            write_golden_slice(root)
+            connection = connect(Path(directory) / "catalog.sqlite3")
+            try:
+                first = ingest_asset_directory(
+                    connection, root, build_key="normalizer-upgrade-test"
+                )
+                with connection:
+                    connection.execute(
+                        "DELETE FROM asset_normalization_runs WHERE snapshot_id=?",
+                        (first["snapshot_id"],),
+                    )
+                    connection.execute(
+                        "DELETE FROM catalog_gameplay_tags WHERE snapshot_id=?",
+                        (first["snapshot_id"],),
+                    )
+                second = ingest_asset_directory(
+                    connection, root, build_key="normalizer-upgrade-test"
+                )
+                tag_count = connection.execute(
+                    "SELECT COUNT(*) FROM catalog_gameplay_tags WHERE snapshot_id=?",
+                    (first["snapshot_id"],),
+                ).fetchone()[0]
+                runs = connection.execute(
+                    """
+                    SELECT normalizer_version, status FROM asset_normalization_runs
+                    WHERE snapshot_id=?
+                    """,
+                    (first["snapshot_id"],),
+                ).fetchall()
+            finally:
+                connection.close()
+
+        self.assertEqual(first["snapshot_id"], second["snapshot_id"])
+        self.assertFalse(second["idempotent"])
+        self.assertGreater(tag_count, 0)
+        self.assertEqual([("phase2-v1", "ready")], [tuple(row) for row in runs])
 
     def test_unresolved_references_are_reported_without_inference(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -337,6 +678,16 @@ class AssetCatalogTests(unittest.TestCase):
             try:
                 ingest_asset_directory(connection, root, build_key="incomplete-test")
                 hero = hero_provenance(connection, "Rescue Trooper Ramirez")
+                raw_rows = {
+                    row["row_name"]: row["output_value"]
+                    for row in connection.execute(
+                        """
+                        SELECT cr.row_name, cp.output_value
+                        FROM catalog_curve_rows cr
+                        JOIN catalog_curve_points cp ON cp.curve_row_id=cr.id
+                        """
+                    )
+                }
             finally:
                 connection.close()
 
@@ -346,9 +697,10 @@ class AssetCatalogTests(unittest.TestCase):
         self.assertEqual("unresolved_ability_kit", by_mode["commander"]["status"])
         self.assertEqual([], by_mode["support"]["effects"])
         self.assertEqual([], by_mode["commander"]["effects"])
-        self.assertEqual(1.17, by_mode["support"]["unlinked_balance_evidence"]["value"])
-        self.assertEqual(1.33, by_mode["commander"]["unlinked_balance_evidence"]["value"])
-        self.assertIn("not interpreted", by_mode["commander"]["unlinked_balance_evidence"]["note"])
+        self.assertNotIn("unlinked_balance_evidence", by_mode["support"])
+        self.assertNotIn("unlinked_balance_evidence", by_mode["commander"])
+        self.assertEqual(1.17, raw_rows["Perk.AssaultDamage.T01.DamageMult"])
+        self.assertEqual(1.33, raw_rows["Perk.AssaultDamage.T02.DamageMult"])
 
 
 if __name__ == "__main__":

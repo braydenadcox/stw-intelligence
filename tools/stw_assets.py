@@ -18,7 +18,7 @@ from stw_pipeline import connect
 
 
 PERK_KIT_RE = re.compile(r"^Kit_Perk_H_(?P<family>.+)_(?P<tier>T\d+)$")
-NORMALIZER_VERSION = "phase2-v15"
+NORMALIZER_VERSION = "interaction-v3"
 ROSTER_PLAN_VERSION = "phase2-roster-v1"
 
 RUNTIME_DATA_ROW_STRUCTS = {
@@ -434,6 +434,8 @@ def _clear_normalized_snapshot(
         "(SELECT id FROM catalog_gameplay_effects WHERE snapshot_id=?)",
         "DELETE FROM catalog_gameplay_tag_occurrences WHERE tag_id IN "
         "(SELECT id FROM catalog_gameplay_tags WHERE snapshot_id=?)",
+        "DELETE FROM catalog_team_perk_eligibility_rules WHERE team_perk_id IN "
+        "(SELECT id FROM catalog_team_perks WHERE snapshot_id=?)",
     )
     for statement in leaf_deletes:
         connection.execute(statement, (snapshot_id,))
@@ -448,6 +450,7 @@ def _clear_normalized_snapshot(
         "catalog_hero_class_kits",
         "catalog_ability_links",
         "catalog_gameplay_tags",
+        "catalog_team_perks",
         "catalog_heroes",
         "catalog_perks",
         "catalog_ability_kits",
@@ -562,6 +565,7 @@ def _normalize_snapshot(
         ("hero classes", _normalize_hero_classes, (connection, snapshot_id, payloads)),
         ("effects", _normalize_effects, (connection, snapshot_id, payloads)),
         ("ability kits", _normalize_ability_kits, (connection, snapshot_id, payloads)),
+        ("team perks", _normalize_team_perks, (connection, snapshot_id, payloads)),
         ("hero class kits", _normalize_hero_class_kits, (connection, snapshot_id)),
         ("heroes", _normalize_heroes, (connection, snapshot_id, payloads)),
         ("weapons", _normalize_weapon_catalog, (connection, snapshot_id, payloads)),
@@ -1120,7 +1124,16 @@ def _normalize_effect_mechanics(
             value=None if magnitude_id is not None else {"raw": properties[key]},
             status="supported" if magnitude_id is not None else "partial",
         )
-    if "StackingType" in properties or "StackLimitCount" in properties:
+    stacking_keys = (
+        "StackingType",
+        "StackLimitCount",
+        "StackDurationRefreshPolicy",
+        "StackPeriodResetPolicy",
+        "StackExpirationPolicy",
+        "bDenyOverflowApplication",
+        "bClearStackOnOverflow",
+    )
+    if any(key in properties for key in stacking_keys):
         _insert_mechanic(
             connection,
             snapshot_id,
@@ -1129,10 +1142,7 @@ def _normalize_effect_mechanics(
             effect_id,
             "stacking",
             "$.Properties.Stacking",
-            value={
-                "type": properties.get("StackingType"),
-                "limit": properties.get("StackLimitCount"),
-            },
+            value={key: properties.get(key) for key in stacking_keys if key in properties},
         )
     for key in (
         "ApplicationTagRequirements",
@@ -1357,12 +1367,19 @@ def _normalize_ability_kits(
                 kind = "ability"
             else:
                 kind = "reference"
+            if "removedgameplayeffects" in path_lower:
+                grant_operation = "removed"
+            elif structural_effect or structural_ability:
+                grant_operation = "granted"
+            else:
+                grant_operation = "reference"
             connection.execute(
                 """
                 INSERT INTO catalog_ability_kit_grants(
                     ability_kit_id, source_reference_id, grant_kind,
-                    target_path, gameplay_effect_id, ability_id, grant_level
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    target_path, gameplay_effect_id, ability_id, grant_level,
+                    grant_operation
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     kit_id,
@@ -1372,9 +1389,279 @@ def _normalize_ability_kits(
                     gameplay_effect_id,
                     ability_id,
                     _ability_kit_grant_level(export, reference["property_path"]),
+                    grant_operation,
                 ),
             )
     _normalize_linked_abilities(connection, snapshot_id, payloads)
+
+
+def _localized_property_for_reference(
+    connection: sqlite3.Connection,
+    snapshot_id: int,
+    payloads: dict[int, dict[str, Any]],
+    source_object_id: int,
+    property_fragment: str,
+    property_name: str,
+) -> str | None:
+    references = connection.execute(
+        """
+        SELECT DISTINCT target_package_path FROM asset_references
+        WHERE source_object_id=? AND lower(property_path) LIKE ?
+        ORDER BY target_package_path
+        """,
+        (source_object_id, f"%{property_fragment.casefold()}%"),
+    ).fetchall()
+    values: list[str] = []
+    for reference in references:
+        object_rows = connection.execute(
+            """
+            SELECT id FROM asset_objects
+            WHERE snapshot_id=? AND package_path=? ORDER BY export_index
+            """,
+            (snapshot_id, reference["target_package_path"]),
+        ).fetchall()
+        for object_row in object_rows:
+            properties = payloads.get(object_row["id"], {}).get("Properties") or {}
+            value = _localized_text(properties.get(property_name))
+            if value:
+                values.append(value)
+    return values[0] if len(set(values)) == 1 else None
+
+
+def _team_perk_query_semantics(query: Any) -> tuple[list[str], str | None, str]:
+    if not isinstance(query, dict):
+        return [], None, "opaque"
+    tags = sorted(
+        {
+            item.get("TagName")
+            for item in query.get("TagDictionary") or []
+            if isinstance(item, dict) and isinstance(item.get("TagName"), str)
+        },
+        key=str.casefold,
+    )
+    expression = str(query.get("AutoDescription") or "").strip() or None
+    token_stream = query.get("QueryTokenStream") or []
+    if not tags and not token_stream:
+        return [], expression, "supported"
+    if expression and expression.startswith("ALL(") and expression.endswith(")"):
+        if all(tag in expression for tag in tags):
+            return tags, expression, "supported"
+    return [], expression, "partial"
+
+
+def _team_perk_semantic_status(
+    connection: sqlite3.Connection, ability_kit_id: int | None
+) -> str:
+    if ability_kit_id is None:
+        return "opaque"
+    grants = connection.execute(
+        """
+        SELECT grant_kind, gameplay_effect_id, ability_id
+        FROM catalog_ability_kit_grants WHERE ability_kit_id=?
+        """,
+        (ability_kit_id,),
+    ).fetchall()
+    if not grants:
+        return "opaque"
+    supported_facts = 0
+    incomplete = False
+    opaque = False
+    for grant in grants:
+        if grant["grant_kind"] == "gameplay_effect":
+            if grant["gameplay_effect_id"] is None:
+                incomplete = True
+                continue
+            modifier_counts = connection.execute(
+                """
+                SELECT
+                  SUM(CASE WHEN modifier.interpretation_status='supported'
+                                AND magnitude.interpretation_status='supported'
+                           THEN 1 ELSE 0 END),
+                  SUM(CASE WHEN modifier.interpretation_status!='supported'
+                                OR magnitude.interpretation_status!='supported'
+                           THEN 1 ELSE 0 END)
+                FROM catalog_effect_modifiers modifier
+                LEFT JOIN catalog_magnitudes magnitude ON magnitude.id=modifier.magnitude_id
+                WHERE modifier.gameplay_effect_id=?
+                """,
+                (grant["gameplay_effect_id"],),
+            ).fetchone()
+            supported_facts += int(modifier_counts[0] or 0)
+            incomplete = incomplete or bool(modifier_counts[1])
+            effect_object_id = connection.execute(
+                "SELECT source_object_id FROM catalog_gameplay_effects WHERE id=?",
+                (grant["gameplay_effect_id"],),
+            ).fetchone()[0]
+            mechanic_counts = connection.execute(
+                """
+                SELECT
+                  SUM(CASE WHEN mechanic.interpretation_status='supported'
+                                AND (magnitude.interpretation_status IS NULL
+                                     OR magnitude.interpretation_status='supported')
+                           THEN 1 ELSE 0 END),
+                  SUM(CASE WHEN mechanic.interpretation_status!='supported'
+                                OR magnitude.interpretation_status IN ('partial', 'opaque')
+                           THEN 1 ELSE 0 END)
+                FROM catalog_mechanics mechanic
+                LEFT JOIN catalog_magnitudes magnitude ON magnitude.id=mechanic.magnitude_id
+                WHERE mechanic.source_object_id=?
+                """,
+                (effect_object_id,),
+            ).fetchone()
+            supported_facts += int(mechanic_counts[0] or 0)
+            incomplete = incomplete or bool(mechanic_counts[1])
+            opaque = opaque or bool(
+                connection.execute(
+                    "SELECT 1 FROM catalog_opaque_mechanics WHERE source_object_id=? LIMIT 1",
+                    (effect_object_id,),
+                ).fetchone()
+            )
+        elif grant["grant_kind"] == "ability":
+            if grant["ability_id"] is None:
+                incomplete = True
+                continue
+            ability = connection.execute(
+                "SELECT semantic_status FROM catalog_abilities WHERE id=?",
+                (grant["ability_id"],),
+            ).fetchone()
+            if ability and ability["semantic_status"] == "opaque":
+                opaque = True
+            else:
+                incomplete = True
+            mechanic_counts = connection.execute(
+                """
+                SELECT
+                  SUM(CASE WHEN interpretation_status='supported' THEN 1 ELSE 0 END),
+                  SUM(CASE WHEN interpretation_status='opaque' THEN 1 ELSE 0 END)
+                FROM catalog_mechanics
+                WHERE owner_domain='ability' AND owner_id=?
+                """,
+                (grant["ability_id"],),
+            ).fetchone()
+            supported_facts += int(mechanic_counts[0] or 0)
+            opaque = opaque or bool(mechanic_counts[1])
+    if supported_facts == 0 and opaque:
+        return "opaque"
+    if incomplete or opaque:
+        return "partial" if supported_facts else "opaque"
+    return "supported" if supported_facts else "partial"
+
+
+def _normalize_team_perks(
+    connection: sqlite3.Connection,
+    snapshot_id: int,
+    payloads: dict[int, dict[str, Any]],
+) -> None:
+    for object_id, export in payloads.items():
+        if export.get("Type") != "FortTeamPerkItemDefinition":
+            continue
+        properties = export.get("Properties") or {}
+        object_row = connection.execute(
+            "SELECT package_path, object_name FROM asset_objects WHERE id=?",
+            (object_id,),
+        ).fetchone()
+        kit_path = _object_path(properties.get("GrantedAbilityKit"))
+        kit_id = _kit_id_for_path(connection, snapshot_id, kit_path) if kit_path else None
+        kit_source_object_id = None
+        if kit_id is not None:
+            kit_source_object_id = connection.execute(
+                "SELECT source_object_id FROM catalog_ability_kits WHERE id=?", (kit_id,)
+            ).fetchone()[0]
+        traits = sorted(
+            {
+                trait
+                for entry in properties.get("DataList") or []
+                if isinstance(entry, dict)
+                for trait in entry.get("Traits") or []
+                if isinstance(trait, str)
+            },
+            key=str.casefold,
+        )
+        rules = properties.get("TeamPerkLoadoutConditions") or []
+        parsed_rules = [_team_perk_query_semantics(rule.get("RequiredTagQuery"))
+                        for rule in rules if isinstance(rule, dict)]
+        eligibility_status = (
+            "supported"
+            if rules and len(parsed_rules) == len(rules)
+            and all(status == "supported" for _, _, status in parsed_rules)
+            else "partial" if rules else "opaque"
+        )
+        perk_id = connection.execute(
+            """
+            INSERT INTO catalog_team_perks(
+                snapshot_id, source_object_id, team_perk_key, package_path,
+                display_name, item_description, effect_description,
+                requirement_description, ability_kit_path, ability_kit_id,
+                progressive_bonus, traits_json, eligibility_status, semantic_status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                snapshot_id,
+                object_id,
+                object_row["object_name"],
+                object_row["package_path"],
+                _localized_text(properties.get("ItemName")) or object_row["object_name"],
+                _localized_text(properties.get("ItemDescription")),
+                _localized_property_for_reference(
+                    connection, snapshot_id, payloads, kit_source_object_id,
+                    ".tooltip.", "Description"
+                ) if kit_source_object_id is not None else None,
+                _localized_property_for_reference(
+                    connection, snapshot_id, payloads, object_id,
+                    "tooltipclass", "Description"
+                ),
+                kit_path,
+                kit_id,
+                int(bool(properties.get("bProgressiveBonus"))),
+                json.dumps(traits, separators=(",", ":")),
+                eligibility_status,
+                _team_perk_semantic_status(connection, kit_id),
+            ),
+        ).lastrowid
+        for ordinal, rule in enumerate(rules):
+            if not isinstance(rule, dict):
+                continue
+            required_tags, expression, rule_status = _team_perk_query_semantics(
+                rule.get("RequiredTagQuery")
+            )
+            class_tags = [tag for tag in required_tags if tag.startswith("Class.")]
+            keyword_tags = [tag for tag in required_tags if tag.startswith("Keyword.")]
+            required_count = rule.get("NumTimesSatisfiable")
+            if not isinstance(required_count, int) or required_count < 1:
+                rule_status = "partial"
+                required_count = 0
+            connection.execute(
+                """
+                INSERT INTO catalog_team_perk_eligibility_rules(
+                    team_perk_id, rule_ordinal, required_count, query_expression,
+                    tag_query_json, required_tags_json, required_class_tags_json,
+                    required_keyword_tags_json, consider_minimum_tier,
+                    consider_maximum_tier, consider_minimum_level,
+                    consider_maximum_level, consider_minimum_rarity,
+                    consider_maximum_rarity, minimum_hero_tier, maximum_hero_tier,
+                    minimum_hero_level, maximum_hero_level, minimum_hero_rarity,
+                    maximum_hero_rarity, interpretation_status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    perk_id, ordinal, required_count, expression,
+                    json.dumps(_compact_value(rule.get("RequiredTagQuery") or {}),
+                               sort_keys=True, separators=(",", ":")),
+                    json.dumps(required_tags, separators=(",", ":")),
+                    json.dumps(class_tags, separators=(",", ":")),
+                    json.dumps(keyword_tags, separators=(",", ":")),
+                    int(bool(rule.get("bConsiderMinimumTier"))),
+                    int(bool(rule.get("bConsiderMaximumTier"))),
+                    int(bool(rule.get("bConsiderMinimumLevel"))),
+                    int(bool(rule.get("bConsiderMaximumLevel"))),
+                    int(bool(rule.get("bConsiderMinimumRarity"))),
+                    int(bool(rule.get("bConsiderMaximumRarity"))),
+                    rule.get("MinimumHeroTier"), rule.get("MaximumHeroTier"),
+                    rule.get("MinimumHeroLevel"), rule.get("MaximumHeroLevel"),
+                    rule.get("MinimumHeroRarity"), rule.get("MaximumHeroRarity"),
+                    rule_status,
+                ),
+            )
 
 
 def _normalize_linked_abilities(
@@ -1586,6 +1873,21 @@ def _ensure_ability(
     _normalize_ability_mechanics(
         connection, snapshot_id, source_object_id, ability_id, properties
     )
+    object_type = str(export.get("Type") or "")
+    class_name = str(export.get("Class") or "")
+    if object_type.endswith("_C") or "BlueprintGeneratedClass" in class_name:
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO catalog_opaque_mechanics(
+                snapshot_id, source_object_id, property_path, mechanic_kind, reason
+            ) VALUES (?, ?, '$.BlueprintGraph', 'blueprint_execution', ?)
+            """,
+            (
+                snapshot_id,
+                source_object_id,
+                "structural defaults and event registrations are preserved, but the compiled Blueprint execution graph is not statically executed",
+            ),
+        )
     return ability_id
 
 
@@ -1656,16 +1958,16 @@ def _normalize_ability_mechanics(
                 value=cost,
                 status="supported" if magnitude_id is not None else "partial",
             )
-    for key, mechanic_type in (
-        ("CooldownGameplayEffectClass", "cooldown_effect"),
-        ("CostGameplayEffectClass", "cost_effect"),
-        ("AbilityTriggers", "trigger"),
-        ("ActivationRequiredTags", "activation_condition"),
-        ("ActivationBlockedTags", "activation_condition"),
-        ("AbilityTags", "ability_tags"),
-        ("ActivationOwnedTags", "owned_tags"),
-        ("DamageStatHandle", "damage_stat_row"),
-        ("EffectContainers", "effect_container"),
+    for key, mechanic_type, mechanic_status in (
+        ("CooldownGameplayEffectClass", "cooldown_effect", "partial"),
+        ("CostGameplayEffectClass", "cost_effect", "partial"),
+        ("AbilityTriggers", "trigger", "supported"),
+        ("ActivationRequiredTags", "activation_condition", "supported"),
+        ("ActivationBlockedTags", "activation_condition", "supported"),
+        ("AbilityTags", "ability_tags", "supported"),
+        ("ActivationOwnedTags", "owned_tags", "supported"),
+        ("DamageStatHandle", "damage_stat_row", "partial"),
+        ("EffectContainers", "effect_container", "partial"),
     ):
         if key not in properties:
             continue
@@ -1681,7 +1983,7 @@ def _normalize_ability_mechanics(
             f"$.Properties.{key}",
             conditions=properties[key] if "Tags" in key else None,
             value=properties[key] if "Tags" not in key else None,
-            status="partial",
+            status=mechanic_status,
         )
 
     # Hero perks commonly grant a GameplayAbility whose Blueprint defaults hold
@@ -4740,6 +5042,15 @@ def catalog_coverage(
             WHERE snapshot_id=? AND ability_kit_id IS NOT NULL
         """,
         "abilities": "SELECT COUNT(*) FROM catalog_abilities WHERE snapshot_id=?",
+        "team_perks": "SELECT COUNT(*) FROM catalog_team_perks WHERE snapshot_id=?",
+        "team_perks_with_resolved_kits": """
+            SELECT COUNT(*) FROM catalog_team_perks
+            WHERE snapshot_id=? AND ability_kit_id IS NOT NULL
+        """,
+        "team_perks_with_supported_eligibility": """
+            SELECT COUNT(*) FROM catalog_team_perks
+            WHERE snapshot_id=? AND eligibility_status='supported'
+        """,
         "perks": "SELECT COUNT(*) FROM catalog_perks WHERE snapshot_id=?",
         "perk_families": """
             SELECT COUNT(DISTINCT perk_family) FROM catalog_perks WHERE snapshot_id=?
@@ -4959,6 +5270,7 @@ def _snapshot_summary(
             "catalog_hero_class_kits",
             "catalog_data_tables",
             "catalog_gameplay_tags",
+            "catalog_team_perks",
             "catalog_magnitudes",
             "catalog_mechanics",
             "catalog_opaque_mechanics",

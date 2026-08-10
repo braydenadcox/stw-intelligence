@@ -985,6 +985,64 @@ MIGRATIONS = [
     """,
     """
     ALTER TABLE catalog_ability_kit_grants ADD COLUMN grant_level REAL;
+    """,
+    """
+    ALTER TABLE catalog_ability_kit_grants ADD COLUMN grant_operation TEXT NOT NULL
+        DEFAULT 'reference'
+        CHECK (grant_operation IN ('granted', 'removed', 'reference'));
+    CREATE TABLE catalog_team_perks (
+        id INTEGER PRIMARY KEY,
+        snapshot_id INTEGER NOT NULL REFERENCES asset_snapshots(id) ON DELETE CASCADE,
+        source_object_id INTEGER NOT NULL UNIQUE REFERENCES asset_objects(id),
+        team_perk_key TEXT NOT NULL,
+        package_path TEXT NOT NULL,
+        display_name TEXT NOT NULL,
+        item_description TEXT,
+        effect_description TEXT,
+        requirement_description TEXT,
+        ability_kit_path TEXT,
+        ability_kit_id INTEGER REFERENCES catalog_ability_kits(id),
+        progressive_bonus INTEGER NOT NULL DEFAULT 0,
+        traits_json TEXT NOT NULL DEFAULT '[]',
+        eligibility_status TEXT NOT NULL
+            CHECK (eligibility_status IN ('supported', 'partial', 'opaque')),
+        semantic_status TEXT NOT NULL
+            CHECK (semantic_status IN ('supported', 'partial', 'opaque')),
+        UNIQUE (snapshot_id, team_perk_key)
+    );
+    CREATE TABLE catalog_team_perk_eligibility_rules (
+        id INTEGER PRIMARY KEY,
+        team_perk_id INTEGER NOT NULL
+            REFERENCES catalog_team_perks(id) ON DELETE CASCADE,
+        rule_ordinal INTEGER NOT NULL,
+        required_count INTEGER NOT NULL,
+        query_expression TEXT,
+        tag_query_json TEXT NOT NULL,
+        required_tags_json TEXT NOT NULL DEFAULT '[]',
+        required_class_tags_json TEXT NOT NULL DEFAULT '[]',
+        required_keyword_tags_json TEXT NOT NULL DEFAULT '[]',
+        consider_minimum_tier INTEGER NOT NULL,
+        consider_maximum_tier INTEGER NOT NULL,
+        consider_minimum_level INTEGER NOT NULL,
+        consider_maximum_level INTEGER NOT NULL,
+        consider_minimum_rarity INTEGER NOT NULL,
+        consider_maximum_rarity INTEGER NOT NULL,
+        minimum_hero_tier TEXT,
+        maximum_hero_tier TEXT,
+        minimum_hero_level INTEGER,
+        maximum_hero_level INTEGER,
+        minimum_hero_rarity TEXT,
+        maximum_hero_rarity TEXT,
+        interpretation_status TEXT NOT NULL
+            CHECK (interpretation_status IN ('supported', 'partial', 'opaque')),
+        UNIQUE (team_perk_id, rule_ordinal)
+    );
+    CREATE INDEX catalog_team_perks_snapshot_idx
+        ON catalog_team_perks(snapshot_id, display_name);
+    CREATE INDEX catalog_team_perks_ability_kit_idx
+        ON catalog_team_perks(ability_kit_id);
+    CREATE INDEX catalog_team_perk_rules_perk_idx
+        ON catalog_team_perk_eligibility_rules(team_perk_id);
     """
 ]
 

@@ -176,6 +176,18 @@ See [shared runtime combat semantics](docs/shared-runtime-combat-semantics.md) f
 proven CritRating/item-rating/difficulty lookups, Nocturno signature classification, and
 the formulas that remain inside native Fortnite code.
 
+Team perks use the same normalized reference and mechanic graph as hero and weapon perks:
+
+```powershell
+python tools/stw_interactions.py --db data/phase2-real-validation.sqlite3 team-perks
+python tools/stw_interactions.py --db data/phase2-real-validation.sqlite3 team-perk "Blast from the Past"
+```
+
+Eligibility composition, gameplay events, effects, durations, periods, stacking, cooldowns,
+set-by-caller values, conditions, executions, and explicit Blueprint opacity are retained;
+partial or opaque team perks are never treated as zero-value mechanics. See
+[team-perk interaction semantics](docs/team-perk-interaction-semantics.md) for details.
+
 ## Live local application
 
 On Windows, the default command watches Fortnite's standard log location, loads the

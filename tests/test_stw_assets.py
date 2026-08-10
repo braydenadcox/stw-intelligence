@@ -1785,7 +1785,7 @@ class AssetCatalogTests(unittest.TestCase):
         self.assertEqual(before, after)
         self.assertEqual("37.00", build["game_version"])
         self.assertEqual("123456", build["changelist"])
-        self.assertEqual("phase2-v15", second["normalization"]["normalizer_version"])
+        self.assertEqual("interaction-v3", second["normalization"]["normalizer_version"])
 
     def test_ingestion_preserves_duplicate_object_names_within_a_package(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1867,7 +1867,7 @@ class AssetCatalogTests(unittest.TestCase):
         self.assertEqual(first["snapshot_id"], second["snapshot_id"])
         self.assertFalse(second["idempotent"])
         self.assertGreater(tag_count, 0)
-        self.assertEqual([("phase2-v15", "ready")], [tuple(row) for row in runs])
+        self.assertEqual([("interaction-v3", "ready")], [tuple(row) for row in runs])
 
     def test_unresolved_references_are_reported_without_inference(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

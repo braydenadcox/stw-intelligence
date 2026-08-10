@@ -17,6 +17,21 @@ from stw_pipeline import connect
 
 PERK_KIT_RE = re.compile(r"^Kit_Perk_H_(?P<family>.+)_(?P<tier>T\d+)$")
 NORMALIZER_VERSION = "phase2-v11"
+ROSTER_PLAN_VERSION = "phase2-roster-v1"
+
+STW_HERO_CLASSES = ("Commando", "Constructor", "Ninja", "Outlander")
+SEMANTIC_DEPENDENCY_CATEGORIES = {
+    "hero_perk_kit",
+    "granted_gameplay_effect",
+    "referenced_gameplay_effect",
+    "referenced_ability_logic",
+    "active_ability_logic",
+    "inheritance",
+    "balance_curve",
+    "custom_calculation",
+    "granted_ability",
+    "ability_mechanic",
+}
 
 
 @dataclass(frozen=True)
@@ -249,7 +264,15 @@ def ingest_asset_directory(
                     package = canonical_package_path(export.get("Package")) or fallback_package
                     name = str(export.get("Name") or f"export_{export_index}")
                     object_type = str(export.get("Type") or "Unknown")
-                    object_key = f"{package or source.relative_path}::{name}"
+                    # Unreal packages may legitimately contain repeated object names
+                    # (particle distributions are a common example).  Preserve every
+                    # export by its immutable file position; name/package remain query
+                    # attributes and reference resolution stays conservative when a
+                    # textual selector matches more than one object.
+                    object_key = (
+                        f"{package or ''}::{name}::"
+                        f"{source.relative_path}::{export_index}"
+                    )
                     object_id = connection.execute(
                         """
                         INSERT INTO asset_objects(
@@ -2756,9 +2779,7 @@ def _queue_classification(
         )
     if ".template." in path or ".super." in path or ".archetype." in path:
         return 0, "inheritance", "closes inherited/shared gameplay semantics"
-    if "curvetable" in path and (
-        "modifier" in path or "magnitude" in path or "duration" in path
-    ):
+    if "curvetable" in path:
         return 0, "balance_curve", "resolves a mechanic's exact numerical magnitude"
     if "calculationclass" in path or "execution" in path:
         return 0, "custom_calculation", "identifies currently opaque custom behavior"
@@ -2863,6 +2884,811 @@ def asset_export_queue(
         ),
         "counts": counts,
         "assets": assets,
+    }
+
+
+def _semantic_graph_index(
+    connection: sqlite3.Connection, snapshot_id: int
+) -> tuple[dict[int, list[sqlite3.Row]], dict[str, list[int]]]:
+    references: dict[int, list[sqlite3.Row]] = {}
+    for row in connection.execute(
+        """
+        SELECT reference.source_object_id, reference.resolution_status,
+               reference.property_path, reference.target_path,
+               reference.target_package_path, reference.target_object_id,
+               source.package_path AS source_package,
+               source.object_type AS source_type
+        FROM asset_references reference
+        JOIN asset_objects source ON source.id=reference.source_object_id
+        WHERE reference.snapshot_id=? ORDER BY reference.id
+        """,
+        (snapshot_id,),
+    ):
+        references.setdefault(row["source_object_id"], []).append(row)
+    package_objects: dict[str, list[int]] = {}
+    for row in connection.execute(
+        """
+        SELECT id, package_path FROM asset_objects
+        WHERE snapshot_id=? AND package_path IS NOT NULL
+        ORDER BY package_path, export_index
+        """,
+        (snapshot_id,),
+    ):
+        package_objects.setdefault(row["package_path"], []).append(row["id"])
+    return references, package_objects
+
+
+def _semantic_perk_closure(
+    connection: sqlite3.Connection,
+    snapshot_id: int,
+    perk_family: str,
+    *,
+    reference_index: dict[int, list[sqlite3.Row]] | None = None,
+    package_object_index: dict[str, list[int]] | None = None,
+) -> tuple[set[int], list[dict[str, Any]], list[sqlite3.Row]]:
+    perks = connection.execute(
+        """
+        SELECT perk.*, kit.source_object_id AS kit_source_object_id,
+               reference.resolution_status AS kit_resolution_status,
+               reference.target_path AS kit_target_path,
+               reference.target_package_path AS kit_target_package,
+               source.package_path AS kit_source_package,
+               source.object_type AS kit_source_type,
+               reference.property_path AS kit_property_path
+        FROM catalog_perks perk
+        LEFT JOIN catalog_ability_kits kit ON kit.id=perk.ability_kit_id
+        LEFT JOIN asset_references reference ON reference.id=perk.source_reference_id
+        LEFT JOIN asset_objects source ON source.id=reference.source_object_id
+        WHERE perk.snapshot_id=? AND perk.perk_family=?
+        ORDER BY perk.perk_tier
+        """,
+        (snapshot_id, perk_family),
+    ).fetchall()
+    closure = {
+        row["kit_source_object_id"]
+        for row in perks
+        if row["kit_source_object_id"] is not None
+    }
+    unresolved: dict[str, dict[str, Any]] = {}
+
+    def record_dependency(
+        *,
+        target_package: str,
+        target_path: str,
+        property_path: str,
+        source_package: str | None,
+        source_type: str,
+        resolution_status: str,
+    ) -> None:
+        priority, category, reason = _queue_classification(
+            source_type, property_path, target_package
+        )
+        if priority == 99 or category not in SEMANTIC_DEPENDENCY_CATEGORIES:
+            return
+        entry = unresolved.setdefault(
+            target_package,
+            {
+                "package_path": target_package,
+                "priority": priority,
+                "categories": set(),
+                "reasons": set(),
+                "target_paths": set(),
+                "source_packages": set(),
+                "resolution_statuses": set(),
+                "reference_count": 0,
+            },
+        )
+        entry["priority"] = min(entry["priority"], priority)
+        entry["categories"].add(category)
+        entry["reasons"].add(reason)
+        entry["target_paths"].add(target_path)
+        if source_package:
+            entry["source_packages"].add(source_package)
+        entry["resolution_statuses"].add(resolution_status)
+        entry["reference_count"] += 1
+
+    for row in perks:
+        if row["ability_kit_id"] is not None or row["kit_target_package"] is None:
+            continue
+        record_dependency(
+            target_package=row["kit_target_package"],
+            target_path=row["kit_target_path"],
+            property_path=row["kit_property_path"],
+            source_package=row["kit_source_package"],
+            source_type=row["kit_source_type"] or "FortHeroGameplayDefinition",
+            resolution_status=row["kit_resolution_status"] or "unresolved",
+        )
+
+    frontier = list(closure)
+    while frontier:
+        source_object_id = frontier.pop()
+        rows = (
+            reference_index.get(source_object_id, [])
+            if reference_index is not None
+            else connection.execute(
+                """
+                SELECT reference.resolution_status, reference.property_path,
+                       reference.target_path, reference.target_package_path,
+                       reference.target_object_id,
+                       source.package_path AS source_package,
+                       source.object_type AS source_type
+                FROM asset_references reference
+                JOIN asset_objects source ON source.id=reference.source_object_id
+                WHERE reference.source_object_id=?
+                ORDER BY reference.id
+                """,
+                (source_object_id,),
+            ).fetchall()
+        )
+        for row in rows:
+            priority, category, _ = _queue_classification(
+                row["source_type"], row["property_path"], row["target_package_path"]
+            )
+            if priority == 99 or category not in SEMANTIC_DEPENDENCY_CATEGORIES:
+                continue
+            if (
+                row["resolution_status"] == "resolved"
+                and row["target_object_id"] is not None
+            ):
+                # FModel commonly emits a generated class and its default object
+                # in one package.  A structural reference may select either one,
+                # while normalized mechanics live on the other.  Once the package
+                # itself has resolved, traverse every exported object in that exact
+                # package; do not synthesize sibling package paths.
+                package_objects = (
+                    package_object_index.get(row["target_package_path"], [])
+                    if package_object_index is not None
+                    else [
+                        package_object["id"]
+                        for package_object in connection.execute(
+                            """
+                            SELECT id FROM asset_objects
+                            WHERE snapshot_id=? AND package_path=?
+                            ORDER BY export_index
+                            """,
+                            (snapshot_id, row["target_package_path"]),
+                        )
+                    ]
+                )
+                for target_id in package_objects:
+                    if target_id not in closure:
+                        closure.add(target_id)
+                        frontier.append(target_id)
+                continue
+            record_dependency(
+                target_package=row["target_package_path"],
+                target_path=row["target_path"],
+                property_path=row["property_path"],
+                source_package=row["source_package"],
+                source_type=row["source_type"],
+                resolution_status=row["resolution_status"],
+            )
+
+    dependencies = [
+        {
+            **entry,
+            "categories": sorted(entry["categories"]),
+            "reasons": sorted(entry["reasons"]),
+            "target_paths": sorted(entry["target_paths"]),
+            "source_packages": sorted(entry["source_packages"]),
+            "resolution_statuses": sorted(entry["resolution_statuses"]),
+        }
+        for entry in unresolved.values()
+    ]
+    dependencies.sort(key=lambda item: (item["priority"], item["package_path"]))
+    return closure, dependencies, perks
+
+
+def perk_family_semantic_report(
+    connection: sqlite3.Connection,
+    perk_family: str,
+    snapshot_id: int | None = None,
+    *,
+    reference_index: dict[int, list[sqlite3.Row]] | None = None,
+    package_object_index: dict[str, list[int]] | None = None,
+) -> dict[str, Any]:
+    snapshot_id = snapshot_id or latest_asset_snapshot_id(connection)
+    if snapshot_id is None:
+        raise ValueError("no ready asset snapshot")
+    closure, dependencies, perks = _semantic_perk_closure(
+        connection,
+        snapshot_id,
+        perk_family,
+        reference_index=reference_index,
+        package_object_index=package_object_index,
+    )
+    if not perks:
+        raise ValueError(f"perk family not found in snapshot {snapshot_id}: {perk_family}")
+    supported_mechanics = supported_modifiers = opaque_mechanics = 0
+    blueprint_partial = blueprint_opaque = 0
+    if closure:
+        placeholders = ",".join("?" for _ in closure)
+        parameters = sorted(closure)
+        supported_mechanics = connection.execute(
+            f"""
+            SELECT COUNT(*) FROM catalog_mechanics
+            WHERE source_object_id IN ({placeholders})
+              AND interpretation_status='supported'
+            """,
+            parameters,
+        ).fetchone()[0]
+        supported_modifiers = connection.execute(
+            f"""
+            SELECT COUNT(*) FROM catalog_effect_modifiers modifier
+            JOIN catalog_gameplay_effects effect
+              ON effect.id=modifier.gameplay_effect_id
+            WHERE effect.source_object_id IN ({placeholders})
+              AND modifier.interpretation_status='supported'
+            """,
+            parameters,
+        ).fetchone()[0]
+        opaque_mechanics = connection.execute(
+            f"""
+            SELECT COUNT(*) FROM (
+              SELECT source_object_id, property_path FROM catalog_opaque_mechanics
+              WHERE source_object_id IN ({placeholders})
+              UNION
+              SELECT source_object_id, property_path FROM catalog_mechanics
+              WHERE source_object_id IN ({placeholders})
+                AND interpretation_status='opaque'
+            )
+            """,
+            parameters + parameters,
+        ).fetchone()[0]
+        blueprint_partial, blueprint_opaque = connection.execute(
+            f"""
+            SELECT
+              COALESCE(SUM(CASE WHEN semantic_status='partial' THEN 1 ELSE 0 END), 0),
+              COALESCE(SUM(CASE WHEN semantic_status='opaque' THEN 1 ELSE 0 END), 0)
+            FROM catalog_abilities
+            WHERE source_object_id IN ({placeholders})
+            """,
+            parameters,
+        ).fetchone()
+    supported_facts = supported_mechanics + supported_modifiers
+    missing_kits = [
+        row["ability_kit_path"] for row in perks if row["ability_kit_id"] is None
+    ]
+    reasons: list[dict[str, Any]] = []
+    if missing_kits:
+        reasons.append(
+            {"code": "missing_perk_kits", "count": len(missing_kits), "assets": missing_kits}
+        )
+    if dependencies:
+        reasons.append(
+            {
+                "code": "unresolved_semantic_dependencies",
+                "count": len(dependencies),
+                "assets": [item["package_path"] for item in dependencies],
+            }
+        )
+    if blueprint_partial or blueprint_opaque:
+        reasons.append(
+            {
+                "code": "blueprint_behavior_not_executed",
+                "count": blueprint_partial + blueprint_opaque,
+            }
+        )
+    if opaque_mechanics:
+        reasons.append({"code": "opaque_custom_mechanics", "count": opaque_mechanics})
+    if supported_facts == 0:
+        reasons.append({"code": "no_supported_semantic_facts", "count": 1})
+
+    if supported_facts == 0 and (opaque_mechanics or blueprint_opaque):
+        status = "opaque"
+    elif reasons:
+        status = "partial"
+    else:
+        status = "resolved"
+    return {
+        "snapshot_id": snapshot_id,
+        "perk_family": perk_family,
+        "tiers": [row["perk_tier"] for row in perks],
+        "status": status,
+        "optimization_ready": status == "resolved",
+        "evidence": {
+            "transitive_asset_objects": len(closure),
+            "supported_mechanics": supported_mechanics,
+            "supported_modifiers": supported_modifiers,
+            "opaque_mechanics": opaque_mechanics,
+            "blueprint_partial_abilities": blueprint_partial,
+            "blueprint_opaque_abilities": blueprint_opaque,
+        },
+        "reasons": reasons,
+        "unresolved_dependencies": dependencies,
+    }
+
+
+def roster_coverage_report(
+    connection: sqlite3.Connection, snapshot_id: int | None = None
+) -> dict[str, Any]:
+    snapshot_id = snapshot_id or latest_asset_snapshot_id(connection)
+    if snapshot_id is None:
+        return {"snapshot_id": None, "summary": {}, "heroes": [], "perk_families": []}
+    families = [
+        row[0]
+        for row in connection.execute(
+            """
+            SELECT DISTINCT perk_family FROM catalog_perks
+            WHERE snapshot_id=? ORDER BY perk_family
+            """,
+            (snapshot_id,),
+        )
+    ]
+    reference_index, package_object_index = _semantic_graph_index(
+        connection, snapshot_id
+    )
+    family_reports = {
+        family: perk_family_semantic_report(
+            connection,
+            family,
+            snapshot_id,
+            reference_index=reference_index,
+            package_object_index=package_object_index,
+        )
+        for family in families
+    }
+    heroes: list[dict[str, Any]] = []
+    hero_status_counts = {"resolved": 0, "partial": 0, "opaque": 0}
+    rows = connection.execute(
+        """
+        SELECT id, hero_key, display_name, hero_class
+        FROM catalog_heroes WHERE snapshot_id=? ORDER BY display_name, hero_key
+        """,
+        (snapshot_id,),
+    ).fetchall()
+    for hero in rows:
+        variants = connection.execute(
+            """
+            SELECT variant_key, display_name, rarity, tier
+            FROM catalog_hero_variants WHERE hero_id=? ORDER BY variant_key
+            """,
+            (hero["id"],),
+        ).fetchall()
+        assignments = connection.execute(
+            """
+            SELECT hero_perk.perk_mode, perk.perk_family, perk.perk_tier
+            FROM catalog_hero_perks hero_perk
+            JOIN catalog_perks perk ON perk.id=hero_perk.perk_id
+            WHERE hero_perk.hero_id=? ORDER BY hero_perk.perk_mode
+            """,
+            (hero["id"],),
+        ).fetchall()
+        modes = {row["perk_mode"] for row in assignments}
+        statuses = [family_reports[row["perk_family"]]["status"] for row in assignments]
+        missing_modes = sorted({"support", "commander"} - modes)
+        if missing_modes or "partial" in statuses:
+            hero_status = "partial"
+        elif statuses and all(status == "opaque" for status in statuses):
+            hero_status = "opaque"
+        elif statuses and all(status == "resolved" for status in statuses):
+            hero_status = "resolved"
+        else:
+            hero_status = "partial"
+        hero_status_counts[hero_status] += 1
+        heroes.append(
+            {
+                "hero_key": hero["hero_key"],
+                "display_name": hero["display_name"],
+                "hero_class": hero["hero_class"],
+                "status": hero_status,
+                "missing_perk_modes": missing_modes,
+                "variant_count": len(variants),
+                "variants": [dict(row) for row in variants],
+                "perks": [
+                    {
+                        **dict(row),
+                        "semantic_status": family_reports[row["perk_family"]]["status"],
+                        "optimization_ready": family_reports[row["perk_family"]][
+                            "optimization_ready"
+                        ],
+                    }
+                    for row in assignments
+                ],
+            }
+        )
+    raw_hids = connection.execute(
+        """
+        SELECT COUNT(*) FROM asset_objects
+        WHERE snapshot_id=? AND object_type='FortHeroType'
+        """,
+        (snapshot_id,),
+    ).fetchone()[0]
+    mapped_hids = sum(hero["variant_count"] for hero in heroes)
+    family_status_counts = {"resolved": 0, "partial": 0, "opaque": 0}
+    for report in family_reports.values():
+        family_status_counts[report["status"]] += 1
+    optimization_ready = family_status_counts["resolved"]
+    identities_with_variants = sum(hero["variant_count"] > 0 for hero in heroes)
+    heroes_missing_perks = sum(bool(hero["missing_perk_modes"]) for hero in heroes)
+    hero_perk_assignments = sum(len(hero["perks"]) for hero in heroes)
+    observed_classes = sorted(
+        {hero["hero_class"] for hero in heroes if hero["hero_class"]}
+    )
+    required_folder_scopes, required_asset_scopes = _required_roster_export_scopes()
+    observed_export_scopes, missing_export_scopes = _observed_roster_export_scopes(
+        connection, snapshot_id
+    )
+    receipt = connection.execute(
+        """
+        SELECT plan_version, attestation_text, recorded_at
+        FROM asset_roster_export_receipts WHERE snapshot_id=?
+        """,
+        (snapshot_id,),
+    ).fetchone()
+    all_heroes_have_perks = all(not hero["missing_perk_modes"] for hero in heroes)
+    complete_roster_claimed = (
+        receipt is not None
+        and receipt["plan_version"] == ROSTER_PLAN_VERSION
+        and not missing_export_scopes
+        and raw_hids == mapped_hids
+        and all_heroes_have_perks
+        and set(observed_classes) == set(STW_HERO_CLASSES)
+        and bool(heroes)
+    )
+    return {
+        "snapshot_id": snapshot_id,
+        "catalog_awareness": {
+            "status": (
+                "controlled_roster_batches_observed"
+                if complete_roster_claimed
+                else "incomplete_or_unverified_folder_export"
+            ),
+            "identity_rule": (
+                "one canonical hero per exported FortHeroGameplayDefinition; "
+                "FortHeroType rarity/evolution records remain linked variants"
+            ),
+            "observed_classes": observed_classes,
+            "expected_class_folders": list(STW_HERO_CLASSES),
+            "observed_export_scope_count": len(observed_export_scopes),
+            "required_export_scope_count": (
+                len(required_folder_scopes) + len(required_asset_scopes)
+            ),
+            "missing_export_scopes": missing_export_scopes,
+            "recursive_export_receipt": dict(receipt) if receipt else None,
+            "complete_roster_claimed": complete_roster_claimed,
+        },
+        "summary": {
+            "unique_hero_gameplay_identities": len(heroes),
+            "hero_identities_with_hid_variants": identities_with_variants,
+            "hero_identities_without_hid_variants": len(heroes) - identities_with_variants,
+            "raw_hid_objects": raw_hids,
+            "mapped_hid_variants": mapped_hids,
+            "unmapped_hid_variants": raw_hids - mapped_hids,
+            "unique_perk_families": len(family_reports),
+            "hero_perk_assignments": hero_perk_assignments,
+            "heroes_missing_support_or_commander": heroes_missing_perks,
+            "hero_status_counts": hero_status_counts,
+            "perk_family_status_counts": family_status_counts,
+            "optimization_ready_perk_families": optimization_ready,
+            "optimization_ready_percentage": (
+                optimization_ready / len(family_reports) if family_reports else None
+            ),
+        },
+        "heroes": heroes,
+        "perk_families": list(family_reports.values()),
+    }
+
+
+def _fmodel_path(package_path: str, *, folder: bool = False) -> str:
+    if package_path == "/SaveTheWorld" or package_path.startswith("/SaveTheWorld/"):
+        suffix = package_path[len("/SaveTheWorld") :].lstrip("/")
+        base = "FortniteGame/Plugins/GameFeatures/SaveTheWorld/Content"
+    elif package_path == "/Game" or package_path.startswith("/Game/"):
+        suffix = package_path[len("/Game") :].lstrip("/")
+        base = "FortniteGame/Content"
+    else:
+        return package_path
+    path = f"{base}/{suffix}" if suffix else base
+    return path if folder else f"{path}.uasset"
+
+
+def _required_roster_export_scopes() -> tuple[list[str], list[str]]:
+    folders = [
+        _fmodel_path(f"/SaveTheWorld/Heroes/{hero_class}/GameplayDefinition", folder=True)
+        for hero_class in STW_HERO_CLASSES
+    ] + [
+        _fmodel_path(f"/SaveTheWorld/Heroes/{hero_class}/ItemDefinition", folder=True)
+        for hero_class in STW_HERO_CLASSES
+    ] + [
+        _fmodel_path("/SaveTheWorld/Abilities/Player/Perks/Hero", folder=True),
+        _fmodel_path("/SaveTheWorld/Abilities/Player/Perks/Leader", folder=True),
+        _fmodel_path("/SaveTheWorld/GameplayEffectTemplates", folder=True),
+        _fmodel_path("/Game/GameplayEffectTemplates", folder=True),
+        _fmodel_path("/Game/Abilities/Player/Parents", folder=True),
+    ]
+    assets = [_fmodel_path("/Game/Balance/DataTables/CombatEffects_HeroAbilities")]
+    return folders, assets
+
+
+def _observed_roster_export_scopes(
+    connection: sqlite3.Connection, snapshot_id: int
+) -> tuple[list[str], list[str]]:
+    folders, assets = _required_roster_export_scopes()
+    source_paths = [
+        row[0].replace("\\", "/")
+        for row in connection.execute(
+            "SELECT source_path FROM asset_files WHERE snapshot_id=?", (snapshot_id,)
+        )
+    ]
+
+    def folder_observed(scope: str) -> bool:
+        marker = f"/{scope.strip('/')}/"
+        return any(marker in f"/{path.strip('/')}/" for path in source_paths)
+
+    def asset_observed(scope: str) -> bool:
+        expected_json = f"{scope[:-7]}.json" if scope.endswith(".uasset") else scope
+        return any(path.endswith(expected_json) for path in source_paths)
+
+    observed = [scope for scope in folders if folder_observed(scope)] + [
+        scope for scope in assets if asset_observed(scope)
+    ]
+    missing = sorted((set(folders) | set(assets)) - set(observed))
+    return observed, missing
+
+
+def record_roster_export_receipt(
+    connection: sqlite3.Connection,
+    snapshot_id: int | None = None,
+    *,
+    confirm_complete_recursive_export: bool = False,
+) -> dict[str, Any]:
+    snapshot_id = snapshot_id or latest_asset_snapshot_id(connection)
+    if snapshot_id is None:
+        raise ValueError("no ready asset snapshot")
+    if not confirm_complete_recursive_export:
+        raise ValueError(
+            "recording a roster receipt requires explicit confirmation that every "
+            "batch-plan folder was exported recursively"
+        )
+    observed, missing = _observed_roster_export_scopes(connection, snapshot_id)
+    if missing:
+        raise ValueError(
+            "cannot record complete-roster export receipt; missing scopes: "
+            + ", ".join(missing)
+        )
+    attestation = (
+        "operator confirmed every phase2-roster-v1 folder was exported recursively; "
+        "scope presence was verified against this immutable snapshot manifest"
+    )
+    with connection:
+        connection.execute(
+            """
+            INSERT INTO asset_roster_export_receipts(
+                snapshot_id, plan_version, scopes_json, attestation_text
+            ) VALUES (?, ?, ?, ?)
+            ON CONFLICT(snapshot_id) DO UPDATE SET
+                plan_version=excluded.plan_version,
+                scopes_json=excluded.scopes_json,
+                attestation_text=excluded.attestation_text,
+                recorded_at=CURRENT_TIMESTAMP
+            """,
+            (
+                snapshot_id,
+                ROSTER_PLAN_VERSION,
+                json.dumps(observed, separators=(",", ":")),
+                attestation,
+            ),
+        )
+    return {
+        "snapshot_id": snapshot_id,
+        "plan_version": ROSTER_PLAN_VERSION,
+        "observed_scope_count": len(observed),
+        "attestation": attestation,
+    }
+
+
+def full_roster_batch_plan(
+    connection: sqlite3.Connection, snapshot_id: int | None = None
+) -> dict[str, Any]:
+    snapshot_id = snapshot_id or latest_asset_snapshot_id(connection)
+    roster = roster_coverage_report(connection, snapshot_id)
+    if snapshot_id is None:
+        return {"snapshot_id": None, "batches": [], "follow_up_batches": []}
+    hero_count = roster["summary"]["unique_hero_gameplay_identities"]
+    family_count = roster["summary"]["unique_perk_families"]
+    hero_names = [hero["display_name"] for hero in roster["heroes"]]
+    family_names = [report["perk_family"] for report in roster["perk_families"]]
+    dependency_families: dict[str, set[str]] = {}
+    for report in roster["perk_families"]:
+        for dependency in report["unresolved_dependencies"]:
+            dependency_families.setdefault(dependency["package_path"], set()).add(
+                report["perk_family"]
+            )
+
+    def dependencies_under(prefixes: tuple[str, ...]) -> tuple[list[str], list[str]]:
+        packages = sorted(
+            package
+            for package in dependency_families
+            if any(package == prefix or package.startswith(f"{prefix}/") for prefix in prefixes)
+        )
+        affected = sorted(
+            {
+                family
+                for package in packages
+                for family in dependency_families.get(package, set())
+            }
+        )
+        return packages, affected
+
+    template_prefixes = (
+        "/SaveTheWorld/GameplayEffectTemplates",
+        "/Game/GameplayEffectTemplates",
+        "/Game/Abilities/Player/Parents",
+    )
+    template_dependencies, template_families = dependencies_under(template_prefixes)
+    gameplay_folders = [
+        _fmodel_path(f"/SaveTheWorld/Heroes/{hero_class}/GameplayDefinition", folder=True)
+        for hero_class in STW_HERO_CLASSES
+    ]
+    item_folders = [
+        _fmodel_path(f"/SaveTheWorld/Heroes/{hero_class}/ItemDefinition", folder=True)
+        for hero_class in STW_HERO_CLASSES
+    ]
+    batches = [
+        {
+            "priority": 0,
+            "batch_id": "roster-gameplay-identities",
+            "exact_fmodel_folders_or_searches": gameplay_folders,
+            "expected_relevant_asset_types": ["FortHeroGameplayDefinition"],
+            "why": (
+                "enumerates canonical HGD gameplay identities and their explicit "
+                "support/commander perk references"
+            ),
+            "unlocks": [
+                "complete unique-hero count",
+                "all support and commander perk assignments",
+            ],
+            "currently_known_heroes": hero_count,
+            "currently_known_hero_names": hero_names,
+            "deduplicated_export_scope_count": 4,
+            "deduplicated_dependency_count": None,
+        },
+        {
+            "priority": 1,
+            "batch_id": "roster-hid-variants",
+            "exact_fmodel_folders_or_searches": item_folders,
+            "expected_relevant_asset_types": ["FortHeroType"],
+            "why": (
+                "maps every rarity/evolution HID to its explicitly referenced HGD "
+                "without counting variants as heroes"
+            ),
+            "unlocks": ["friendly hero names", "variant and orphan-HID auditing"],
+            "currently_mapped_variants": roster["summary"]["mapped_hid_variants"],
+            "deduplicated_export_scope_count": 4,
+            "deduplicated_dependency_count": None,
+        },
+        {
+            "priority": 2,
+            "batch_id": "hero-perk-implementations",
+            "exact_fmodel_folders_or_searches": [
+                _fmodel_path("/SaveTheWorld/Abilities/Player/Perks/Hero", folder=True),
+                _fmodel_path("/SaveTheWorld/Abilities/Player/Perks/Leader", folder=True),
+            ],
+            "expected_relevant_asset_types": [
+                "FortAbilityKit",
+                "GameplayAbility Blueprint defaults",
+                "GameplayEffect",
+            ],
+            "why": (
+                "captures all HGD-selected support/commander kits and their shared "
+                "Blueprint/effect implementations in two relevant folder exports"
+            ),
+            "unlocks": ["all currently discoverable hero perk families"],
+            "currently_known_perk_families": family_count,
+            "currently_known_perk_family_names": family_names,
+            "deduplicated_export_scope_count": 2,
+            "deduplicated_dependency_count": family_count,
+        },
+        {
+            "priority": 3,
+            "batch_id": "shared-perk-semantic-bases",
+            "exact_fmodel_folders_or_searches": [
+                _fmodel_path("/SaveTheWorld/GameplayEffectTemplates", folder=True),
+                _fmodel_path("/Game/GameplayEffectTemplates", folder=True),
+                _fmodel_path("/Game/Abilities/Player/Parents", folder=True),
+            ],
+            "expected_relevant_asset_types": [
+                "GameplayEffect templates",
+                "GameplayAbility parent classes",
+            ],
+            "why": (
+                "closes inherited modifier, duration, healing, damage, and generic "
+                "triggered-ability semantics"
+            ),
+            "unlocks": ["shared semantic bases reused across many perk families"],
+            "currently_known_dependency_packages": template_dependencies,
+            "currently_blocked_perk_families": template_families,
+            "deduplicated_export_scope_count": 3,
+            "deduplicated_dependency_count": len(template_dependencies),
+        },
+        {
+            "priority": 4,
+            "batch_id": "hero-perk-balance-table",
+            "exact_fmodel_folders_or_searches": [
+                _fmodel_path("/Game/Balance/DataTables/CombatEffects_HeroAbilities")
+            ],
+            "expected_relevant_asset_types": ["CurveTable"],
+            "why": "resolves numerical curve rows referenced by hero perk mechanics",
+            "unlocks": ["exact perk magnitudes, durations, chances, and thresholds"],
+            "deduplicated_export_scope_count": 1,
+            "deduplicated_dependency_count": 1,
+        },
+    ]
+
+    covered_virtual_folders = (
+        "/SaveTheWorld/Abilities/Player/Perks/Hero",
+        "/SaveTheWorld/Abilities/Player/Perks/Leader",
+        "/SaveTheWorld/GameplayEffectTemplates",
+        "/Game/GameplayEffectTemplates",
+        "/Game/Abilities/Player/Parents",
+    )
+    grouped: dict[str, dict[str, Any]] = {}
+    for report in roster["perk_families"]:
+        for dependency in report["unresolved_dependencies"]:
+            package = dependency["package_path"]
+            covered_by_initial_batch = any(
+                package == folder or package.startswith(f"{folder}/")
+                for folder in covered_virtual_folders
+            )
+            if (
+                covered_by_initial_batch
+                and not roster["catalog_awareness"]["complete_roster_claimed"]
+            ):
+                continue
+            folder = package.rsplit("/", 1)[0]
+            entry = grouped.setdefault(
+                folder,
+                {
+                    "priority": 5,
+                    "exact_fmodel_folder": _fmodel_path(folder, folder=True),
+                    "dependency_packages": set(),
+                    "perk_families": set(),
+                    "categories": set(),
+                    "inside_completed_initial_scope": covered_by_initial_batch,
+                },
+            )
+            entry["dependency_packages"].add(package)
+            entry["perk_families"].add(report["perk_family"])
+            entry["categories"].update(dependency["categories"])
+    follow_up = [
+        {
+            **entry,
+            "dependency_packages": sorted(entry["dependency_packages"]),
+            "perk_families": sorted(entry["perk_families"]),
+            "categories": sorted(entry["categories"]),
+            "deduplicated_dependency_count": len(entry["dependency_packages"]),
+            "action": (
+                "retry the listed exact packages; their containing recursive batch "
+                "was completed but they remain absent"
+                if entry["inside_completed_initial_scope"]
+                else "export this folder recursively"
+            ),
+        }
+        for entry in grouped.values()
+    ]
+    follow_up.sort(
+        key=lambda item: (-item["deduplicated_dependency_count"], item["exact_fmodel_folder"])
+    )
+    return {
+        "snapshot_id": snapshot_id,
+        "strategy": (
+            "export five ordered, relevant batches once; re-ingest the same read-only "
+            "root; then use only graph-derived follow-up folders"
+        ),
+        "source_of_truth": (
+            "HGD/HID and perk dependencies are accepted only through explicit asset "
+            "references; folder names select export scope and are not semantic evidence"
+        ),
+        "batches": batches,
+        "follow_up_batches": follow_up,
+        "excluded_as_irrelevant": [
+            "UI icons and portraits",
+            "cosmetic outfits and backblings",
+            "feedback and frontend animation assets",
+            "XP, sacrifice, and progression tables",
+            "active ability assets unless later required by optimizer scope",
+        ],
     }
 
 
@@ -3158,6 +3984,27 @@ def _parser() -> argparse.ArgumentParser:
     queue.add_argument("--paths-only", action="store_true")
     coverage = commands.add_parser("coverage", help="show normalized catalog coverage")
     coverage.add_argument("--snapshot-id", type=int)
+    roster = commands.add_parser(
+        "roster", help="show canonical hero/perk roster and semantic readiness"
+    )
+    roster.add_argument("--snapshot-id", type=int)
+    perk = commands.add_parser(
+        "perk", help="show transitive semantic closure for one perk family"
+    )
+    perk.add_argument("family")
+    perk.add_argument("--snapshot-id", type=int)
+    batches = commands.add_parser(
+        "batch-plan", help="show the controlled complete-roster FModel export plan"
+    )
+    batches.add_argument("--snapshot-id", type=int)
+    receipt = commands.add_parser(
+        "roster-receipt",
+        help="record completion of every recursive folder in the roster batch plan",
+    )
+    receipt.add_argument("--snapshot-id", type=int)
+    receipt.add_argument(
+        "--confirm-complete-recursive-export", action="store_true", required=True
+    )
     commands.add_parser("snapshot", help="show the latest snapshot summary")
     return parser
 
@@ -3195,6 +4042,20 @@ def main(argv: Iterable[str] | None = None) -> int:
                 return 0
         elif args.command == "coverage":
             payload = catalog_coverage(connection, args.snapshot_id)
+        elif args.command == "roster":
+            payload = roster_coverage_report(connection, args.snapshot_id)
+        elif args.command == "perk":
+            payload = perk_family_semantic_report(
+                connection, args.family, args.snapshot_id
+            )
+        elif args.command == "batch-plan":
+            payload = full_roster_batch_plan(connection, args.snapshot_id)
+        elif args.command == "roster-receipt":
+            payload = record_roster_export_receipt(
+                connection,
+                args.snapshot_id,
+                confirm_complete_recursive_export=args.confirm_complete_recursive_export,
+            )
         else:
             snapshot_id = latest_asset_snapshot_id(connection)
             payload = (

@@ -11,8 +11,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 from stw_assets import (  # noqa: E402
     asset_export_queue,
     catalog_coverage,
+    full_roster_batch_plan,
     hero_provenance,
     ingest_asset_directory,
+    perk_family_semantic_report,
+    record_roster_export_receipt,
+    roster_coverage_report,
     unresolved_reference_report,
 )
 from stw_pipeline import connect  # noqa: E402
@@ -1321,6 +1325,48 @@ class AssetCatalogTests(unittest.TestCase):
         self.assertEqual("123456", build["changelist"])
         self.assertEqual("phase2-v11", second["normalization"]["normalizer_version"])
 
+    def test_ingestion_preserves_duplicate_object_names_within_a_package(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "exports"
+            write_golden_slice(root)
+            duplicate_package = "/Test/Particles/P_DuplicateNames"
+            _write_export(
+                root,
+                "Particles/P_DuplicateNames.json",
+                [
+                    {
+                        "Type": "DistributionFloatConstant",
+                        "Name": "RequiredDistributionSpawnRate",
+                        "Package": duplicate_package,
+                        "Properties": {"Constant": 1.0},
+                    },
+                    {
+                        "Type": "DistributionFloatConstant",
+                        "Name": "RequiredDistributionSpawnRate",
+                        "Package": duplicate_package,
+                        "Properties": {"Constant": 2.0},
+                    },
+                ],
+            )
+            connection = connect(Path(directory) / "catalog.sqlite3")
+            try:
+                summary = ingest_asset_directory(
+                    connection, root, build_key="duplicate-object-name-test"
+                )
+                rows = connection.execute(
+                    """
+                    SELECT object_name, object_key FROM asset_objects
+                    WHERE snapshot_id=? AND package_path=? ORDER BY export_index
+                    """,
+                    (summary["snapshot_id"], duplicate_package),
+                ).fetchall()
+            finally:
+                connection.close()
+
+        self.assertEqual(2, len(rows))
+        self.assertEqual(rows[0]["object_name"], rows[1]["object_name"])
+        self.assertNotEqual(rows[0]["object_key"], rows[1]["object_key"])
+
     def test_existing_raw_snapshot_is_rederived_for_a_new_normalizer(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "exports"
@@ -1415,6 +1461,195 @@ class AssetCatalogTests(unittest.TestCase):
         self.assertNotIn("unlinked_balance_evidence", by_mode["commander"])
         self.assertEqual(1.17, raw_rows["Perk.AssaultDamage.T01.DamageMult"])
         self.assertEqual(1.33, raw_rows["Perk.AssaultDamage.T02.DamageMult"])
+
+    def test_roster_collapses_hid_variants_into_one_hgd_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "exports"
+            source_files = write_golden_slice(root)
+            original = next(path for path in source_files if path.name.startswith("HID_"))
+            payload = json.loads(original.read_text(encoding="utf-8"))
+            payload[0]["Name"] = "HID_Commando_GrenadeGun_VR_T03"
+            payload[0]["Package"] = (
+                "/SaveTheWorld/Heroes/Commando/ItemDefinition/"
+                "HID_Commando_GrenadeGun_VR_T03"
+            )
+            payload[0]["Properties"]["DataList"] = [
+                {"Rarity": "EFortRarity::Epic"},
+                {"Tier": "EFortItemTier::III"},
+            ]
+            _write_export(root, "Heroes/HID_Commando_GrenadeGun_VR_T03.json", payload)
+            connection = connect(Path(directory) / "catalog.sqlite3")
+            try:
+                summary = ingest_asset_directory(
+                    connection, root, build_key="canonical-roster-test"
+                )
+                roster = roster_coverage_report(connection, summary["snapshot_id"])
+            finally:
+                connection.close()
+
+        self.assertEqual(1, roster["summary"]["unique_hero_gameplay_identities"])
+        self.assertEqual(1, roster["summary"]["hero_identities_with_hid_variants"])
+        self.assertEqual(0, roster["summary"]["hero_identities_without_hid_variants"])
+        self.assertEqual(2, roster["summary"]["raw_hid_objects"])
+        self.assertEqual(2, roster["summary"]["mapped_hid_variants"])
+        self.assertEqual(0, roster["summary"]["unmapped_hid_variants"])
+        self.assertEqual(2, roster["heroes"][0]["variant_count"])
+        self.assertEqual(2, roster["summary"]["hero_perk_assignments"])
+        self.assertEqual(0, roster["summary"]["heroes_missing_support_or_commander"])
+        self.assertEqual(
+            {"support", "commander"},
+            {perk["perk_mode"] for perk in roster["heroes"][0]["perks"]},
+        )
+
+    def test_perk_closure_deduplicates_shared_missing_template(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "exports"
+            write_golden_slice(root)
+            connection = connect(Path(directory) / "catalog.sqlite3")
+            try:
+                summary = ingest_asset_directory(
+                    connection, root, build_key="perk-closure-test"
+                )
+                report = perk_family_semantic_report(
+                    connection, "AssaultDamage", summary["snapshot_id"]
+                )
+            finally:
+                connection.close()
+
+        self.assertEqual("partial", report["status"])
+        self.assertFalse(report["optimization_ready"])
+        self.assertEqual(1, len(report["unresolved_dependencies"]))
+        dependency = report["unresolved_dependencies"][0]
+        self.assertEqual(
+            "/SaveTheWorld/GameplayEffectTemplates/Hero/"
+            "GET_DamageMultiplier_Ranged_Hero",
+            dependency["package_path"],
+        )
+        self.assertEqual(2, dependency["reference_count"])
+
+    def test_roster_marks_unsupported_blueprint_only_perk_as_opaque(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "exports"
+            source_files = write_golden_slice(root)
+            hgd_file = next(
+                path for path in source_files if path.name == "HGD_Commando_GrenadeGun.json"
+            )
+            hgd = json.loads(hgd_file.read_text(encoding="utf-8"))
+            properties = hgd[0]["Properties"]
+            perk_root = "/Test/Perks/Opaque"
+            for property_name, tier in (("HeroPerk", "T01"), ("CommanderPerk", "T02")):
+                properties[property_name]["GrantedAbilityKit"] = _reference(
+                    f"{perk_root}/Kit_Perk_H_Opaque_{tier}",
+                    f"Kit_Perk_H_Opaque_{tier}",
+                )
+            hgd_file.write_text(json.dumps(hgd, separators=(",", ":")), encoding="utf-8")
+            ability_package = f"{perk_root}/GA_Perk_H_Opaque"
+            for tier in ("T01", "T02"):
+                kit_name = f"Kit_Perk_H_Opaque_{tier}"
+                _write_export(
+                    root,
+                    f"Opaque/{kit_name}.json",
+                    [
+                        {
+                            "Type": "FortAbilityKit",
+                            "Name": kit_name,
+                            "Package": f"{perk_root}/{kit_name}",
+                            "Properties": {
+                                "GameplayAbilities": [
+                                    {"ObjectPath": f"{ability_package}.0"}
+                                ]
+                            },
+                        }
+                    ],
+                )
+            _write_export(
+                root,
+                "Opaque/GA_Perk_H_Opaque.json",
+                [
+                    {
+                        "Type": "GA_Perk_H_Opaque_C",
+                        "Name": "Default__GA_Perk_H_Opaque_C",
+                        "Package": ability_package,
+                        "Properties": {},
+                    }
+                ],
+            )
+            connection = connect(Path(directory) / "catalog.sqlite3")
+            try:
+                summary = ingest_asset_directory(
+                    connection, root, build_key="opaque-roster-test"
+                )
+                report = perk_family_semantic_report(
+                    connection, "Opaque", summary["snapshot_id"]
+                )
+            finally:
+                connection.close()
+
+        self.assertEqual("opaque", report["status"])
+        self.assertFalse(report["optimization_ready"])
+        reason_codes = {reason["code"] for reason in report["reasons"]}
+        self.assertIn("blueprint_behavior_not_executed", reason_codes)
+        self.assertIn("no_supported_semantic_facts", reason_codes)
+
+    def test_complete_roster_batch_plan_is_small_relevant_and_ordered(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "exports"
+            write_golden_slice(root)
+            extend_with_phase_two_semantics(root)
+            connection = connect(Path(directory) / "catalog.sqlite3")
+            try:
+                summary = ingest_asset_directory(
+                    connection, root, build_key="batch-plan-test"
+                )
+                plan = full_roster_batch_plan(connection, summary["snapshot_id"])
+                roster = roster_coverage_report(connection, summary["snapshot_id"])
+            finally:
+                connection.close()
+
+        self.assertEqual(
+            [
+                "roster-gameplay-identities",
+                "roster-hid-variants",
+                "hero-perk-implementations",
+                "shared-perk-semantic-bases",
+                "hero-perk-balance-table",
+            ],
+            [batch["batch_id"] for batch in plan["batches"]],
+        )
+        self.assertEqual([0, 1, 2, 3, 4], [batch["priority"] for batch in plan["batches"]])
+        self.assertEqual(
+            4, plan["batches"][0]["deduplicated_export_scope_count"]
+        )
+        self.assertIsNone(plan["batches"][0]["deduplicated_dependency_count"])
+        all_paths = json.dumps(plan["batches"])
+        self.assertNotIn("UI/Foundation", all_paths)
+        self.assertNotIn("Cosmetic", all_paths)
+        self.assertEqual("resolved", roster["perk_families"][0]["status"])
+        self.assertEqual(1.0, roster["summary"]["optimization_ready_percentage"])
+        self.assertFalse(roster["catalog_awareness"]["complete_roster_claimed"])
+
+    def test_roster_receipt_refuses_incomplete_folder_scopes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "exports"
+            write_golden_slice(root)
+            connection = connect(Path(directory) / "catalog.sqlite3")
+            try:
+                summary = ingest_asset_directory(
+                    connection, root, build_key="roster-receipt-test"
+                )
+                with self.assertRaisesRegex(ValueError, "missing scopes"):
+                    record_roster_export_receipt(
+                        connection,
+                        summary["snapshot_id"],
+                        confirm_complete_recursive_export=True,
+                    )
+                receipt_count = connection.execute(
+                    "SELECT COUNT(*) FROM asset_roster_export_receipts"
+                ).fetchone()[0]
+            finally:
+                connection.close()
+
+        self.assertEqual(0, receipt_count)
 
 
 if __name__ == "__main__":

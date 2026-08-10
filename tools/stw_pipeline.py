@@ -754,6 +754,16 @@ MIGRATIONS = [
         ability_kit_id INTEGER REFERENCES catalog_ability_kits(id),
         UNIQUE (hero_class_id, kit_ordinal)
     );
+    """,
+    """
+    CREATE TABLE asset_roster_export_receipts (
+        snapshot_id INTEGER PRIMARY KEY
+            REFERENCES asset_snapshots(id) ON DELETE CASCADE,
+        plan_version TEXT NOT NULL,
+        scopes_json TEXT NOT NULL,
+        attestation_text TEXT NOT NULL,
+        recorded_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
     """
 ]
 

@@ -74,6 +74,10 @@ python tools/stw_assets.py unresolved
 python tools/stw_assets.py coverage
 python tools/stw_assets.py queue
 python tools/stw_assets.py queue --max-priority 0 --paths-only
+python tools/stw_assets.py roster
+python tools/stw_assets.py perk "AssaultDamage"
+python tools/stw_assets.py batch-plan
+python tools/stw_assets.py roster-receipt --confirm-complete-recursive-export
 ```
 
 The checked-in Rescue Trooper golden manifest contains hashes and required follow-up
@@ -92,6 +96,15 @@ Gameplay tags, literal and curve-backed magnitudes, duration, period, applicatio
 stacking, cooldown/trigger facts, and inheritance are normalized for downstream rules.
 Custom magnitude and execution calculations remain explicitly opaque until a dedicated
 interpreter exists.
+
+The controlled roster workflow treats each exported `FortHeroGameplayDefinition` as one
+canonical gameplay identity and links every `FortHeroType` rarity/evolution record as a
+variant. `roster` reports missing mappings and classifies every perk family as resolved,
+partial, or opaque with exact blockers. `batch-plan` emits five ordered, relevant FModel
+export batches (HGD identities, HID variants, hero/leader perk implementations, shared
+GameplayEffect/ability bases, and the hero-perk balance table), then groups any remaining
+transitive references into deduplicated follow-up folders. Cosmetics, UI, progression,
+and unrelated active-ability assets are excluded from this workflow.
 
 ## Live local application
 

@@ -1157,6 +1157,56 @@ MIGRATIONS = [
         ON catalog_signature_weapon_owners(signature_effect_id);
     CREATE INDEX catalog_signature_owners_weapon_idx
         ON catalog_signature_weapon_owners(weapon_identity_id, weapon_variant_id);
+    """,
+    """
+    CREATE TABLE catalog_element_identities (
+        id INTEGER PRIMARY KEY,
+        snapshot_id INTEGER NOT NULL REFERENCES asset_snapshots(id) ON DELETE CASCADE,
+        element_key TEXT NOT NULL,
+        display_name TEXT NOT NULL,
+        internal_damage_tag TEXT NOT NULL,
+        identity_evidence TEXT NOT NULL
+            CHECK (identity_evidence IN ('localized_alteration_and_tag', 'gameplay_tag')),
+        semantic_status TEXT NOT NULL
+            CHECK (semantic_status IN ('supported', 'partial', 'opaque')),
+        UNIQUE (snapshot_id, element_key),
+        UNIQUE (snapshot_id, internal_damage_tag)
+    );
+    CREATE TABLE catalog_element_tags (
+        id INTEGER PRIMARY KEY,
+        element_id INTEGER NOT NULL REFERENCES catalog_element_identities(id) ON DELETE CASCADE,
+        tag_id INTEGER NOT NULL REFERENCES catalog_gameplay_tags(id) ON DELETE CASCADE,
+        tag_role TEXT NOT NULL
+            CHECK (tag_role IN ('damage', 'affliction', 'enemy', 'condition', 'declared')),
+        evidence_object_id INTEGER REFERENCES asset_objects(id),
+        UNIQUE (element_id, tag_id, tag_role)
+    );
+    CREATE TABLE catalog_status_identities (
+        id INTEGER PRIMARY KEY,
+        snapshot_id INTEGER NOT NULL REFERENCES asset_snapshots(id) ON DELETE CASCADE,
+        status_key TEXT NOT NULL,
+        display_name TEXT NOT NULL,
+        status_family TEXT NOT NULL,
+        primary_tag_id INTEGER NOT NULL REFERENCES catalog_gameplay_tags(id),
+        parent_status_id INTEGER REFERENCES catalog_status_identities(id),
+        semantic_status TEXT NOT NULL
+            CHECK (semantic_status IN ('supported', 'partial', 'opaque')),
+        UNIQUE (snapshot_id, status_key)
+    );
+    CREATE TABLE catalog_status_tags (
+        id INTEGER PRIMARY KEY,
+        status_id INTEGER NOT NULL REFERENCES catalog_status_identities(id) ON DELETE CASCADE,
+        tag_id INTEGER NOT NULL REFERENCES catalog_gameplay_tags(id) ON DELETE CASCADE,
+        tag_role TEXT NOT NULL
+            CHECK (tag_role IN ('primary', 'alias', 'condition', 'immunity', 'resistance')),
+        UNIQUE (status_id, tag_id, tag_role)
+    );
+    CREATE INDEX catalog_element_identities_snapshot_idx
+        ON catalog_element_identities(snapshot_id, display_name);
+    CREATE INDEX catalog_element_tags_tag_idx ON catalog_element_tags(tag_id);
+    CREATE INDEX catalog_status_identities_snapshot_idx
+        ON catalog_status_identities(snapshot_id, status_family, display_name);
+    CREATE INDEX catalog_status_tags_tag_idx ON catalog_status_tags(tag_id);
     """
 ]
 

@@ -18,7 +18,7 @@ from stw_pipeline import connect
 
 
 PERK_KIT_RE = re.compile(r"^Kit_Perk_H_(?P<family>.+)_(?P<tier>T\d+)$")
-NORMALIZER_VERSION = "interaction-v6"
+NORMALIZER_VERSION = "interaction-v7"
 ROSTER_PLAN_VERSION = "phase2-roster-v1"
 
 RUNTIME_DATA_ROW_STRUCTS = {
@@ -442,6 +442,11 @@ def _clear_normalized_snapshot(
         "(SELECT id FROM catalog_gadgets WHERE snapshot_id=?)",
         "DELETE FROM catalog_signature_weapon_owners WHERE signature_effect_id IN "
         "(SELECT id FROM catalog_signature_effects WHERE snapshot_id=?)",
+        "DELETE FROM catalog_element_tags WHERE element_id IN "
+        "(SELECT id FROM catalog_element_identities WHERE snapshot_id=?)",
+        "DELETE FROM catalog_status_tags WHERE status_id IN "
+        "(SELECT id FROM catalog_status_identities WHERE snapshot_id=?)",
+        "UPDATE catalog_status_identities SET parent_status_id=NULL WHERE snapshot_id=?",
     )
     for statement in leaf_deletes:
         connection.execute(statement, (snapshot_id,))
@@ -460,6 +465,8 @@ def _clear_normalized_snapshot(
         "catalog_active_abilities",
         "catalog_gadgets",
         "catalog_signature_effects",
+        "catalog_element_identities",
+        "catalog_status_identities",
         "catalog_heroes",
         "catalog_perks",
         "catalog_ability_kits",
@@ -582,6 +589,7 @@ def _normalize_snapshot(
         ("weapons", _normalize_weapon_catalog, (connection, snapshot_id, payloads)),
         ("signature effects", _normalize_signature_effects, (connection, snapshot_id)),
         ("gameplay tags", _normalize_gameplay_tags, (connection, snapshot_id, payloads)),
+        ("elements and statuses", _normalize_elements_and_statuses, (connection, snapshot_id)),
         ("modifier curves", _link_modifier_curves, (connection, snapshot_id)),
         ("magnitude curves", _link_magnitude_curves, (connection, snapshot_id)),
     )
@@ -3432,6 +3440,222 @@ def _normalize_gameplay_tags(
             )
 
 
+_ELEMENT_DAMAGE_TAGS = (
+    "Gameplay.Damage.Elemental.Fire",
+    "Gameplay.Damage.Elemental.Ice",
+    "Gameplay.Damage.Elemental.Lightning",
+    "Gameplay.Damage.Physical.Energy",
+    "Gameplay.Damage.Physical",
+)
+
+
+def _element_label_evidence(
+    connection: sqlite3.Connection, snapshot_id: int, tag_name: str
+) -> tuple[str, str, int | None]:
+    rows = connection.execute(
+        """
+        SELECT alteration.display_name, alteration.description,
+               alteration.source_object_id
+        FROM catalog_alterations alteration
+        JOIN catalog_gameplay_tag_occurrences occurrence
+          ON occurrence.source_object_id=alteration.source_object_id
+        JOIN catalog_gameplay_tags tag ON tag.id=occurrence.tag_id
+        WHERE alteration.snapshot_id=? AND tag.tag_name=?
+        ORDER BY alteration.id
+        """,
+        (snapshot_id, tag_name),
+    ).fetchall()
+    labels: dict[str, int] = {}
+    for row in rows:
+        match = re.search(r"\bElement:\s*([A-Za-z]+)", row["description"] or "")
+        if match:
+            labels.setdefault(match.group(1).title(), row["source_object_id"])
+    if len(labels) == 1:
+        label, object_id = next(iter(labels.items()))
+        return label, "localized_alteration_and_tag", object_id
+    return tag_name.rsplit(".", 1)[-1], "gameplay_tag", None
+
+
+def _status_family(tag_name: str) -> str:
+    leaf = tag_name.removeprefix("Gameplay.Status.").casefold()
+    if leaf.startswith("afflicted"):
+        return "affliction"
+    if "knockbackimmunity" in leaf or "immune" in leaf:
+        return "immunity"
+    if "regenblocked" in leaf:
+        return "regeneration_block"
+    if leaf.startswith("snare"):
+        return "snare"
+    if leaf.startswith("slow"):
+        return "slow"
+    if leaf.startswith("stun"):
+        return "stun"
+    if leaf.startswith("knockback"):
+        return "knockback"
+    if leaf.startswith("frozen"):
+        return "freeze"
+    if leaf.startswith("vulnerable"):
+        return "vulnerability"
+    return "other"
+
+
+def _status_semantic_status(
+    connection: sqlite3.Connection, snapshot_id: int, tag_id: int
+) -> str:
+    source_ids = [
+        row[0]
+        for row in connection.execute(
+            "SELECT DISTINCT source_object_id FROM catalog_gameplay_tag_occurrences WHERE tag_id=?",
+            (tag_id,),
+        )
+    ]
+    if not source_ids:
+        return "partial"
+    placeholders = ",".join("?" for _ in source_ids)
+    supported = connection.execute(
+        f"""
+        SELECT COUNT(*) FROM catalog_mechanics
+        WHERE snapshot_id=? AND source_object_id IN ({placeholders})
+          AND interpretation_status='supported'
+        """,
+        (snapshot_id, *source_ids),
+    ).fetchone()[0]
+    incomplete = connection.execute(
+        f"""
+        SELECT COUNT(*) FROM catalog_mechanics
+        WHERE snapshot_id=? AND source_object_id IN ({placeholders})
+          AND interpretation_status!='supported'
+        """,
+        (snapshot_id, *source_ids),
+    ).fetchone()[0]
+    opaque = connection.execute(
+        f"""
+        SELECT COUNT(*) FROM catalog_opaque_mechanics
+        WHERE snapshot_id=? AND source_object_id IN ({placeholders})
+        """,
+        (snapshot_id, *source_ids),
+    ).fetchone()[0]
+    if supported:
+        return "partial" if incomplete or opaque else "supported"
+    return "opaque" if opaque else "partial"
+
+
+def _normalize_elements_and_statuses(
+    connection: sqlite3.Connection, snapshot_id: int
+) -> None:
+    tag_rows = {
+        row["tag_name"]: row
+        for row in connection.execute(
+            "SELECT id, tag_name FROM catalog_gameplay_tags WHERE snapshot_id=?",
+            (snapshot_id,),
+        )
+    }
+    for damage_tag in _ELEMENT_DAMAGE_TAGS:
+        tag = tag_rows.get(damage_tag)
+        if tag is None:
+            continue
+        label, evidence, evidence_object_id = _element_label_evidence(
+            connection, snapshot_id, damage_tag
+        )
+        element_id = connection.execute(
+            """
+            INSERT INTO catalog_element_identities(
+                snapshot_id, element_key, display_name, internal_damage_tag,
+                identity_evidence, semantic_status
+            ) VALUES (?, ?, ?, ?, ?, 'partial')
+            """,
+            (snapshot_id, label.casefold(), label, damage_tag, evidence),
+        ).lastrowid
+        connection.execute(
+            """
+            INSERT INTO catalog_element_tags(element_id, tag_id, tag_role, evidence_object_id)
+            VALUES (?, ?, 'damage', ?)
+            """,
+            (element_id, tag["id"], evidence_object_id),
+        )
+        internal_leaf = damage_tag.rsplit(".", 1)[-1]
+        affliction_candidates = {
+            "Energy": "Gameplay.Status.Afflicted.Energy",
+        }
+        affliction_tag = tag_rows.get(
+            affliction_candidates.get(
+                internal_leaf, f"Gameplay.Status.Afflicted.{damage_tag.removeprefix('Gameplay.Damage.')}"
+            )
+        )
+        if affliction_tag:
+            connection.execute(
+                """
+                INSERT INTO catalog_element_tags(element_id, tag_id, tag_role)
+                VALUES (?, ?, 'affliction')
+                """,
+                (element_id, affliction_tag["id"]),
+            )
+        enemy_occurrence = connection.execute(
+            """
+            SELECT occurrence.source_object_id
+            FROM catalog_gameplay_tag_occurrences occurrence
+            JOIN asset_objects object ON object.id=occurrence.source_object_id
+            WHERE occurrence.tag_id=? AND (
+              object.package_path LIKE '/SaveTheWorld/Abilities/NPC/%'
+              OR object.package_path LIKE '/SaveTheWorld/Characters/Enemies/%'
+            ) ORDER BY occurrence.id LIMIT 1
+            """,
+            (tag["id"],),
+        ).fetchone()
+        if enemy_occurrence:
+            connection.execute(
+                """
+                INSERT INTO catalog_element_tags(element_id, tag_id, tag_role, evidence_object_id)
+                VALUES (?, ?, 'enemy', ?)
+                """,
+                (element_id, tag["id"], enemy_occurrence["source_object_id"]),
+            )
+
+    status_rows = [
+        row for name, row in sorted(tag_rows.items())
+        if name.startswith("Gameplay.Status.")
+    ]
+    status_ids: dict[str, int] = {}
+    for tag in status_rows:
+        suffix = tag["tag_name"].removeprefix("Gameplay.Status.")
+        display = suffix.replace(".", " / ")
+        status_id = connection.execute(
+            """
+            INSERT INTO catalog_status_identities(
+                snapshot_id, status_key, display_name, status_family,
+                primary_tag_id, semantic_status
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                snapshot_id,
+                tag["tag_name"].casefold(),
+                display,
+                _status_family(tag["tag_name"]),
+                tag["id"],
+                _status_semantic_status(connection, snapshot_id, tag["id"]),
+            ),
+        ).lastrowid
+        status_ids[tag["tag_name"]] = status_id
+        connection.execute(
+            "INSERT INTO catalog_status_tags(status_id, tag_id, tag_role) VALUES (?, ?, 'primary')",
+            (status_id, tag["id"]),
+        )
+    for tag_name, status_id in status_ids.items():
+        parent = tag_name.rsplit(".", 1)[0]
+        if parent in status_ids:
+            connection.execute(
+                "UPDATE catalog_status_identities SET parent_status_id=? WHERE id=?",
+                (status_ids[parent], status_id),
+            )
+    frozen_alias = tag_rows.get("Gameplay.Effect.Frozen")
+    frozen_status = status_ids.get("Gameplay.Status.Frozen")
+    if frozen_alias and frozen_status:
+        connection.execute(
+            "INSERT INTO catalog_status_tags(status_id, tag_id, tag_role) VALUES (?, ?, 'alias')",
+            (frozen_status, frozen_alias["id"]),
+        )
+
+
 def latest_asset_snapshot_id(connection: sqlite3.Connection) -> int | None:
     row = connection.execute(
         "SELECT id FROM asset_snapshots WHERE status='ready' ORDER BY id DESC LIMIT 1"
@@ -5735,6 +5959,8 @@ def _snapshot_summary(
             "catalog_schematics",
             "catalog_alterations",
             "catalog_signature_effects",
+            "catalog_element_identities",
+            "catalog_status_identities",
             "catalog_weapon_slot_loadouts",
         )
     }

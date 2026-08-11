@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "scopes": [
+    {
+      "kind": "folder",
+      "path": "/SaveTheWorld/Abilities/NPC/Elemental"
+    },
+    {
+      "kind": "package",
+      "path": "/Game/Abilities/Player/Generic/GameplayEffects/GE_Generic_StaminaRegenLockout"
+    },
+    {
+      "kind": "package",
+      "path": "/SaveTheWorld/Abilities/NPC/MiniBoss/Abilities/GE_UG_ImmuneToAllButTraps"
+    },
+    {
+      "kind": "package",
+      "path": "/SaveTheWorld/Abilities/NPC/MiniBoss/Abilities/GE_UG_ImmuneToRangeWeapons"
+    },
+    {
+      "kind": "package",
+      "path": "/SaveTheWorld/Abilities/NPC/MiniBoss/Abilities/GE_UG_VulnerableToMelee"
+    },
+    {
+      "kind": "package",
+      "path": "/SaveTheWorld/Abilities/NPC/MiniBoss/Abilities/GE_UG_VulnerableToTraps"
+    },
+    {
+      "kind": "package",
+      "path": "/SaveTheWorld/Balance/DataTables/CombatEffects_NPC"
+    }
+  ]
+}

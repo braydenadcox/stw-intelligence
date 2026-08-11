@@ -231,6 +231,20 @@ stacking, status/element tags, coefficients, source hashes, and explicit Bluepri
 boundaries. See
 [signature weapon interaction semantics](docs/signature-weapon-interaction-semantics.md).
 
+Element and status identities connect those systems to exact damage/status tags, enemy
+element grants, conditional resistance curves, status lifecycles, and immunity boundaries:
+
+```powershell
+python tools/stw_elements.py --db data/phase2-real-validation.sqlite3 coverage
+python tools/stw_elements.py --db data/phase2-real-validation.sqlite3 element Water
+python tools/stw_elements.py --db data/phase2-real-validation.sqlite3 status Afflicted
+```
+
+The catalog preserves the real Water/Ice and Nature/Lightning naming layers, proves
+conditional enemy `DamageResistance` and freeze-duration curve values, and leaves the
+native final-damage conversion explicitly unresolved. See
+[element and status interaction semantics](docs/element-status-interaction-semantics.md).
+
 ## Live local application
 
 On Windows, the default command watches Fortnite's standard log location, loads the

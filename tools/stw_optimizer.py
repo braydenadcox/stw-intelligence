@@ -61,6 +61,24 @@ class HeroProgression:
 
 
 @dataclass(frozen=True)
+class OptimizationConstraints:
+    """User/inventory constraints applied before heuristic search."""
+
+    owned_heroes: tuple[str, ...] = ()
+    unavailable_heroes: tuple[str, ...] = ()
+    locked_commander: str | None = None
+    locked_supports: tuple[str, ...] = ()
+    locked_team_perk: str | None = None
+    owned_team_perks: tuple[str, ...] = ()
+    locked_gadgets: tuple[str, ...] = ()
+    owned_gadgets: tuple[str, ...] = ()
+    allow_partial: bool = True
+    allow_opaque: bool = True
+    avoid_mechanics: tuple[str, ...] = ()
+    locked_weapon_perks: tuple[tuple[int, str], ...] = ()
+
+
+@dataclass(frozen=True)
 class OptimizationRequest:
     weapon: str
     target: TargetContext
@@ -73,6 +91,7 @@ class OptimizationRequest:
     beam_width: int = 128
     max_results: int = 10
     item_level: int | None = None
+    constraints: OptimizationConstraints = OptimizationConstraints()
 
     def weights(self) -> dict[str, float]:
         weights = dict(self.objective_weights)
@@ -276,6 +295,9 @@ def _weapon_option_profiles(connection: sqlite3.Connection, slot_loadout_id: int
                      "exclusions": _json(row["exclusion_names_json"], []),
                      "semantic_status": row["semantic_status"],
                      "objective_scores": _objective_scores(dict(row)),
+                     "semantic_facts": {"display_name": row["display_name"],
+                                        "description": row["description"],
+                                        "tags": _json(row["tags_json"], [])},
                      "perk_rarity": row["perk_rarity"],
                      "source": _source_for_object(connection, row["source_object_id"])}
             options.append(value)
@@ -332,12 +354,17 @@ def _weapon_configurations(connection: sqlite3.Connection, variants: Sequence[sq
 
 def _hero_beam(commanders: Sequence[dict[str, Any]], supports: Sequence[dict[str, Any]],
                weights: Mapping[str, float], support_slots: int, beam_width: int,
-               stats: SearchStats) -> list[dict[str, Any]]:
+               stats: SearchStats,
+               locked_supports: Sequence[dict[str, Any]] = ()) -> list[dict[str, Any]]:
     ranked_commanders = sorted(commanders, key=lambda item: (-_weighted(item, weights), item["hero_key"]))[:max(24, beam_width // 2)]
     ranked_supports = sorted(supports, key=lambda item: (-_weighted(item, weights), item["hero_key"]))[:max(48, beam_width)]
-    beam = [{"commander": commander, "supports": [], "used": {commander["hero_key"]},
-             "heuristic": _weighted(commander, weights)} for commander in ranked_commanders]
-    for _ in range(support_slots):
+    locked_keys = {hero["hero_key"] for hero in locked_supports}
+    beam = [{"commander": commander, "supports": list(locked_supports),
+             "used": {commander["hero_key"], *locked_keys},
+             "heuristic": _weighted(commander, weights) +
+                sum(_weighted(hero, weights) for hero in locked_supports)}
+            for commander in ranked_commanders if commander["hero_key"] not in locked_keys]
+    for _ in range(support_slots - len(locked_supports)):
         expanded = []
         for state in beam:
             for support in ranked_supports:
@@ -366,6 +393,59 @@ def _hero_beam(commanders: Sequence[dict[str, Any]], supports: Sequence[dict[str
         stats.pruned_by_beam += max(0, len(expanded) - len(diverse))
         beam = diverse
     return beam
+
+
+def _matches_choice(profile: Mapping[str, Any], choice: str) -> bool:
+    wanted = choice.casefold()
+    return wanted in {
+        str(profile.get("hero_key") or profile.get("key") or "").casefold(),
+        str(profile.get("display_name") or "").casefold(),
+    }
+
+
+def _filter_profiles(
+    profiles: Sequence[dict[str, Any]], owned: Sequence[str], unavailable: Sequence[str],
+    avoid_mechanics: Sequence[str] = (),
+) -> list[dict[str, Any]]:
+    result = list(profiles)
+    if owned:
+        result = [item for item in result if any(_matches_choice(item, name) for name in owned)]
+    if unavailable:
+        result = [item for item in result if not any(_matches_choice(item, name) for name in unavailable)]
+    if avoid_mechanics:
+        result = [item for item in result if not any(
+            _profile_matches_avoid(item, mechanic) for mechanic in avoid_mechanics
+        )]
+    return result
+
+
+def _profile_matches_avoid(profile: Mapping[str, Any], mechanic: str) -> bool:
+    # Only normalized semantic facts participate. Source paths and identity filenames
+    # are provenance, not evidence that a mechanic exists.
+    text = _flatten_text({
+        "evidence": profile.get("evidence"),
+        "semantic_facts": profile.get("semantic_facts"),
+    })
+    normalized = mechanic.casefold().replace("_", " ").replace("-", " ")
+    aliases = {
+        "elimination trigger": ("elimination", "onkill", "on kill", "kill trigger"),
+    }.get(normalized, (normalized,))
+    return any(alias in text for alias in aliases)
+
+
+def _resolve_locked(
+    profiles: Sequence[dict[str, Any]], choices: Sequence[str], kind: str
+) -> list[dict[str, Any]]:
+    resolved = []
+    for choice in choices:
+        matches = [item for item in profiles if _matches_choice(item, choice)]
+        if len(matches) != 1:
+            raise ValueError(f"locked {kind} must resolve exactly once: {choice!r}")
+        resolved.append(matches[0])
+    keys = [item.get("hero_key") or item.get("key") for item in resolved]
+    if len(keys) != len(set(keys)):
+        raise ValueError(f"locked {kind} choices must be unique")
+    return resolved
 
 
 def _enum_value(value: str | None, prefix: str, order: Mapping[str, int]) -> int | None:
@@ -429,6 +509,7 @@ def _interaction_profiles(connection: sqlite3.Connection, snapshot_id: int) -> t
         team.append({"key": row["team_perk_key"], "display_name": row["display_name"],
                      "semantic_status": status,
                      "objective_scores": _objective_scores(value), "report": report,
+                     "semantic_facts": value,
                      "source": _source_for_object(connection, row["source_object_id"])})
     gadgets = []
     for row in connection.execute("SELECT * FROM catalog_gadgets WHERE snapshot_id=? ORDER BY gadget_key", (snapshot_id,)):
@@ -444,6 +525,7 @@ def _interaction_profiles(connection: sqlite3.Connection, snapshot_id: int) -> t
         gadgets.append({"key": row["gadget_key"], "display_name": row["display_name"],
                         "semantic_status": status,
                         "objective_scores": _objective_scores(value),
+                        "semantic_facts": value,
                         "source": _source_for_object(connection, row["source_object_id"])})
     return team, gadgets
 
@@ -621,20 +703,75 @@ def optimize_loadouts(connection: sqlite3.Connection, request: OptimizationReque
     snapshot_id = snapshot_id or latest_asset_snapshot_id(connection)
     if snapshot_id is None: raise ValueError("no ready asset snapshot")
     stats = SearchStats()
+    constraints = request.constraints
     variants = _resolve_weapon_variants(connection, snapshot_id, request.weapon)
     weapon_configs, theoretical_weapons, weapon_pruned = _weapon_configurations(
         connection, variants, weights, request.beam_width, request.item_level)
+    if constraints.avoid_mechanics:
+        weapon_configs = [item for item in weapon_configs if not any(
+            _profile_matches_avoid(profile, mechanic)
+            for profile in item["profiles"]
+            for mechanic in constraints.avoid_mechanics
+        )]
+        if not weapon_configs:
+            raise ValueError("avoided mechanics leave no legal weapon perk configurations")
+    if constraints.locked_weapon_perks:
+        required = {(slot, key.casefold()) for slot, key in constraints.locked_weapon_perks}
+        weapon_configs = [item for item in weapon_configs if required.issubset({
+            (perk.slot_ordinal, perk.alteration_key.casefold())
+            for perk in item["configuration"].perks
+        })]
+        if not weapon_configs:
+            raise ValueError("locked weapon perks leave no legal weapon configurations")
     stats.weapon_configurations = theoretical_weapons
     stats.pruned_by_beam += weapon_pruned
     commanders, supports = _hero_profiles(connection, snapshot_id)
+    commanders = _filter_profiles(
+        commanders, constraints.owned_heroes, constraints.unavailable_heroes,
+        constraints.avoid_mechanics,
+    )
+    supports = _filter_profiles(
+        supports, constraints.owned_heroes, constraints.unavailable_heroes,
+        constraints.avoid_mechanics,
+    )
+    if constraints.locked_commander:
+        commanders = _resolve_locked(
+            commanders, (constraints.locked_commander,), "commander"
+        )
+    locked_supports = _resolve_locked(
+        supports, constraints.locked_supports, "support hero"
+    )
+    if len(locked_supports) > request.support_slots:
+        raise ValueError("more locked supports than available support slots")
     if request.support_slots and len(supports) < request.support_slots:
         raise ValueError("catalog does not contain enough support heroes")
+    if not commanders:
+        raise ValueError("constraints leave no legal commander candidates")
     stats.theoretical_hero_loadouts = len(commanders) * (
         math.comb(max(0, len(supports) - 1), request.support_slots)
         if len(supports) - 1 >= request.support_slots else 0)
-    hero_states = _hero_beam(commanders, supports, weights, request.support_slots,
-                             request.beam_width, stats)
+    hero_states = _hero_beam(
+        commanders, supports, weights, request.support_slots,
+        request.beam_width, stats, locked_supports,
+    )
+    if not hero_states:
+        raise ValueError("constraints leave no legal commander/support combinations")
     team_profiles, gadget_profiles = _interaction_profiles(connection, snapshot_id)
+    team_profiles = _filter_profiles(
+        team_profiles, constraints.owned_team_perks, (), constraints.avoid_mechanics,
+    )
+    if constraints.locked_team_perk:
+        team_profiles = _resolve_locked(
+            team_profiles, (constraints.locked_team_perk,), "team perk"
+        )
+    gadget_profiles = _filter_profiles(
+        gadget_profiles, constraints.owned_gadgets, (), constraints.avoid_mechanics,
+    )
+    locked_gadgets = _resolve_locked(
+        gadget_profiles, constraints.locked_gadgets, "gadget"
+    )
+    if len(locked_gadgets) > request.gadget_slots:
+        raise ValueError("more locked gadgets than available gadget slots")
     expanded = []
     for state in hero_states:
         if not team_profiles:
@@ -656,7 +793,17 @@ def optimize_loadouts(connection: sqlite3.Connection, request: OptimizationReque
     expanded.sort(key=lambda item: -item["heuristic"])
     stats.pruned_by_beam += max(0, len(expanded) - request.beam_width)
     expanded = expanded[:request.beam_width]
-    gadget_sets = list(itertools.combinations(gadget_profiles, request.gadget_slots)) if request.gadget_slots else [()]
+    locked_gadget_keys = {item["key"] for item in locked_gadgets}
+    remaining_gadgets = [
+        item for item in gadget_profiles if item["key"] not in locked_gadget_keys
+    ]
+    needed_gadgets = request.gadget_slots - len(locked_gadgets)
+    gadget_sets = [
+        (*locked_gadgets, *group)
+        for group in itertools.combinations(remaining_gadgets, needed_gadgets)
+    ] if needed_gadgets else [tuple(locked_gadgets)]
+    if request.gadget_slots and not gadget_sets:
+        raise ValueError("constraints leave no legal gadget combinations")
     stats.gadget_combinations = len(gadget_sets)
     with_gadgets = []
     gadget_choice_count = max(1, min(8, request.beam_width // max(1, len(expanded))))
@@ -689,6 +836,12 @@ def optimize_loadouts(connection: sqlite3.Connection, request: OptimizationReque
     cache: dict[Any, Any] = {}
     rendered = [_render_candidate(connection, snapshot_id, candidate, request, context, cache, stats)
                 for candidate in deduplicated]
+    if not constraints.allow_opaque:
+        rendered = [item for item in rendered if not item["opaque_components"]]
+    if not constraints.allow_partial:
+        rendered = [item for item in rendered if not item["partial_components"]]
+    if not rendered:
+        raise ValueError("constraints leave no candidates with an allowed evidence status")
     stats.evaluated_candidates = len(rendered)
     _normalize_and_rank(rendered, weights)
     stats.pareto_dominated = _mark_pareto(rendered, weights)

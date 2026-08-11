@@ -33,6 +33,7 @@ from stw_activity import (
     recommendation_overview,
     refresh_activity,
 )
+from stw_ai import AiOrchestrator, StwAiTools
 from stw_live import LogWatcher
 from stw_pipeline import connect
 from stw_providers import (
@@ -194,7 +195,31 @@ class ApiApplication:
                     )
                     refresh_activity(connection)
                     return self._json(HTTPStatus.OK, result)
+                if parsed.path == "/api/ai/recommend":
+                    request = payload.get("request")
+                    intent = payload.get("intent")
+                    if not isinstance(request, str) or not request.strip():
+                        return self._json(
+                            HTTPStatus.BAD_REQUEST,
+                            {"error": "request must be a non-empty string"},
+                        )
+                    if intent is not None and not isinstance(intent, dict):
+                        return self._json(
+                            HTTPStatus.BAD_REQUEST,
+                            {"error": "intent must be an object"},
+                        )
+                    try:
+                        result = AiOrchestrator(StwAiTools(connection)).run(
+                            request.strip(), intent
+                        )
+                    except ValueError as error:
+                        return self._json(
+                            HTTPStatus.BAD_REQUEST, {"error": str(error)}
+                        )
+                    return self._json(HTTPStatus.OK, result)
                 return self._json(HTTPStatus.NOT_FOUND, {"error": "not found"})
+            if parsed.path == "/api/ai/tools":
+                return self._json(HTTPStatus.OK, StwAiTools.schemas())
             if parsed.path == "/api/current":
                 return self._json(HTTPStatus.OK, current_state(connection))
             if parsed.path == "/api/attempts":

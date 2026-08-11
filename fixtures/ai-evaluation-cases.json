@@ -1,0 +1,83 @@
+{
+  "schema_version": "stw.ai-evaluation.v1",
+  "cases": [
+    {
+      "id": "nocturno-160",
+      "request": "Build me the strongest Nocturno loadout for 160s.",
+      "grounding": [{"kind": "weapon", "entity_key": "nocturno", "display_name": "Nocturno", "semantic_status": "partial"}],
+      "expect": {"weapon": "Nocturno", "power_level": 160, "objective": "sustained_damage"}
+    },
+    {
+      "id": "potshot-smasher",
+      "request": "Make me a Potshot build specifically for deleting Smashers.",
+      "grounding": [
+        {"kind": "weapon", "entity_key": "potshot", "display_name": "The Potshot", "semantic_status": "partial"},
+        {"kind": "enemy", "entity_key": "smasher", "display_name": "Smasher", "semantic_status": "partial"}
+      ],
+      "expect": {"weapon": "The Potshot", "enemy": "smasher", "objective": "burst_damage"}
+    },
+    {
+      "id": "constructor-control",
+      "request": "I want a ridiculous crowd-control Constructor build.",
+      "grounding": [],
+      "expect": {"objective": "crowd_control", "requires_weapon_clarification": true}
+    },
+    {
+      "id": "existing-criticism",
+      "request": "Here is my current loadout. What sucks about it?",
+      "grounding": [],
+      "expect": {"mode": "analyze"}
+    },
+    {
+      "id": "teddy-uptime",
+      "request": "Give me the best TEDDY build but prioritize ability uptime over raw damage.",
+      "grounding": [{"kind": "ability", "entity_key": "teddy", "display_name": "TEDDY", "semantic_status": "partial"}],
+      "expect": {"objective": "ability_uptime", "requires_weapon_clarification": true}
+    },
+    {
+      "id": "aggressive-no-kills",
+      "request": "I want something fun and aggressive that doesn't rely on kills.",
+      "grounding": [],
+      "expect": {"objective": "condition_reliability", "avoid": "elimination_trigger"}
+    },
+    {
+      "id": "nature-storm",
+      "request": "What should I change if the mission is a Nature storm?",
+      "grounding": [],
+      "expect": {"elemental_storm": "Nature", "requires_weapon_clarification": true}
+    },
+    {
+      "id": "paleo-luna",
+      "request": "Build around Paleo Luna.",
+      "grounding": [{"kind": "hero", "entity_key": "paleo-luna", "display_name": "Paleo Luna", "semantic_status": "partial"}],
+      "expect": {"locked_commander": "Paleo Luna", "requires_weapon_clarification": true}
+    },
+    {
+      "id": "ownership-restriction",
+      "request": "I don't own Lynx. Give me my best Potshot alternative.",
+      "grounding": [
+        {"kind": "hero", "entity_key": "lynx", "display_name": "Lynx", "semantic_status": "opaque"},
+        {"kind": "weapon", "entity_key": "potshot", "display_name": "The Potshot", "semantic_status": "partial"}
+      ],
+      "expect": {"weapon": "The Potshot", "unavailable": "Lynx"}
+    },
+    {
+      "id": "survival",
+      "request": "Give me a tanky healing build for a four player mission.",
+      "grounding": [],
+      "expect": {"objective": "survivability", "requires_weapon_clarification": true}
+    },
+    {
+      "id": "boss-reliability",
+      "request": "I need a reliable boss build without kills.",
+      "grounding": [],
+      "expect": {"objective": "mist_monster_boss", "avoid": "elimination_trigger"}
+    },
+    {
+      "id": "vague-request",
+      "request": "Make me something fun.",
+      "grounding": [],
+      "expect": {"objective": "sustained_damage", "requires_weapon_clarification": true}
+    }
+  ]
+}

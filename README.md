@@ -266,6 +266,19 @@ python tools/stw_optimizer.py --db data/phase2-real-validation.sqlite3 `
 See [full deterministic loadout optimization](docs/full-loadout-optimization.md) for
 legality, weighted objectives, pruning, uncertainty handling, and real benchmarks.
 
+The evidence-constrained AI backend turns natural-language requests into validated
+optimizer calls without allowing the language layer to invent Fortnite facts:
+
+```powershell
+python tools/stw_ai.py `
+  "Build me the strongest Nocturno loadout for 160s." `
+  --db data/phase2-real-validation.sqlite3
+```
+
+See [AI reasoning and recommendation](docs/ai-reasoning-layer.md) for the versioned
+`BuildIntent`, provider interface, targeted tools, ownership constraints, loadout
+analysis, API endpoint, and hallucination safeguards.
+
 The catalog preserves the real Water/Ice and Nature/Lightning naming layers, proves
 conditional enemy `DamageResistance` and freeze-duration curve values, and leaves the
 native final-damage conversion explicitly unresolved. See

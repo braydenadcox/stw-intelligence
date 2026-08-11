@@ -1,0 +1,253 @@
+schema_version: 1
+benchmark_id: stw-golden-qa-2026
+maintainer_note: >-
+  These sources are expert evidence, not canonical game data. Dates indicate when the
+  video was published, not that every numerical claim was independently runtime-tested.
+  Use source_currentness together with each QA case's enforcement and verification fields.
+
+currentness_policy:
+  current_2026: Published in 2026 and eligible to support current QA expectations.
+  historical_unverified: Published before 2026; useful only after asset or runtime confirmation.
+  version_sensitive: Describes behavior that may be bugged, undocumented, or patch-dependent.
+
+sources:
+  - id: S01
+    order: 1
+    title: "2026: Ranking EVERY ASSAULT RIFLE"
+    published: 2026-03-13
+    url: "https://www.youtube.com/watch?v=kfZLGNeHZrU"
+    evidence_type: comparative_tier_test
+    source_currentness: current_2026
+    scope: assault rifles, raw versus loadout rankings, elemental and perk constraints
+
+  - id: S02
+    order: 2
+    title: "Ranking EVERY SHOTGUN"
+    published: 2026-04-10
+    url: "https://www.youtube.com/watch?v=yvZpBSw73mk"
+    evidence_type: comparative_tier_test
+    source_currentness: current_2026
+    scope: shotguns, raw versus loadout rankings, burst versus sustained damage
+
+  - id: S03
+    order: 3
+    title: "Ranking EVERY CONSTRUCTOR"
+    published: 2026-04-29
+    url: "https://www.youtube.com/watch?v=2q4UMrSpbAo"
+    evidence_type: comparative_tier_test
+    source_currentness: current_2026
+    scope: constructor commanders, supports, team perks, defense and combat roles
+
+  - id: S04
+    order: 4
+    title: "Ranking EVERY GADGET"
+    published: 2026-05-05
+    url: "https://www.youtube.com/watch?v=KZ_vlEbluGE"
+    evidence_type: comparative_tier_test
+    source_currentness: current_2026
+    scope: all eight gadgets, cooldowns, team utility, scenario-dependent value
+
+  - id: S05
+    order: 5
+    title: "Chaos Exploder with Crackshot is FANTASTIC!"
+    published: 2026-08-02
+    url: "https://www.youtube.com/watch?v=BdAiaRD5fww"
+    evidence_type: follow_up_build_test
+    source_currentness: current_2026
+    scope: Chaos Exploder pacing, Crackshot persistence, ammo recovery, practical DPS
+
+  - id: S06
+    order: 6
+    title: "The BEST PERKS for the Chaos Exploder"
+    published: 2026-07-31
+    url: "https://www.youtube.com/watch?v=shGtk1lsPDI"
+    evidence_type: controlled_perk_test
+    source_currentness: current_2026
+    scope: Chaos Exploder perk choices, fire rate, magazine size, reload and element constraints
+
+  - id: S07
+    order: 7
+    title: "FIRST LOOK at the NEW Chaos Exploder AR"
+    published: 2026-07-30
+    url: "https://www.youtube.com/watch?v=RvcQ9zjKBJc"
+    evidence_type: first_look_runtime_test
+    source_currentness: current_2026
+    scope: Chaos Exploder core mechanic, reload interactions, early build hypotheses
+
+  - id: S08
+    order: 8
+    title: "Fortnite Save the World Elements Explained"
+    published: 2026-06-02
+    url: "https://www.youtube.com/watch?v=wb6NY92WxJI"
+    evidence_type: epic_sponsored_instruction
+    source_currentness: current_2026
+    scope: weapon elements, elemental enemies, wall-material counters
+
+  - id: S09
+    order: 9
+    title: "Fortnite Save the World Hero Loadouts Explained"
+    published: 2026-06-04
+    url: "https://www.youtube.com/watch?v=MTjYLElrsSM"
+    evidence_type: epic_sponsored_instruction
+    source_currentness: current_2026
+    scope: commander/support construction, team-perk activation, accessible starter loadout
+
+  - id: S10
+    order: 10
+    title: "The BEST WEAPONS to use with Defenders"
+    published: 2026-06-09
+    url: "https://www.youtube.com/watch?v=yIwxzggZvss"
+    evidence_type: feature_loadout_test
+    source_currentness: current_2026
+    scope: defender weapon interactions, signature perks, range and targeting limitations
+
+  - id: S11
+    order: 11
+    title: "Ranking EVERY DEFENDER"
+    published: 2026-06-12
+    url: "https://www.youtube.com/watch?v=MoFJudPsGTg"
+    evidence_type: comparative_tier_test
+    source_currentness: current_2026
+    scope: defender archetypes, perk rolls, free equipment/ammo behavior
+
+  - id: S12
+    order: 12
+    title: "The Supply Drop Got a MASSIVE Buff! The NEW Best Way to FARM?"
+    published: 2026-03-21
+    url: "https://www.youtube.com/watch?v=gDnNZ5j2lDk"
+    evidence_type: patch_behavior_test
+    source_currentness: current_2026
+    scope: Supply Drop resources, instancing, cooldown, Gadgeteer farming loops
+
+  - id: S13
+    order: 13
+    title: "Flash A.C. with the Black Drum is INSANE!"
+    published: 2026-04-04
+    url: "https://www.youtube.com/watch?v=a07wDLHYPcg"
+    evidence_type: mature_build_test
+    source_currentness: current_2026
+    scope: Black Drum phase-shift reload loop, missing-health scaling, survivability
+    flags: [version_sensitive]
+
+  - id: S14
+    order: 14
+    title: "The Black Drum is INCREDIBLE!"
+    published: 2026-03-24
+    url: "https://www.youtube.com/watch?v=zNlEdpqgxyg"
+    evidence_type: first_build_test
+    source_currentness: current_2026
+    scope: Black Drum reload explosion, self-damage, suspected per-pellet behavior
+    flags: [version_sensitive, suspected_bug]
+
+  - id: S15
+    order: 15
+    title: "The NEW Horde Melee META with ED-EE!"
+    published: 2026-04-18
+    url: "https://www.youtube.com/watch?v=9f3v9yQ68iM"
+    evidence_type: scenario_build_test
+    source_currentness: current_2026
+    scope: ED-EE energy melee, shield sustain, Horde-specific trap synergy
+
+  - id: S16
+    order: 16
+    title: "The BEST Shotgun Build for Power Hour!"
+    published: 2026-05-20
+    url: "https://www.youtube.com/watch?v=QiuQkbNz1so"
+    evidence_type: limited_event_test
+    source_currentness: current_2026
+    scope: Super Soldier modifier, War Cry, Ground Pounder, Chaos Agent reload
+    flags: [special_scenario_only]
+
+  - id: S17
+    order: 17
+    title: "The BEST Rocket Spam Build for Power Hour!"
+    published: 2026-05-18
+    url: "https://www.youtube.com/watch?v=UvwTQkt6hpQ"
+    evidence_type: limited_event_test
+    source_currentness: current_2026
+    scope: Super Soldier modifier, launcher ammo conservation, War Cry uptime
+    flags: [special_scenario_only]
+
+  - id: S18
+    order: 18
+    title: "The BEST Lefty and Righty Build for Power Hour!"
+    published: 2026-05-16
+    url: "https://www.youtube.com/watch?v=_N_n5rU00cA"
+    evidence_type: limited_event_test
+    source_currentness: current_2026
+    scope: Super Soldier modifier, Raven abilities, War Cry and launcher reset loop
+    flags: [special_scenario_only]
+
+  - id: S19
+    order: 19
+    title: "Stun EVERYTHING with the Tree of Light!"
+    published: 2026-07-11
+    url: "https://www.youtube.com/watch?v=ivlJblOQFIE"
+    evidence_type: themed_build_test
+    source_currentness: current_2026
+    scope: Tree of Light stun cadence, Paleo Luna, attack speed, mist-monster control
+
+  - id: S20
+    order: 20
+    title: "The BEST PERKS for the Broadside"
+    published: 2026-04-23
+    url: "https://www.youtube.com/watch?v=CKUtJ83nAu8"
+    evidence_type: controlled_trap_test
+    source_currentness: current_2026
+    scope: Broadside geometry, bounce distance, damage perks, sixth-perk tradeoffs
+
+  - id: S21
+    order: 21
+    title: "The BEST PERKS for the Ceiling Drop Trap"
+    published: 2026-04-08
+    url: "https://www.youtube.com/watch?v=rHxiJx9k3k8"
+    evidence_type: controlled_trap_test
+    source_currentness: current_2026
+    scope: Ceiling Drop Trap height, direction, perk layout, durability and structure support
+
+  - id: S22
+    order: 22
+    title: "The ULTIMATE Popcorn Trap Build!"
+    published: 2026-05-01
+    url: "https://www.youtube.com/watch?v=JDhStXAOYYI"
+    evidence_type: novelty_build_test
+    source_currentness: current_2026
+    scope: Floor Launcher and Ceiling Drop Trap interaction, performance risk
+    flags: [novelty_not_recommendation]
+
+  - id: S23
+    order: 23
+    title: "FREE ROCKETS with This INSANE Build!"
+    published: 2026-03-29
+    url: "https://www.youtube.com/watch?v=QjSVM7KY_7E"
+    evidence_type: mature_build_test
+    source_currentness: current_2026
+    scope: War Cry launcher ammo conservation, cooldown and duration support, team staggering
+
+  - id: S24
+    order: 24
+    title: "Mermonster Ken with the Husk Grinder is NUTS!"
+    published: 2026-03-20
+    url: "https://www.youtube.com/watch?v=cWjIoHdOkSo"
+    evidence_type: themed_build_test
+    source_currentness: current_2026
+    scope: missing-health melee scaling, heavy-attack sustain, single-target failure mode
+
+  - id: S25
+    order: 25
+    title: "The Room Sweeper is a MONSTER!"
+    published: 2026-03-17
+    url: "https://www.youtube.com/watch?v=k_xUxgRlzzQ"
+    evidence_type: themed_build_test
+    source_currentness: current_2026
+    scope: Room Sweeper fire rate, magazine/reload management, Totally Rocking Out
+
+  - id: S26
+    order: 26
+    title: "Stoneheart Farrah and the Vacuum Tube Bow are INSANE!"
+    published: 2025-12-09
+    url: "https://www.youtube.com/watch?v=QgYEhXQbMIY"
+    evidence_type: historical_build_test
+    source_currentness: historical_unverified
+    scope: Vacuum Tube Bow chain lightning, Stoneheart Farrah branching, crowd-clear role
+    flags: [requires_2026_revalidation]

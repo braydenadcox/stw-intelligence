@@ -266,6 +266,19 @@ python tools/stw_optimizer.py --db data/phase2-real-validation.sqlite3 `
 See [full deterministic loadout optimization](docs/full-loadout-optimization.md) for
 legality, weighted objectives, pruning, uncertainty handling, and real benchmarks.
 
+The 2026 golden QA benchmark is integrated as a typed, evidence-gated test layer. Install
+the small test dependency, run its unittest module, or generate a real-catalog smoke report:
+
+```powershell
+python -m pip install -r requirements-dev.txt
+python -m unittest tests.test_stw_golden_qa -v
+python tools/stw_golden_qa.py --db data/phase2-real-validation.sqlite3 --gate asset
+```
+
+Only explicitly bound cases execute. Runtime and contextual cases require their declared
+verification gates; rankings and quarantined evidence remain non-blocking review results.
+Every result records the asset build/snapshot and optimizer revision metadata.
+
 The evidence-constrained AI backend turns natural-language requests into validated
 optimizer calls without allowing the language layer to invent Fortnite facts:
 

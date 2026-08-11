@@ -1,0 +1,942 @@
+schema_version: 1
+benchmark_id: stw-golden-qa-2026
+generated_from_sources: stw_golden_qa_sources_2026.yaml
+
+purpose: >-
+  Golden QA cases for an STW optimizer or recommendation system. They test mechanics,
+  constraints, tradeoffs, and conditional ranking behavior without embedding creator
+  tier lists as canonical game data.
+
+enforcement_levels:
+  hard_invariant: Failing this case should block a release after asset/runtime verification.
+  ranking_expectation: Directional expert baseline; log a regression and review rather than auto-block.
+  contextual: Must be recognized only when its stated scenario is active.
+  quarantine: Keep visible, but never score as current truth until revalidated.
+
+oracle_types:
+  exact_state: Output must contain the specified state or multiplier.
+  required_factors: Output must account for every listed factor before recommending.
+  relative_rank: Candidate should outrank control under the supplied fixtures.
+  forbidden_conclusion: Output must not make the listed unconditional conclusion.
+  manual_runtime: A runtime behavior must be tested; prose agreement is insufficient.
+
+cases:
+  - id: ELEM-001
+    domain: elements
+    query: Choose an element for a weapon used against fire elemental husks.
+    fixtures: {target_element: fire, available_weapon_elements: [water, fire, nature, energy, physical]}
+    oracle: {type: relative_rank, candidate: water, control: fire, relation: higher_damage}
+    enforcement: hard_invariant
+    verification: asset_or_runtime
+    status: active
+    sources: [S08]
+
+  - id: ELEM-002
+    domain: elements
+    query: Choose an element for a weapon used against nature elemental husks.
+    fixtures: {target_element: nature, available_weapon_elements: [water, fire, nature, energy, physical]}
+    oracle: {type: relative_rank, candidate: fire, control: water, relation: higher_damage}
+    enforcement: hard_invariant
+    verification: asset_or_runtime
+    status: active
+    sources: [S08]
+
+  - id: ELEM-003
+    domain: elements
+    query: Choose an element for a weapon used against water elemental husks.
+    fixtures: {target_element: water, available_weapon_elements: [water, fire, nature, energy, physical]}
+    oracle: {type: relative_rank, candidate: nature, control: fire, relation: higher_damage}
+    enforcement: hard_invariant
+    verification: asset_or_runtime
+    status: active
+    sources: [S08]
+
+  - id: ELEM-004
+    domain: elements
+    query: Compare energy and physical weapons against an elemental target when no counter-element weapon is available.
+    fixtures: {target_type: elemental, energy_multiplier_claim: 0.75, physical_multiplier_claim: 0.50}
+    oracle:
+      type: required_factors
+      must_include: [energy_is_generalist, physical_is_penalized_against_elementals, verify_current_multipliers]
+    enforcement: hard_invariant
+    verification: asset_or_runtime
+    status: active
+    sources: [S08]
+
+  - id: ELEM-005
+    domain: elements
+    query: Recommend a wall material against nature elemental enemies.
+    fixtures: {enemy_element: nature, candidate_materials: [wood, brick, metal]}
+    oracle: {type: relative_rank, candidate: brick, control: metal, relation: more_resistant}
+    enforcement: hard_invariant
+    verification: asset_or_runtime
+    status: active
+    sources: [S08]
+
+  - id: ELEM-006
+    domain: elements
+    query: Recommend a wall material against water elemental enemies.
+    fixtures: {enemy_element: water, candidate_materials: [wood, brick, metal]}
+    oracle: {type: relative_rank, candidate: metal, control: brick, relation: more_resistant}
+    enforcement: hard_invariant
+    verification: asset_or_runtime
+    status: active
+    sources: [S08]
+
+  - id: LOAD-001
+    domain: hero_loadouts
+    query: Build an accessible assault-rifle loadout around a Siegebreaker.
+    fixtures: {weapon: Siegebreaker, class: assault, priority: weapon_damage, account_stage: early}
+    oracle:
+      type: required_factors
+      must_include: [assault_damage_commander, activated_team_perk, sustain_option, mobility_or_magazine_tradeoff]
+    enforcement: hard_invariant
+    verification: asset
+    status: active
+    sources: [S09]
+
+  - id: LOAD-002
+    domain: hero_loadouts
+    query: Use Totally Rocking Out in a proposed loadout.
+    fixtures: {team_perk: Totally Rocking Out}
+    oracle:
+      type: required_factors
+      must_include: [two_compatible_support_heroes, activation_trigger, crit_benefit]
+    enforcement: hard_invariant
+    verification: asset
+    status: active
+    sources: [S09, S01, S02]
+
+  - id: LOAD-003
+    domain: hero_loadouts
+    query: Compare Rescue Trooper as commander versus support for assault damage.
+    fixtures: {hero: Rescue Trooper Ramirez, support_bonus_claim: 0.17, commander_bonus_claim: 0.50}
+    oracle: {type: exact_state, expected: commander_bonus_exceeds_support_bonus}
+    enforcement: hard_invariant
+    verification: asset
+    status: active
+    sources: [S09]
+
+  - id: CHAOS-001
+    domain: chaos_exploder
+    query: Model the Chaos Exploder's core on-hit behavior.
+    fixtures: {weapon: Chaos Exploder}
+    oracle:
+      type: required_factors
+      must_include: [impact_explosion, nearby_target_damage, firing_cadence_effect]
+    enforcement: hard_invariant
+    verification: runtime
+    status: active
+    sources: [S07, S06, S05]
+
+  - id: CHAOS-002
+    domain: chaos_exploder
+    query: Determine whether the weapon's automatic ammo return counts as a reload.
+    fixtures: {weapon: Chaos Exploder, mechanic: automatic_ammo_return}
+    oracle: {type: exact_state, expected: does_not_count_as_reload}
+    enforcement: hard_invariant
+    verification: runtime
+    status: active
+    sources: [S05, S06, S07]
+
+  - id: CHAOS-003
+    domain: chaos_exploder
+    query: Evaluate Locked and Reloaded for a build that relies on automatic ammo return and avoids manual reloads.
+    fixtures: {weapon: Chaos Exploder, loop: auto_return_without_manual_reload}
+    oracle: {type: forbidden_conclusion, forbidden: locked_and_reloaded_is_always_active}
+    enforcement: hard_invariant
+    verification: runtime
+    status: active
+    sources: [S07, S05]
+
+  - id: CHAOS-004
+    domain: chaos_exploder
+    query: Evaluate First Shot Rio when ammo is restored automatically without a reload.
+    fixtures: {weapon: Chaos Exploder, hero: First Shot Rio, loop: auto_return}
+    oracle:
+      type: required_factors
+      must_include: [first_mag_state_is_not_recreated_by_auto_return, manual_reload_changes_state]
+    enforcement: hard_invariant
+    verification: runtime
+    status: active
+    sources: [S07, S05]
+
+  - id: CHAOS-005
+    domain: chaos_exploder
+    query: Compare fire-rate perks with no fire-rate perk on the Chaos Exploder.
+    fixtures: {weapon: Chaos Exploder, compared_perk: fire_rate}
+    oracle:
+      type: required_factors
+      must_include: [explosion_cadence, practical_ammo_waiting, long_run_dps_not_just_burst]
+    enforcement: hard_invariant
+    verification: runtime
+    status: active
+    sources: [S06, S05]
+
+  - id: CHAOS-006
+    domain: chaos_exploder
+    query: Recommend an element for a Chaos Exploder used across mixed elemental missions.
+    fixtures: {weapon: Chaos Exploder, desired_element: energy}
+    oracle: {type: forbidden_conclusion, forbidden: energy_is_available_without_catalog_confirmation}
+    enforcement: hard_invariant
+    verification: asset
+    status: active
+    sources: [S06]
+
+  - id: CHAOS-007
+    domain: chaos_exploder
+    query: Build around Crackshot while preserving his ramping stacks.
+    fixtures: {weapon: Chaos Exploder, commander: Crackshot}
+    oracle:
+      type: required_factors
+      must_include: [avoid_weapon_switching, automatic_ammo_return_preserves_stacks, pacing_or_magazine_tradeoff]
+    enforcement: hard_invariant
+    verification: runtime
+    status: active
+    sources: [S05]
+
+  - id: CHAOS-008
+    domain: chaos_exploder
+    query: Rank Crackshot lead versus Sledgehammer lead for unrestricted practical play.
+    fixtures: {weapon: Chaos Exploder, objective: practical_sustained_damage}
+    oracle:
+      type: required_factors
+      must_include: [crackshot_stack_ceiling, awkward_wait_cycle, manual_reload_option, sledgehammer_crit_scaling]
+    enforcement: ranking_expectation
+    verification: expert_direction_plus_runtime
+    status: active
+    sources: [S05, S06]
+
+  - id: AR-001
+    domain: assault_rifles
+    query: Explain why a weapon can be high-tier only with a loadout.
+    fixtures: {ranking_views: [weapon_only, full_loadout]}
+    oracle:
+      type: required_factors
+      must_include: [single_target, crowd_clear, elemental_coverage, hero_synergy, reload_or_ammo_loop]
+    enforcement: hard_invariant
+    verification: model_behavior
+    status: active
+    sources: [S01]
+
+  - id: AR-002
+    domain: assault_rifles
+    query: Rank the Nocturno, Storm King's Scourge, and generic low-tier assault rifles in optimized endgame loadouts.
+    fixtures: {candidates: [Nocturno, Storm King's Scourge, generic_low_tier_AR], objective: broad_endgame_value}
+    oracle: {type: relative_rank, candidate: [Nocturno, Storm King's Scourge], control: generic_low_tier_AR, relation: higher}
+    enforcement: ranking_expectation
+    verification: expert_direction_plus_asset
+    status: active
+    sources: [S01]
+
+  - id: AR-003
+    domain: assault_rifles
+    query: Evaluate a Floor Flusher when its sixth perk matches the mission element.
+    fixtures: {weapon: Floor Flusher, sixth_perk_match: true}
+    oracle:
+      type: required_factors
+      must_include: [conditional_damage_bonus, element_match, poor_generalization_outside_match]
+    enforcement: ranking_expectation
+    verification: asset_plus_runtime
+    status: active
+    sources: [S01]
+
+  - id: AR-004
+    domain: assault_rifles
+    query: Recommend between a Beat Blaster and a strong single-target rifle for a dense wave.
+    fixtures: {candidate: Beat Blaster, scenario: dense_crowd}
+    oracle:
+      type: required_factors
+      must_include: [pierce_or_dance_crowd_control, lower_single_target_damage, scenario_weighting]
+    enforcement: ranking_expectation
+    verification: expert_direction
+    status: active
+    sources: [S01]
+
+  - id: AR-005
+    domain: assault_rifles
+    query: Evaluate the Wraith with a crit-focused Totally Rocking Out loadout.
+    fixtures: {weapon: Wraith, team_perk: Totally Rocking Out, objective: crit_damage}
+    oracle:
+      type: required_factors
+      must_include: [base_crit_rating, multiple_crit_damage_perks, activation_uptime]
+    enforcement: ranking_expectation
+    verification: asset_plus_runtime
+    status: active
+    sources: [S01]
+
+  - id: AR-006
+    domain: assault_rifles
+    query: Recommend a physical-locked assault rifle for a high-level elemental mission.
+    fixtures: {weapon_element: physical, target_type: elemental}
+    oracle: {type: forbidden_conclusion, forbidden: universally_best_without_element_penalty}
+    enforcement: hard_invariant
+    verification: asset
+    status: active
+    sources: [S01, S08]
+
+  - id: SG-001
+    domain: shotguns
+    query: Rank Popshot, Huskbuster, and Ground Pounder with no hero reload solution.
+    fixtures: {candidates: [Popshot, Huskbuster, Ground Pounder], reload_solution: none, objective: mathematical_sustained_dps}
+    oracle: {type: relative_rank, candidate: Popshot, control: [Huskbuster, Ground Pounder], relation: higher_or_competitive}
+    enforcement: ranking_expectation
+    verification: expert_direction_plus_runtime
+    status: active
+    sources: [S02]
+
+  - id: SG-002
+    domain: shotguns
+    query: Rank Popshot, Huskbuster, and Ground Pounder with Chaos Agent reload support.
+    fixtures: {candidates: [Popshot, Huskbuster, Ground Pounder], reload_solution: Chaos Agent, objective: burst_and_practical_dps}
+    oracle: {type: relative_rank, candidate: Ground Pounder, control: Popshot, relation: higher}
+    enforcement: ranking_expectation
+    verification: expert_direction_plus_runtime
+    status: active
+    sources: [S02, S16]
+
+  - id: SG-003
+    domain: shotguns
+    query: Explain why Chaos Agent materially changes Ground Pounder evaluation.
+    fixtures: {weapon: Ground Pounder, support: Chaos Agent}
+    oracle: {type: required_factors, must_include: [long_native_reload, ability_triggered_reload, burst_preservation]}
+    enforcement: hard_invariant
+    verification: asset_plus_runtime
+    status: active
+    sources: [S02, S16]
+
+  - id: SG-004
+    domain: shotguns
+    query: Evaluate the Vacuum Tube Shotgun in a favorable elemental mission.
+    fixtures: {weapon: Vacuum Tube Shotgun, mission_element: water, weapon_element: nature}
+    oracle:
+      type: required_factors
+      must_include: [chain_lightning, crowd_clear, single_target_damage, elemental_lock]
+    enforcement: ranking_expectation
+    verification: asset_plus_runtime
+    status: active
+    sources: [S02]
+
+  - id: SG-005
+    domain: shotguns
+    query: Evaluate the Pulsar 9000 as a universal shotgun recommendation.
+    fixtures: {weapon: Pulsar 9000}
+    oracle:
+      type: forbidden_conclusion
+      forbidden: universally_best_without_range_and_shield_bubble_constraints
+    enforcement: ranking_expectation
+    verification: expert_direction
+    status: active
+    sources: [S02, S10]
+
+  - id: SG-006
+    domain: shotguns
+    query: Compare the Room Sweeper with and without Totally Rocking Out.
+    fixtures: {weapon: Room Sweeper, compared_states: [no_team_perk, Totally Rocking Out]}
+    oracle: {type: relative_rank, candidate: Totally Rocking Out, control: no_team_perk, relation: materially_higher_output}
+    enforcement: ranking_expectation
+    verification: runtime
+    status: active
+    sources: [S02, S25]
+
+  - id: SG-007
+    domain: shotguns
+    query: Score the Primal Shotgun while its observed behavior is inconsistent.
+    fixtures: {weapon: Primal Shotgun, runtime_behavior: inconsistent}
+    oracle: {type: forbidden_conclusion, forbidden: stable_numeric_ranking}
+    enforcement: quarantine
+    verification: runtime
+    status: quarantined
+    sources: [S02]
+
+  - id: SG-008
+    domain: shotguns
+    query: Explain why the Disintegrator improved in current evaluation.
+    fixtures: {weapon: Disintegrator}
+    oracle: {type: required_factors, must_include: [ammo_cost_change, crowd_damage, current_asset_value]}
+    enforcement: ranking_expectation
+    verification: asset
+    status: active
+    sources: [S02]
+
+  - id: CONS-001
+    domain: constructors
+    query: Build a structure-survivability BASE loadout.
+    fixtures: {objective: structure_survivability}
+    oracle:
+      type: required_factors
+      must_include: [BASE_Kyle_health, Power_BASE_repair, connectivity_or_control_support]
+    enforcement: ranking_expectation
+    verification: asset
+    status: active
+    sources: [S03]
+
+  - id: CONS-002
+    domain: constructors
+    query: Compare BASE Kyle in commander and support positions.
+    fixtures: {hero: BASE Kyle, commander_health_claim: 0.84, support_health_claim: 0.28}
+    oracle: {type: exact_state, expected: commander_bonus_exceeds_support_bonus}
+    enforcement: hard_invariant
+    verification: asset
+    status: active
+    sources: [S03]
+
+  - id: CONS-003
+    domain: constructors
+    query: Use Supercharged Traps in a BASE build.
+    fixtures: {team_perk: Supercharged Traps}
+    oracle:
+      type: required_factors
+      must_include: [BASE_affecting_support_count, trap_damage_scaling, Mega_BASE_unlock_or_ownership]
+    enforcement: hard_invariant
+    verification: asset
+    status: active
+    sources: [S03, S22]
+
+  - id: CONS-004
+    domain: constructors
+    query: Recommend Warden Kyle as commander for maximum team healing.
+    fixtures: {hero: Warden Kyle, objective: team_healing_near_BASE}
+    oracle: {type: forbidden_conclusion, forbidden: commander_is_required_or_always_best}
+    enforcement: ranking_expectation
+    verification: asset_plus_expert_direction
+    status: active
+    sources: [S03]
+
+  - id: CONS-005
+    domain: constructors
+    query: Score Machinist Harper when trap durability is not a binding constraint.
+    fixtures: {hero: Machinist Harper, durability_binding: false}
+    oracle: {type: forbidden_conclusion, forbidden: top_tier_regardless_of_scenario}
+    enforcement: contextual
+    verification: model_behavior
+    status: active
+    sources: [S03, S20, S21]
+
+  - id: CONS-006
+    domain: constructors
+    query: Score Machinist Harper in an endurance build where durability is binding.
+    fixtures: {hero: Machinist Harper, scenario: endurance, durability_binding: true}
+    oracle: {type: relative_rank, candidate: Machinist Harper, control: generic_combat_constructor, relation: higher}
+    enforcement: contextual
+    verification: model_behavior
+    status: active
+    sources: [S03, S20, S21]
+
+  - id: CONS-007
+    domain: constructors
+    query: Recommend Electro-Pulse Penny or Thunder Thora for unattended endgame damage.
+    fixtures: {scenario: high_level_endgame, objective: passive_BASE_damage}
+    oracle: {type: forbidden_conclusion, forbidden: low_level_AFK_strength_implies_endgame_scaling}
+    enforcement: ranking_expectation
+    verification: expert_direction_plus_runtime
+    status: active
+    sources: [S03]
+
+  - id: CONS-008
+    domain: constructors
+    query: Evaluate a Decoy-focused constructor against minibosses and mist monsters.
+    fixtures: {objective: control_mist_monsters_and_minibosses, ability: DECOY}
+    oracle: {type: required_factors, must_include: [target_immunity_or_nonresponse, normal_husk_control]}
+    enforcement: hard_invariant
+    verification: runtime
+    status: active
+    sources: [S03]
+
+  - id: GAD-001
+    domain: gadgets
+    query: Compare Supply Drop before and after its 2026 buff.
+    fixtures: {gadget: Supply Drop, current_cooldown_claim_seconds: 180}
+    oracle:
+      type: required_factors
+      must_include: [current_cooldown, material_yield, crafting_items, traps, per_player_instancing]
+    enforcement: hard_invariant
+    verification: asset_plus_runtime
+    status: active
+    sources: [S04, S12]
+
+  - id: GAD-002
+    domain: gadgets
+    query: Evaluate Undercover Buzz as commander for repeated Supply Drops.
+    fixtures: {gadget: Supply Drop, commander: Undercover Buzz, cooldown_reduction_claim: 0.50}
+    oracle: {type: exact_state, expected: approximately_90_second_supply_drop_cooldown_if_assets_match}
+    enforcement: hard_invariant
+    verification: asset_plus_runtime
+    status: active
+    sources: [S04, S12]
+
+  - id: GAD-003
+    domain: gadgets
+    query: Recommend Supply Drop in a coordinated four-player farming group.
+    fixtures: {party_size: 4, gadget: Supply Drop}
+    oracle:
+      type: required_factors
+      must_include: [drops_are_instanced_for_teammates, coordination_scales_yield, avoid_literal_16x_constant]
+    enforcement: hard_invariant
+    verification: runtime
+    status: active
+    sources: [S12]
+
+  - id: GAD-004
+    domain: gadgets
+    query: Evaluate Banner for objective defense.
+    fixtures: {gadget: Banner, scenario: objective_defense, cooldown_claim_seconds: 180}
+    oracle:
+      type: required_factors
+      must_include: [structure_health_buff, respawn_point, current_cooldown, temporary_duration]
+    enforcement: ranking_expectation
+    verification: asset_plus_runtime
+    status: active
+    sources: [S04, S12]
+
+  - id: GAD-005
+    domain: gadgets
+    query: Choose a gadget for slowing smashers or minibosses.
+    fixtures: {objective: slow_high_priority_targets}
+    oracle: {type: relative_rank, candidate: Slow Field, control: Air Strike, relation: higher_utility}
+    enforcement: ranking_expectation
+    verification: expert_direction
+    status: active
+    sources: [S04]
+
+  - id: GAD-006
+    domain: gadgets
+    query: Choose between Air Strike and core defensive gadgets for general endgame use.
+    fixtures: {candidate: Air Strike, controls: [Adrenaline Rush, Banner, Slow Field, Supply Drop, Hover Turret]}
+    oracle: {type: relative_rank, candidate: core_defensive_gadgets, control: Air Strike, relation: generally_higher}
+    enforcement: ranking_expectation
+    verification: expert_direction
+    status: active
+    sources: [S04]
+
+  - id: DEF-001
+    domain: defenders
+    query: Account for the 2026 defender equipment economy.
+    fixtures: {feature: defenders}
+    oracle:
+      type: required_factors
+      must_include: [no_defender_pad_cost, no_ammo_cost, no_durability_cost, shared_schematic_allowed]
+    enforcement: hard_invariant
+    verification: asset_plus_runtime
+    status: active
+    sources: [S10, S11]
+
+  - id: DEF-002
+    domain: defenders
+    query: Choose a defender archetype for broad ranged effectiveness.
+    fixtures: {candidates: [assault, pistol_SMG, sniper, shotgun, melee]}
+    oracle: {type: relative_rank, candidate: [assault, pistol_SMG, sniper], control: melee, relation: generally_higher}
+    enforcement: ranking_expectation
+    verification: expert_direction
+    status: active
+    sources: [S10, S11]
+
+  - id: DEF-003
+    domain: defenders
+    query: Score a shotgun defender without considering engagement range.
+    fixtures: {defender_type: shotgun}
+    oracle: {type: forbidden_conclusion, forbidden: complete_evaluation_without_range_limit}
+    enforcement: hard_invariant
+    verification: model_behavior
+    status: active
+    sources: [S10, S11]
+
+  - id: DEF-004
+    domain: defenders
+    query: Exploit a weapon signature perk that may ignore its normal cooldown when used by a defender.
+    fixtures: {user: defender, interaction: signature_perk_cooldown}
+    oracle: {type: manual_runtime, expected: revalidate_each_patch_before_scoring}
+    enforcement: quarantine
+    verification: runtime
+    status: quarantined
+    sources: [S10]
+
+  - id: DEF-005
+    domain: defenders
+    query: Recommend a bow to a sniper defender because the player build is strong with that bow.
+    fixtures: {defender_type: sniper, weapon_type: bow}
+    oracle:
+      type: required_factors
+      must_include: [defender_charge_behavior, signature_perk_activation, player_synergy_does_not_transfer_automatically]
+    enforcement: hard_invariant
+    verification: runtime
+    status: active
+    sources: [S10]
+
+  - id: BDRUM-001
+    domain: black_drum
+    query: Treat the observed Black Drum reload explosion as a stable intended formula.
+    fixtures: {weapon: Black Drum, mechanic: reload_explosion}
+    oracle: {type: forbidden_conclusion, forbidden: stable_intended_formula_without_runtime_revalidation}
+    enforcement: quarantine
+    verification: runtime
+    status: quarantined
+    sources: [S13, S14, S02]
+
+  - id: BDRUM-002
+    domain: black_drum
+    query: Determine whether each pellet independently contributes to the reload explosion.
+    fixtures: {weapon: Black Drum, hypothesis: per_pellet_explosion}
+    oracle: {type: manual_runtime, expected: unresolved_suspected_bug}
+    enforcement: quarantine
+    verification: controlled_runtime
+    status: quarantined
+    sources: [S13, S14]
+
+  - id: BDRUM-003
+    domain: black_drum
+    query: Build a Flash A.C. loop around the Black Drum.
+    fixtures: {weapon: Black Drum, commander: Flash A.C.}
+    oracle:
+      type: required_factors
+      must_include: [shoot, phase_shift, Chaos_Agent_reload, missing_health_scaling, energy_management]
+    enforcement: contextual
+    verification: runtime
+    status: active
+    sources: [S13]
+
+  - id: BDRUM-004
+    domain: black_drum
+    query: Use First Shot Rio to improve the Black Drum.
+    fixtures: {weapon: Black Drum, hero: First Shot Rio}
+    oracle: {type: forbidden_conclusion, forbidden: assault_rifle_first_shot_bonus_applies_to_shotgun}
+    enforcement: hard_invariant
+    verification: asset
+    status: active
+    sources: [S13]
+
+  - id: BDRUM-005
+    domain: black_drum
+    query: Use Blast From the Past in a missing-health Black Drum build.
+    fixtures: {weapon: Black Drum, team_perk: Blast From the Past}
+    oracle:
+      type: required_factors
+      must_include: [larger_absolute_health_pool, same_missing_health_percentage, shield_removal, survivability_tradeoff]
+    enforcement: contextual
+    verification: asset_plus_runtime
+    status: active
+    sources: [S13]
+
+  - id: EDEE-001
+    domain: ed_ee_melee
+    query: Build around ED-EE's commander perk.
+    fixtures: {commander: ED-EE, objective: energy_melee_damage}
+    oracle:
+      type: required_factors
+      must_include: [energy_melee_weapon, shield_derived_damage, shield_sustain, crit_or_attack_speed]
+    enforcement: hard_invariant
+    verification: asset_plus_runtime
+    status: active
+    sources: [S03, S15]
+
+  - id: EDEE-002
+    domain: ed_ee_melee
+    query: Add Prehistoric Izza to an ED-EE shield build.
+    fixtures: {commander: ED-EE, support: Prehistoric Izza}
+    oracle: {type: forbidden_conclusion, forbidden: no_shield_armor_condition_synergizes_with_required_shield}
+    enforcement: hard_invariant
+    verification: asset
+    status: active
+    sources: [S03, S15]
+
+  - id: EDEE-003
+    domain: ed_ee_melee
+    query: Add Intergalactic Ken to an ED-EE energy build.
+    fixtures: {commander: ED-EE, support: Intergalactic Ken, damage_type: energy}
+    oracle: {type: required_factors, must_include: [energy_eliminations_restore_shield, shield_uptime_preserves_damage]}
+    enforcement: hard_invariant
+    verification: asset_plus_runtime
+    status: active
+    sources: [S15]
+
+  - id: EDEE-004
+    domain: ed_ee_melee
+    query: Transfer a Horde ED-EE trap interaction directly into every mission type.
+    fixtures: {source_scenario: Horde, target_scenario: unrestricted}
+    oracle: {type: forbidden_conclusion, forbidden: event_specific_trap_loop_is_universal}
+    enforcement: contextual
+    verification: runtime
+    status: active
+    sources: [S15]
+
+  - id: EVENT-001
+    domain: power_hour
+    query: Reduce an active ability cooldown by four seconds per ranged elimination.
+    fixtures: {modifier: Super Soldier, scenario: Power Hour}
+    oracle: {type: exact_state, expected: active_only_when_modifier_present}
+    enforcement: contextual
+    verification: runtime
+    status: active
+    sources: [S16, S17, S18]
+
+  - id: EVENT-002
+    domain: power_hour
+    query: Apply the Super Soldier cooldown loop in a normal mission.
+    fixtures: {modifier: none, scenario: normal_mission}
+    oracle: {type: forbidden_conclusion, forbidden: ranged_eliminations_reduce_active_cooldown_by_event_amount}
+    enforcement: hard_invariant
+    verification: model_behavior
+    status: active
+    sources: [S16, S17, S18]
+
+  - id: EVENT-003
+    domain: power_hour
+    query: Count trap eliminations as ranged-weapon eliminations for Super Soldier.
+    fixtures: {modifier: Super Soldier, elimination_source: trap}
+    oracle: {type: forbidden_conclusion, forbidden: trap_kills_are_assumed_to_trigger_without_test}
+    enforcement: contextual
+    verification: runtime
+    status: active
+    sources: [S16]
+
+  - id: TREE-001
+    domain: tree_of_light
+    query: Model the Tree of Light's stun cadence.
+    fixtures: {weapon: Tree of Light, unique_perk: stun_cadence}
+    oracle: {type: exact_state, expected: every_eighth_hit_claim_requires_asset_confirmation}
+    enforcement: hard_invariant
+    verification: asset_plus_runtime
+    status: active
+    sources: [S19]
+
+  - id: TREE-002
+    domain: tree_of_light
+    query: Use Tree of Light stun against a miniboss.
+    fixtures: {weapon: Tree of Light, target: miniboss}
+    oracle: {type: forbidden_conclusion, forbidden: stun_reliably_controls_minibosses}
+    enforcement: hard_invariant
+    verification: runtime
+    status: active
+    sources: [S19]
+
+  - id: TREE-003
+    domain: tree_of_light
+    query: Stop a charging smasher solely with Tree of Light stun.
+    fixtures: {weapon: Tree of Light, target_state: charging_smasher}
+    oracle: {type: forbidden_conclusion, forbidden: stun_guarantees_charge_interruption}
+    enforcement: hard_invariant
+    verification: runtime
+    status: active
+    sources: [S19]
+
+  - id: TRAP-001
+    domain: broadside
+    query: Place a Broadside with open space and no opposing wall.
+    fixtures: {trap: Broadside, opposing_wall_distance_tiles: null}
+    oracle: {type: forbidden_conclusion, forbidden: maximum_damage_geometry}
+    enforcement: hard_invariant
+    verification: runtime
+    status: active
+    sources: [S20]
+
+  - id: TRAP-002
+    domain: broadside
+    query: Optimize Broadside placement for repeated cannonball hits.
+    fixtures: {trap: Broadside, candidate_distances_tiles: [1, 2, 3, 4]}
+    oracle:
+      type: required_factors
+      must_include: [opposing_wall, bounce_path, one_tile_preferred, one_to_three_tiles_effective]
+    enforcement: hard_invariant
+    verification: runtime
+    status: active
+    sources: [S20]
+
+  - id: TRAP-003
+    domain: broadside
+    query: Choose a universal Broadside sixth perk.
+    fixtures: {trap: Broadside, options: [durability, heals_attached, structure_health]}
+    oracle:
+      type: forbidden_conclusion
+      forbidden: one_sixth_perk_is_universally_best_without_durability_and_damage_pattern
+    enforcement: hard_invariant
+    verification: model_behavior
+    status: active
+    sources: [S20]
+
+  - id: TRAP-004
+    domain: ceiling_drop_trap
+    query: Place a Ceiling Drop Trap six tiles above a normal walking enemy.
+    fixtures: {trap: Ceiling Drop Trap, height_tiles: 6, standard_trigger: true}
+    oracle: {type: forbidden_conclusion, forbidden: normal_reliable_trigger_at_six_tiles}
+    enforcement: hard_invariant
+    verification: runtime
+    status: active
+    sources: [S21, S22]
+
+  - id: TRAP-005
+    domain: ceiling_drop_trap
+    query: Choose the standard ceiling height for a Ceiling Drop Trap.
+    fixtures: {trap: Ceiling Drop Trap, candidate_heights_tiles: [2, 3, 4]}
+    oracle: {type: relative_rank, candidate: 3, control: 4, relation: more_reliable_and_effective}
+    enforcement: hard_invariant
+    verification: runtime
+    status: active
+    sources: [S21]
+
+  - id: TRAP-006
+    domain: ceiling_drop_trap
+    query: Orient Ceiling Drop Tires to roll enemies away from an objective.
+    fixtures: {trap: Ceiling Drop Trap, desired_roll_direction: away_from_objective}
+    oracle:
+      type: required_factors
+      must_include: [trap_is_directional, tires_roll_toward_player_back_at_placement, coordinate_floor_freeze_direction]
+    enforcement: hard_invariant
+    verification: runtime
+    status: active
+    sources: [S21]
+
+  - id: TRAP-007
+    domain: ceiling_drop_trap
+    query: Recommend the six-tile popcorn build as a standard defense.
+    fixtures: {build: Floor Launcher plus six-tile Ceiling Drop Trap}
+    oracle:
+      type: forbidden_conclusion
+      forbidden: novelty_build_is_standard_recommendation_or_performance_safe
+    enforcement: contextual
+    verification: runtime
+    status: active
+    sources: [S22]
+
+  - id: ROCKET-001
+    domain: launcher_builds
+    query: Build a non-event launcher ammo-conservation loadout.
+    fixtures: {commander: Star-Spangled Headhunter, support: 8-Bit Demo, scenario: normal_mission}
+    oracle:
+      type: required_factors
+      must_include: [War_Cry_window, commander_nonconsumption, support_nonconsumption, probabilistic_effective_shots]
+    enforcement: hard_invariant
+    verification: asset_plus_runtime
+    status: active
+    sources: [S23, S03]
+
+  - id: ROCKET-002
+    domain: launcher_builds
+    query: Convert 70 percent ammo nonconsumption into effective rocket count.
+    fixtures: {nonconsumption_probability: 0.70}
+    oracle: {type: exact_state, expected: geometric_expectation_about_3_33_shots_per_consumed_round_not_1_70}
+    enforcement: hard_invariant
+    verification: math_plus_runtime
+    status: active
+    sources: [S23]
+
+  - id: ROCKET-003
+    domain: launcher_builds
+    query: Use Assault Ammo Recovery to conserve launcher ammunition.
+    fixtures: {support: Assault Ammo Recovery, weapon_class: launcher}
+    oracle: {type: forbidden_conclusion, forbidden: assault_ammo_recovery_applies_to_launchers}
+    enforcement: hard_invariant
+    verification: asset
+    status: active
+    sources: [S23]
+
+  - id: ROCKET-004
+    domain: launcher_builds
+    query: Coordinate repeated War Cry launcher windows in a team.
+    fixtures: {party_size: 4, ability: War Cry}
+    oracle:
+      type: required_factors
+      must_include: [War_Cry_affects_teammates, staggered_activations, cooldown_and_duration_support, positioning]
+    enforcement: contextual
+    verification: runtime
+    status: active
+    sources: [S23]
+
+  - id: MER-001
+    domain: mermonster_melee
+    query: Build Mermonster Ken around missing health.
+    fixtures: {commander: Mermonster Ken, weapon: Husk Grinder}
+    oracle:
+      type: required_factors
+      must_include: [missing_health_damage_scaling, Husk_Grinder_health_reduction, Blast_From_the_Past_absolute_health, life_leech]
+    enforcement: contextual
+    verification: asset_plus_runtime
+    status: active
+    sources: [S24]
+
+  - id: MER-002
+    domain: mermonster_melee
+    query: Score the Mermonster Husk Grinder build against a lone high-health smasher.
+    fixtures: {build: Mermonster Husk Grinder, target_group: single_high_health_target}
+    oracle:
+      type: required_factors
+      must_include: [kill_trigger_dependency, heavy_attack_explosion_cooldown, weak_sustain_without_adds]
+    enforcement: ranking_expectation
+    verification: runtime
+    status: active
+    sources: [S24]
+
+  - id: MER-003
+    domain: mermonster_melee
+    query: Recommend a water Husk Grinder against fire enemies because the missing-health synergy is strong.
+    fixtures: {weapon_element: water, target_element: fire}
+    oracle: {type: required_factors, must_include: [element_match_is_favorable, synergy_does_not_replace_element_check]}
+    enforcement: hard_invariant
+    verification: asset
+    status: active
+    sources: [S24, S08]
+
+  - id: FAR-001
+    domain: stoneheart_farrah
+    query: Treat the December 2025 Vacuum Tube Bow interaction as confirmed current behavior.
+    fixtures: {weapon: Vacuum Tube Bow, hero: Stoneheart Farrah}
+    oracle: {type: forbidden_conclusion, forbidden: current_2026_confirmation_without_asset_or_runtime_retest}
+    enforcement: quarantine
+    verification: asset_plus_runtime
+    status: quarantined
+    sources: [S26]
+
+  - id: FAR-002
+    domain: stoneheart_farrah
+    query: If revalidated, model Vacuum Tube Bow plus Stoneheart Farrah for dense crowds.
+    fixtures: {weapon: Vacuum Tube Bow, commander: Stoneheart Farrah, target_density: high}
+    oracle:
+      type: required_factors
+      must_include: [chain_lightning, Farrah_splintering, cooldown_or_ready_state, elemental_match, crowd_clear_role]
+    enforcement: contextual
+    verification: asset_plus_runtime
+    status: informational
+    sources: [S26]
+
+  - id: FAR-003
+    domain: stoneheart_farrah
+    query: Recommend Vacuum Tube Bow plus Farrah as the best single-target boss setup.
+    fixtures: {weapon: Vacuum Tube Bow, commander: Stoneheart Farrah, objective: single_target_boss_damage}
+    oracle: {type: forbidden_conclusion, forbidden: crowd_branching_strength_implies_best_single_target_damage}
+    enforcement: quarantine
+    verification: runtime
+    status: informational
+    sources: [S26]
+
+  - id: META-001
+    domain: benchmark_governance
+    query: Convert a creator's tier placement into a permanent optimizer constant.
+    fixtures: {claim_type: tier_ranking}
+    oracle:
+      type: forbidden_conclusion
+      forbidden: subjective_tier_is_canonical_game_data
+    enforcement: hard_invariant
+    verification: benchmark_policy
+    status: active
+    sources: [S01, S02, S03, S04, S11]
+
+  - id: META-002
+    domain: benchmark_governance
+    query: Promote an exact damage number from a showcase into a hard regression threshold.
+    fixtures: {claim_type: showcase_damage_number}
+    oracle:
+      type: required_factors
+      must_include: [power_level, perks, hero_loadout, mission_modifiers, target_state, runtime_patch]
+    enforcement: hard_invariant
+    verification: benchmark_policy
+    status: active
+    sources: [S01, S05, S13, S16, S19]
+
+  - id: META-003
+    domain: benchmark_governance
+    query: Use a pre-2026 transcript to override a contradictory 2026 source.
+    fixtures: {older_source_status: historical_unverified, newer_source_status: current_2026}
+    oracle: {type: forbidden_conclusion, forbidden: older_unverified_claim_overrides_newer_current_evidence}
+    enforcement: hard_invariant
+    verification: benchmark_policy
+    status: active
+    sources: [S26]

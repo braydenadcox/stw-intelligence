@@ -69,7 +69,7 @@ OBJECTIVE_LANGUAGE = {
     "sustained_damage": ("sustained", "dps", "damage", "strongest"),
     "crowd_clear": ("crowd clear", "aoe", "wave clear", "trash clear"),
     "mist_monster_boss": ("mist monster", "smasher", "boss", "miniboss"),
-    "survivability": ("survive", "survivability", "tanky", "tank", "defense"),
+    "survivability": ("survive", "survivable", "survivability", "tanky", "tank", "defense"),
     "healing_sustain": ("healing", "heal", "sustain", "regeneration"),
     "crowd_control": ("crowd control", "crowd-control", "stun", "snare", "freeze", "slow"),
     "ability_uptime": ("ability uptime", "uptime", "cooldown", "spam"),
@@ -273,7 +273,10 @@ class ReasoningProvider(Protocol):
 
     provider_id: str
 
-    def interpret(self, user_text: str, grounded_entities: Sequence[Mapping[str, Any]]) -> Mapping[str, Any]: ...
+    def interpret(
+        self, user_text: str, grounded_entities: Sequence[Mapping[str, Any]],
+        conversation: Sequence[Mapping[str, Any]] = (),
+    ) -> Mapping[str, Any]: ...
 
     def select_evidence(self, intent: BuildIntent, evidence: Sequence[Mapping[str, Any]]) -> Sequence[str]: ...
 
@@ -283,7 +286,10 @@ class DeterministicReasoningProvider:
 
     provider_id = "deterministic-local-v1"
 
-    def interpret(self, user_text: str, grounded_entities: Sequence[Mapping[str, Any]]) -> Mapping[str, Any]:
+    def interpret(
+        self, user_text: str, grounded_entities: Sequence[Mapping[str, Any]],
+        conversation: Sequence[Mapping[str, Any]] = (),
+    ) -> Mapping[str, Any]:
         text = user_text.casefold()
         weights = {
             objective: float(sum(term in text for term in terms))
@@ -418,6 +424,30 @@ class StwAiTools:
             if marker not in seen:
                 deduped.append(item); seen.add(marker)
         return deduped[:limit]
+
+    def resolve_enemy_input(self, value: str) -> str | None:
+        """Resolve a user-facing enemy label only when the graph is unambiguous."""
+        exact = self.connection.execute(
+            """SELECT enemy_key FROM catalog_enemy_archetypes
+               WHERE snapshot_id=? AND lower(enemy_key)=lower(?)""",
+            (self.snapshot_id, value.strip()),
+        ).fetchall()
+        if len(exact) == 1:
+            return str(exact[0]["enemy_key"])
+        roots = self.connection.execute(
+            """SELECT enemy_key FROM catalog_enemy_archetypes
+               WHERE snapshot_id=? AND parent_enemy_id IS NULL
+                 AND lower(COALESCE(display_name,''))=lower(?)""",
+            (self.snapshot_id, value.strip()),
+        ).fetchall()
+        if len(roots) == 1:
+            return str(roots[0]["enemy_key"])
+        grounded = {
+            str(item["entity_key"])
+            for item in self.grounded_mentions(value)
+            if item["kind"] == "enemy"
+        }
+        return next(iter(grounded)) if len(grounded) == 1 else None
 
     def baseline_enemy(self) -> dict[str, Any] | None:
         """Return the structurally named default Husk pawn, never a fuzzy guess."""
@@ -604,8 +634,11 @@ class StwAiTools:
             ),
         )
 
-    def optimize(self, intent: BuildIntent) -> dict[str, Any]:
-        return optimize_loadouts(self.connection, self.optimization_request(intent), self.snapshot_id)
+    def optimize(self, intent: BuildIntent, progress: Any = None) -> dict[str, Any]:
+        return optimize_loadouts(
+            self.connection, self.optimization_request(intent), self.snapshot_id,
+            progress,
+        )
 
     def compare(self, loadouts: Sequence[SpecifiedLoadout], scenario: CombatScenario) -> dict[str, Any]:
         evaluations = [self.evaluate_loadout(loadout, scenario) for loadout in loadouts]
@@ -685,6 +718,43 @@ def _render_evidence(selected: Sequence[str], evidence: Sequence[Mapping[str, An
             "evidence": selected_rows}
 
 
+def build_intent_payload(intent: BuildIntent) -> dict[str, Any]:
+    value = asdict(intent)
+    value["schema_version"] = INTENT_SCHEMA_VERSION
+    value["objective_weights"] = dict(intent.objective_weights)
+    def loadout_payload(loadout: SpecifiedLoadout | None) -> dict[str, Any] | None:
+        if loadout is None: return None
+        result = asdict(loadout)
+        result["weapon_perks"] = [
+            {"slot": slot, "perk": perk} for slot, perk in loadout.weapon_perks
+        ]
+        return result
+    value["current_loadout"] = loadout_payload(intent.current_loadout)
+    value["comparison_loadouts"] = [
+        loadout_payload(loadout) for loadout in intent.comparison_loadouts
+    ]
+    value["locked_weapon_perks"] = [
+        {"slot": slot, "perk": perk} for slot, perk in intent.locked_weapon_perks
+    ]
+    return value
+
+
+def _merge_followup_intent(
+    previous: Mapping[str, Any], patch: Mapping[str, Any]
+) -> dict[str, Any]:
+    merged = dict(previous)
+    union_fields = {"unavailable_heroes", "unavailable_weapons", "avoid_conditions"}
+    for key, value in patch.items():
+        if key in {"schema_version", "user_request"}: continue
+        if value is None or value == [] or value == () or value == {}: continue
+        if key in union_fields:
+            merged[key] = list(dict.fromkeys([*merged.get(key, []), *value]))
+        else:
+            merged[key] = value
+    merged["schema_version"] = INTENT_SCHEMA_VERSION
+    return merged
+
+
 def analyze_existing_loadout(tools: StwAiTools, intent: BuildIntent) -> dict[str, Any]:
     if not intent.current_loadout:
         raise ValueError("existing-loadout analysis requires current_loadout")
@@ -758,11 +828,35 @@ class AiOrchestrator:
         self.tools = tools
         self.provider = provider or DeterministicReasoningProvider()
 
-    def run(self, user_text: str, intent_override: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    def run(
+        self, user_text: str,
+        intent_override: Mapping[str, Any] | None = None,
+        *,
+        previous_intent: Mapping[str, Any] | None = None,
+        intent_patch: Mapping[str, Any] | None = None,
+        conversation: Sequence[Mapping[str, Any]] = (),
+        progress: Any = None,
+    ) -> dict[str, Any]:
         started = time.perf_counter()
+        emit = progress or (lambda stage, detail=None: None)
+        emit("understanding_request", "Grounding request against the local catalog")
         grounding = self.tools.grounded_mentions(user_text)
-        raw_intent = intent_override or self.provider.interpret(user_text, grounding)
+        raw_intent = intent_override or self.provider.interpret(
+            user_text, grounding, conversation
+        )
+        if previous_intent and intent_override is None:
+            raw_intent = _merge_followup_intent(previous_intent, raw_intent)
+        if intent_patch:
+            raw_intent = {**raw_intent, **intent_patch,
+                          "schema_version": INTENT_SCHEMA_VERSION}
+        if raw_intent.get("target_enemy"):
+            resolved_target = self.tools.resolve_enemy_input(
+                str(raw_intent["target_enemy"])
+            )
+            if resolved_target:
+                raw_intent["target_enemy"] = resolved_target
         intent = BuildIntent.from_dict(raw_intent, user_text)
+        emit("resolving_constraints", "Validating inventory, locks, mission, and target")
         assumptions = []
         if intent.mode == "recommend" and not intent.target_enemy:
             baseline = self.tools.baseline_enemy()
@@ -775,21 +869,24 @@ class AiOrchestrator:
         if intent.mode == "analyze":
             if not intent.current_loadout:
                 return self._clarification(intent, grounding, ["Provide current_loadout with at least a weapon."])
+            emit("evaluating_candidates", "Evaluating the supplied loadout")
             analysis = analyze_existing_loadout(self.tools, intent)
+            emit("preparing_recommendation", "Preparing the evidence-backed analysis")
             return {"schema_version": "stw.ai-response.v1", "provider": self.provider.provider_id,
-                    "prompt_version": PROMPT_VERSION, "intent": asdict(intent), "grounding": grounding,
+                    "prompt_version": PROMPT_VERSION, "intent": build_intent_payload(intent), "grounding": grounding,
                     "analysis": analysis, "elapsed_ms": (time.perf_counter() - started) * 1000.0}
         if intent.mode == "compare":
             if len(intent.comparison_loadouts) < 2:
                 return self._clarification(
                     intent, grounding, ["Provide at least two complete comparison_loadouts."]
                 )
+            emit("evaluating_candidates", "Comparing builds under one scenario")
             comparison = self.tools.compare(
                 intent.comparison_loadouts,
                 CombatScenario(target_element=intent.target_element),
             )
             return {"schema_version": "stw.ai-response.v1", "provider": self.provider.provider_id,
-                    "prompt_version": PROMPT_VERSION, "intent": asdict(intent), "grounding": grounding,
+                    "prompt_version": PROMPT_VERSION, "intent": build_intent_payload(intent), "grounding": grounding,
                     "comparison": comparison,
                     "safeguards": {"same_scenario_required": True,
                                    "definitive": comparison["definitive"]},
@@ -798,7 +895,7 @@ class AiOrchestrator:
         if not intent.weapon: missing.append("Which weapon or schematic should the build use?")
         if not intent.target_enemy: missing.append("Which enemy context should it be evaluated against?")
         if missing: return self._clarification(intent, grounding, missing)
-        optimization = self.tools.optimize(intent)
+        optimization = self.tools.optimize(intent, emit)
         recommendations = optimization["definitive_rankings"] or optimization["uncertainty_aware_recommendations"]
         if not recommendations:
             return self._clarification(intent, grounding, ["No candidate satisfies all supplied constraints."])
@@ -806,9 +903,10 @@ class AiOrchestrator:
         evidence = _evidence_for_recommendation(top)
         selected = self.provider.select_evidence(intent, evidence)
         explanation = _render_evidence(selected, evidence)
+        emit("preparing_recommendation", "Preparing the recommendation and evidence")
         return {
             "schema_version": "stw.ai-response.v1", "provider": self.provider.provider_id,
-            "prompt_version": PROMPT_VERSION, "intent": asdict(intent), "grounding": grounding,
+            "prompt_version": PROMPT_VERSION, "intent": build_intent_payload(intent), "grounding": grounding,
             "recommendation": top, "alternatives": recommendations[1:intent.requested_alternatives],
             "synergy_chain": _synergy_chain(top),
             "optimizer_summary": {"counts": optimization["counts"], "search_space": optimization["search_space"],
@@ -825,7 +923,7 @@ class AiOrchestrator:
     def _clarification(self, intent: BuildIntent, grounding: Sequence[Mapping[str, Any]], questions: Sequence[str]) -> dict[str, Any]:
         return {"schema_version": "stw.ai-response.v1", "provider": self.provider.provider_id,
                 "prompt_version": PROMPT_VERSION, "status": "needs_clarification",
-                "intent": asdict(intent), "grounding": list(grounding), "questions": list(questions)}
+                "intent": build_intent_payload(intent), "grounding": list(grounding), "questions": list(questions)}
 
 
 def main(argv: Iterable[str] | None = None) -> int:

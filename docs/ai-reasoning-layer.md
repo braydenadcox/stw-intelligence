@@ -137,7 +137,8 @@ uncertainty-aware because all 33 candidates contained material opaque mechanics.
 
 ## Boundaries
 
-This backend is ready for a user-facing application and a real LLM adapter. The UI
-still needs inventory entry, structured scenario controls, streamed progress, and
-human-friendly comparison displays. A model adapter must retain schema validation,
-evidence-ID validation, and the rule that partial/opaque contributions are never zero.
+The production local application and first real provider adapter now sit above this
+boundary. See [STW AI application](ai-application.md) for persisted conversations,
+inventory, progress jobs, analysis/comparison screens, and OpenAI configuration. Every
+provider must retain schema validation, evidence-ID validation, and the rule that
+partial/opaque contributions are never zero.

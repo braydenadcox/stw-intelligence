@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the local STW Intelligence watcher, API, and minimal dashboard."""
+"""Run the local STW Intelligence loadout AI, watcher, API, and dashboard."""
 
 from __future__ import annotations
 
@@ -34,6 +34,8 @@ from stw_activity import (
     refresh_activity,
 )
 from stw_ai import AiOrchestrator, StwAiTools
+from stw_ai_app import AiJobManager
+from stw_ai_openai import OpenAIReasoningProvider
 from stw_live import LogWatcher
 from stw_pipeline import connect
 from stw_providers import (
@@ -136,11 +138,13 @@ class ApiApplication:
         dashboard: Path = DASHBOARD,
         provider_status: Callable[[], dict[str, object]] | None = None,
         active_log: Path | None = None,
+        ai_jobs: AiJobManager | None = None,
     ):
         self.database = database.resolve()
         self.dashboard = dashboard
         self.provider_status = provider_status
         self.active_log = active_log.resolve() if active_log else None
+        self.ai_jobs = ai_jobs
 
     def dispatch(
         self, method: str, target: str, body: bytes = b""
@@ -173,6 +177,25 @@ class ApiApplication:
                             ),
                         },
                     )
+                if parsed.path == "/api/ai/jobs":
+                    if self.ai_jobs is None:
+                        return self._json(
+                            HTTPStatus.SERVICE_UNAVAILABLE,
+                            {"error": "AI application is not configured"},
+                        )
+                    try:
+                        job = self.ai_jobs.submit(payload)
+                    except ValueError as error:
+                        return self._json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
+                    return self._json(HTTPStatus.ACCEPTED, job)
+                if parsed.path == "/api/ai/inventory":
+                    if self.ai_jobs is None:
+                        return self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "AI application is not configured"})
+                    try:
+                        result = self.ai_jobs.set_inventory(payload)
+                    except ValueError as error:
+                        return self._json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
+                    return self._json(HTTPStatus.OK, result)
                 if parsed.path == "/api/admin/backup":
                     settings = get_settings(connection)
                     result = backup_database(
@@ -208,6 +231,11 @@ class ApiApplication:
                             HTTPStatus.BAD_REQUEST,
                             {"error": "intent must be an object"},
                         )
+                    if self.ai_jobs is not None:
+                        job = self.ai_jobs.submit({
+                            "request": request.strip(), "intent": intent
+                        })
+                        return self._json(HTTPStatus.ACCEPTED, job)
                     try:
                         result = AiOrchestrator(StwAiTools(connection)).run(
                             request.strip(), intent
@@ -220,6 +248,49 @@ class ApiApplication:
                 return self._json(HTTPStatus.NOT_FOUND, {"error": "not found"})
             if parsed.path == "/api/ai/tools":
                 return self._json(HTTPStatus.OK, StwAiTools.schemas())
+            if parsed.path == "/api/ai/config":
+                return self._json(
+                    HTTPStatus.OK,
+                    self.ai_jobs.status() if self.ai_jobs else {
+                        "provider": "not_configured", "asset_database_ready": False,
+                    },
+                )
+            if parsed.path == "/api/ai/inventory":
+                if self.ai_jobs is None:
+                    return self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "AI application is not configured"})
+                return self._json(HTTPStatus.OK, {"items": self.ai_jobs.inventory()})
+            if parsed.path == "/api/ai/catalog":
+                if self.ai_jobs is None:
+                    return self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "AI application is not configured"})
+                query = parse_qs(parsed.query)
+                kind = query.get("kind", [""])[0]
+                search = query.get("query", [""])[0]
+                try:
+                    limit = int(query.get("limit", ["25"])[0])
+                    items = self.ai_jobs.search_catalog(kind, search, limit)
+                except (ValueError, sqlite3.Error) as error:
+                    return self._json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
+                return self._json(HTTPStatus.OK, {"items": items})
+            if parsed.path == "/api/ai/conversations":
+                if self.ai_jobs is None:
+                    return self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "AI application is not configured"})
+                return self._json(HTTPStatus.OK, {"conversations": self.ai_jobs.conversations()})
+            if parsed.path.startswith("/api/ai/conversations/"):
+                if self.ai_jobs is None:
+                    return self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "AI application is not configured"})
+                conversation_id = parsed.path.rsplit("/", 1)[1]
+                result = self.ai_jobs.conversation(conversation_id)
+                return self._json(HTTPStatus.OK if result else HTTPStatus.NOT_FOUND,
+                                  result or {"error": "conversation not found"})
+            if parsed.path.startswith("/api/ai/jobs/"):
+                if self.ai_jobs is None:
+                    return self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "AI application is not configured"})
+                job_id = parsed.path.rsplit("/", 1)[1]
+                try:
+                    result = self.ai_jobs.get(job_id)
+                except KeyError:
+                    return self._json(HTTPStatus.NOT_FOUND, {"error": "job not found"})
+                return self._json(HTTPStatus.OK, result)
             if parsed.path == "/api/current":
                 return self._json(HTTPStatus.OK, current_state(connection))
             if parsed.path == "/api/attempts":
@@ -467,6 +538,16 @@ class ProviderRefreshLoop:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--db", type=Path, default=Path("data/stw-intelligence.sqlite3"))
+    parser.add_argument(
+        "--asset-db", type=Path,
+        default=Path("data/phase2-real-validation.sqlite3"),
+        help="normalized Fortnite asset catalog used by the loadout AI",
+    )
+    parser.add_argument(
+        "--ai-provider", choices=("deterministic", "openai"),
+        default=os.environ.get("STW_AI_PROVIDER", "deterministic"),
+        help="language provider; OpenAI requires OPENAI_API_KEY",
+    )
     parser.add_argument("--log", type=Path)
     parser.add_argument("--fixture", type=Path, default=DEFAULT_FIXTURE)
     parser.add_argument("--provider-url", help="approved normalized mission feed URL")
@@ -541,6 +622,23 @@ def main() -> int:
     if log_path is None:
         parser.error("--log is required when LOCALAPPDATA is unavailable")
 
+    try:
+        ai_reasoning_provider = (
+            OpenAIReasoningProvider() if args.ai_provider == "openai"
+            else None
+        )
+    except ValueError as error:
+        parser.error(str(error))
+    ai_jobs = AiJobManager(
+        args.db, args.asset_db,
+        provider=ai_reasoning_provider,
+    )
+    if not args.asset_db.exists():
+        print(
+            f"Loadout AI warning: asset catalog not found at {args.asset_db}. "
+            "Matchmaking features will still run."
+        )
+
     provider_loop: ProviderRefreshLoop | None = None
     provider_status: Callable[[], dict[str, object]] | None = None
     if args.provider_url:
@@ -581,7 +679,8 @@ def main() -> int:
             (args.host, args.port),
             handler_for(
                 ApiApplication(
-                    args.db, provider_status=provider_status, active_log=log_path
+                    args.db, provider_status=provider_status, active_log=log_path,
+                    ai_jobs=ai_jobs,
                 )
             ),
         )

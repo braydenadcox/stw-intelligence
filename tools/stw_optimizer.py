@@ -695,8 +695,9 @@ def _mark_pareto(candidates: list[dict[str, Any]], weights: Mapping[str, float])
 
 
 def optimize_loadouts(connection: sqlite3.Connection, request: OptimizationRequest,
-                      snapshot_id: int | None = None) -> dict[str, Any]:
+                      snapshot_id: int | None = None, progress: Any = None) -> dict[str, Any]:
     started = time.perf_counter()
+    emit = progress or (lambda stage, detail=None: None)
     weights = request.weights()
     if not 0 <= request.support_slots <= 5 or not 0 <= request.gadget_slots <= 2:
         raise ValueError("support slots must be 0..5 and gadget slots must be 0..2")
@@ -704,6 +705,7 @@ def optimize_loadouts(connection: sqlite3.Connection, request: OptimizationReque
     if snapshot_id is None: raise ValueError("no ready asset snapshot")
     stats = SearchStats()
     constraints = request.constraints
+    emit("generating_legal_builds", "Generating legal weapons, heroes, team perks, and gadgets")
     variants = _resolve_weapon_variants(connection, snapshot_id, request.weapon)
     weapon_configs, theoretical_weapons, weapon_pruned = _weapon_configurations(
         connection, variants, weights, request.beam_width, request.item_level)
@@ -834,6 +836,7 @@ def optimize_loadouts(connection: sqlite3.Connection, request: OptimizationReque
         if len(deduplicated) >= request.beam_width: break
     context = scenario_report(connection, snapshot_id, request.target, request.mission)
     cache: dict[Any, Any] = {}
+    emit("evaluating_candidates", f"Evaluating {len(deduplicated)} candidate builds")
     rendered = [_render_candidate(connection, snapshot_id, candidate, request, context, cache, stats)
                 for candidate in deduplicated]
     if not constraints.allow_opaque:
@@ -853,6 +856,7 @@ def optimize_loadouts(connection: sqlite3.Connection, request: OptimizationReque
         "opaque" if item["opaque_components"] else "partial"
         if item["partial_components"] else "supported" for item in rendered
     )
+    emit("analyzing_uncertainty", "Classifying supported, partial, and opaque contributions")
     return {
         "snapshot_id": snapshot_id, "request": {**asdict(request), "normalized_weights": weights},
         "scenario_resolution": context,

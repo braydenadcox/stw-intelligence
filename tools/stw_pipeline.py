@@ -1345,6 +1345,36 @@ MIGRATIONS = [
         ON catalog_encounter_option_sets(snapshot_id);
     CREATE INDEX catalog_encounter_modifiers_snapshot_idx
         ON catalog_encounter_modifiers(snapshot_id);
+    """,
+    """
+    CREATE TABLE ai_conversations (
+        id TEXT PRIMARY KEY,
+        title TEXT NOT NULL,
+        last_intent_json TEXT,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE TABLE ai_messages (
+        id INTEGER PRIMARY KEY,
+        conversation_id TEXT NOT NULL
+            REFERENCES ai_conversations(id) ON DELETE CASCADE,
+        role TEXT NOT NULL CHECK (role IN ('user', 'assistant', 'system')),
+        content TEXT NOT NULL,
+        response_json TEXT,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE INDEX ai_messages_conversation_idx
+        ON ai_messages(conversation_id, id);
+    CREATE TABLE ai_inventory (
+        entity_kind TEXT NOT NULL CHECK (
+            entity_kind IN ('hero', 'weapon', 'team_perk', 'gadget')
+        ),
+        entity_key TEXT NOT NULL,
+        display_name TEXT NOT NULL,
+        owned INTEGER NOT NULL DEFAULT 1 CHECK (owned IN (0, 1)),
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (entity_kind, entity_key)
+    );
     """
 ]
 

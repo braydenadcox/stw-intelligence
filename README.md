@@ -279,6 +279,12 @@ See [AI reasoning and recommendation](docs/ai-reasoning-layer.md) for the versio
 `BuildIntent`, provider interface, targeted tools, ownership constraints, loadout
 analysis, API endpoint, and hallucination safeguards.
 
+The polished local AI application is included in the normal dashboard. Double-click
+`start-stw.cmd`, then open **AI Chat**, **Build Analyzer**, **Inventory**, or
+**Compare Builds**. The deterministic provider works offline. To enable the real
+OpenAI adapter, set `OPENAI_API_KEY` and `STW_AI_PROVIDER=openai` before launching.
+See [STW AI application](docs/ai-application.md) for configuration and workflows.
+
 The catalog preserves the real Water/Ice and Nature/Lightning naming layers, proves
 conditional enemy `DamageResistance` and freeze-duration curve values, and leaves the
 native final-damage conversion explicitly unresolved. See

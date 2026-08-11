@@ -253,6 +253,19 @@ python tools/stw_context.py --db data/phase2-real-validation.sqlite3 modifier "H
 See [enemy and mission context semantics](docs/enemy-mission-context-semantics.md) for
 the structural evidence rules and the native runtime boundaries.
 
+Complete deterministic loadout search combines that context with legal commanders,
+supports, team perks, weapons/perks, abilities, and gadgets:
+
+```powershell
+python tools/stw_optimizer.py --db data/phase2-real-validation.sqlite3 `
+  --weapon Nocturno --enemy default__huskpawn_c `
+  --mission /savetheworld/missions/primary/launchtheballoon/ridethestorm `
+  --objective burst_damage=2,crowd_clear=1 --four-player
+```
+
+See [full deterministic loadout optimization](docs/full-loadout-optimization.md) for
+legality, weighted objectives, pruning, uncertainty handling, and real benchmarks.
+
 The catalog preserves the real Water/Ice and Nature/Lightning naming layers, proves
 conditional enemy `DamageResistance` and freeze-duration curve values, and leaves the
 native final-damage conversion explicitly unresolved. See

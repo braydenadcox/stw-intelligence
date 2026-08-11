@@ -52,6 +52,8 @@ class LoadoutContext:
     commander: str | None = None
     support_heroes: tuple[str, ...] = ()
     source_tags: tuple[str, ...] = ()
+    team_perk: str | None = None
+    gadgets: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -576,10 +578,11 @@ def _resolve_hero(
         JOIN catalog_hero_perks assignment ON assignment.hero_id=hero.id
         JOIN catalog_perks perk ON perk.id=assignment.perk_id
         LEFT JOIN catalog_ability_kits kit ON kit.id=perk.ability_kit_id
-        WHERE hero.snapshot_id=? AND lower(hero.display_name)=lower(?)
+        WHERE hero.snapshot_id=? AND
+          (lower(hero.display_name)=lower(?) OR lower(hero.hero_key)=lower(?))
           AND assignment.perk_mode=?
         """,
-        (state.snapshot_id, hero_name, role),
+        (state.snapshot_id, hero_name, hero_name, role),
     ).fetchall()
     if len(rows) != 1:
         raise ValueError(f"{role} hero must resolve exactly once: {hero_name!r}")
@@ -619,6 +622,63 @@ def _resolve_hero(
         "perk_family": row["perk_family"],
         "perk_tier": row["perk_tier"],
         "source": hero_source,
+    }
+
+
+def _resolve_loadout_interaction(
+    state: _EvaluationState, name: str, kind: str
+) -> dict[str, Any]:
+    if kind == "team_perk":
+        table, key_column = "catalog_team_perks", "team_perk_key"
+    elif kind == "gadget":
+        table, key_column = "catalog_gadgets", "gadget_key"
+    else:
+        raise ValueError(f"unsupported loadout interaction kind: {kind}")
+    rows = state.connection.execute(
+        f"""SELECT id, source_object_id, ability_kit_id, {key_column} AS owner_key,
+                   display_name, semantic_status
+            FROM {table} WHERE snapshot_id=? AND
+              (lower({key_column})=lower(?) OR lower(display_name)=lower(?))""",
+        (state.snapshot_id, name, name),
+    ).fetchall()
+    if len(rows) != 1:
+        raise ValueError(f"{kind} must resolve exactly once: {name!r}")
+    row = rows[0]
+    state.add_provenance(
+        _source_for_object(state.connection, row["source_object_id"], kind)
+    )
+    # Team-perk kits grant effects to the loadout owner. Gadget kits frequently
+    # contain effects applied by a spawned actor or ability to another target;
+    # aggregating those into player weapon attributes would fabricate targeting.
+    found = 0
+    if kind == "team_perk":
+        found = _kit_modifiers(
+            state, row["ability_kit_id"], kind, row["display_name"],
+            {"owner_key": row["owner_key"]},
+        )
+    else:
+        state.issue(
+            "gadget_runtime_targeting_not_evaluated",
+            "Gadget effects remain semantic evidence until activation and target "
+            "ownership are structurally proven for this scenario.",
+            origin=row["owner_key"],
+        )
+    if row["semantic_status"] != "supported":
+        state.issue(
+            f"partial_or_opaque_{kind}",
+            f"{row['display_name']} is {row['semantic_status']}; supported sub-effects "
+            "are evaluated while unresolved behavior remains unquantified.",
+            origin=row["owner_key"],
+        )
+    if not found and kind == "team_perk":
+        state.issue(
+            f"{kind}_without_static_modifier",
+            f"{row['display_name']} exposes no directly evaluable static combat modifier.",
+            origin=row["owner_key"],
+        )
+    return {
+        "key": row["owner_key"], "display_name": row["display_name"],
+        "semantic_status": row["semantic_status"],
     }
 
 
@@ -693,6 +753,11 @@ def _validate_inputs(
         raise ValueError("support heroes must be unique")
     if loadout.commander and loadout.commander.casefold() in names:
         raise ValueError("the commander cannot also occupy a support slot")
+    if len(loadout.gadgets) > 2:
+        raise ValueError("at most two gadgets are allowed")
+    gadget_names = [name.casefold() for name in loadout.gadgets]
+    if len(gadget_names) != len(set(gadget_names)):
+        raise ValueError("gadgets must be unique")
     if configuration.item_level is not None and configuration.item_level < 1:
         raise ValueError("item_level must be positive")
 
@@ -729,6 +794,14 @@ def evaluate_combat(
     )
     supports = [
         _resolve_hero(state, hero, "support") for hero in loadout.support_heroes
+    ]
+    team_perk = (
+        _resolve_loadout_interaction(state, loadout.team_perk, "team_perk")
+        if loadout.team_perk else None
+    )
+    gadgets = [
+        _resolve_loadout_interaction(state, gadget, "gadget")
+        for gadget in loadout.gadgets
     ]
 
     raw_stats = _json(variant["raw_stats_json"], {})
@@ -993,7 +1066,8 @@ def evaluate_combat(
         status=status,
         weapon=weapon,
         scenario=asdict(scenario),
-        loadout={"commander": commander, "support_heroes": supports},
+        loadout={"commander": commander, "support_heroes": supports,
+                 "team_perk": team_perk, "gadgets": gadgets},
         attributes=attributes,
         metrics=metrics,
         contributions=state.contributions,

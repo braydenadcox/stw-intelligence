@@ -149,14 +149,84 @@ class AiReasoningTests(unittest.TestCase):
         provenance = result["recommendation"]["provenance"]
         self.assertTrue(any(item.get("content_sha256") for item in provenance))
 
-    def test_missing_weapon_returns_clarification_instead_of_guess(self) -> None:
+    def test_unconstrained_crowd_control_request_optimizes_weapon(self) -> None:
         result = AiOrchestrator(self.tools).run(
-            "Make it fun and aggressive",
-            {"schema_version": INTENT_SCHEMA_VERSION, "target_enemy": "HuskGeneric",
-             "objective_weights": {"burst_damage": 1}},
+            "Generate the most effective overall loadout for crowd control",
+            intent_patch={"support_slots": 0, "gadget_slots": 0, "beam_width": 8},
         )
-        self.assertEqual("needs_clarification", result["status"])
-        self.assertIn("weapon", result["questions"][0].casefold())
+        self.assertIn("recommendation", result)
+        self.assertIn("crowd_control", result["intent"]["objective_weights"])
+        self.assertIsNone(result["intent"]["weapon"])
+        self.assertEqual("optimize", result["intent"]["dimension_states"]["weapon"])
+        self.assertTrue(any("all legal catalog weapon" in item for item in result["assumptions"]))
+
+    def test_whatever_weapon_is_best_and_choose_everything_do_not_clarify(self) -> None:
+        for request in (
+            "Whatever weapon is best for crowd control",
+            "You choose everything for crowd control",
+        ):
+            with self.subTest(request=request):
+                result = AiOrchestrator(self.tools).run(
+                    request, intent_patch={"support_slots": 0, "gadget_slots": 0,
+                                           "beam_width": 8}
+                )
+                self.assertIn("recommendation", result)
+                self.assertIsNone(result["intent"]["weapon"])
+                self.assertEqual(
+                    "optimize", result["intent"]["dimension_states"]["weapon"]
+                )
+                if "everything" in request:
+                    self.assertTrue(all(
+                        state == "optimize"
+                        for state in result["intent"]["dimension_states"].values()
+                    ))
+                    self.assertIsNone(result["intent"]["locked_commander"])
+                    self.assertFalse(result["intent"]["locked_supports"])
+
+    def test_explicit_weapon_lock_and_followup_delegation(self) -> None:
+        grounded = [{"kind": "weapon", "entity_key": "nocturno",
+                     "display_name": "Nocturno", "semantic_status": "partial"}]
+        locked = BuildIntent.from_dict(
+            DeterministicReasoningProvider().interpret(
+                "Build the best Nocturno loadout", grounded
+            )
+        )
+        self.assertEqual("Nocturno", locked.weapon)
+        self.assertEqual("locked", locked.dimension_state("weapon"))
+
+        first_payload = {
+            **self.intent(),
+            "dimension_states": {"weapon": "locked"},
+            "explicit_dimensions": ["weapon"],
+        }
+        result = AiOrchestrator(self.tools).run(
+            "Doesn't matter anymore, choose the weapon",
+            previous_intent=first_payload,
+            intent_patch={"support_slots": 0, "gadget_slots": 0, "beam_width": 8},
+        )
+        self.assertIn("recommendation", result)
+        self.assertIsNone(result["intent"]["weapon"])
+        self.assertEqual("optimize", result["intent"]["dimension_states"]["weapon"])
+
+    def test_required_clarification_is_indispensable_and_never_loops(self) -> None:
+        required = {
+            "schema_version": INTENT_SCHEMA_VERSION,
+            "objective_weights": {"crowd_control": 1},
+            "dimension_states": {"target_enemy": "required_clarification"},
+            "explicit_dimensions": ["target_enemy"],
+            "support_slots": 0, "gadget_slots": 0,
+        }
+        first = AiOrchestrator(self.tools).run("Optimize for this target", required)
+        self.assertEqual("needs_clarification", first["status"])
+        self.assertEqual(1, len(first["questions"]))
+        second = AiOrchestrator(self.tools).run(
+            "I still have not specified it", required,
+            conversation=[{"role": "assistant", "content": "clarification",
+                           "response": first}],
+        )
+        self.assertEqual("needs_clarification", second["status"])
+        self.assertEqual([], second["questions"])
+        self.assertTrue(second["blocking_reasons"])
 
     def test_provider_cannot_cite_manufactured_evidence(self) -> None:
         with self.assertRaisesRegex(ValueError, "unknown evidence IDs"):

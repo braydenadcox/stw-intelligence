@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 import tempfile
 import unittest
@@ -16,6 +17,8 @@ from stw_optimizer import (  # noqa: E402
     OptimizationRequest,
     SearchStats,
     _hero_beam,
+    _applicability_trace,
+    _normalize_and_rank,
     _team_perk_eligible,
     _weapon_configurations,
     _resolve_weapon_variants,
@@ -96,6 +99,131 @@ class OptimizerTests(unittest.TestCase):
         self.assertFalse(illegal)
         self.assertTrue(reasons)
 
+    @staticmethod
+    def mechanic_profile(
+        *, source=(), target=(), status="supported", attribute="StunTime",
+        literal=2.0, mechanics=(), semantic_status="supported",
+    ) -> dict:
+        return {
+            "display_name": "Adversarial perk", "semantic_status": semantic_status,
+            "evidence": {"mechanics": list(mechanics), "tags": [], "modifiers": [{
+                "attribute_name": attribute,
+                "modifier_operation": "EGameplayModOp::Additive",
+                "literal_value": literal, "interpretation_status": status,
+                "source_required_tags_json": json.dumps(list(source)),
+                "source_ignored_tags_json": "[]",
+                "target_required_tags_json": json.dumps(list(target)),
+                "target_ignored_tags_json": "[]",
+            }]},
+        }
+
+    def assert_no_supported_credit(self, profile: dict, context: dict) -> None:
+        scores, _, _ = _applicability_trace(profile, context)
+        self.assertEqual({}, scores)
+
+    def test_adversarial_weapon_family_and_range_requirements(self) -> None:
+        assault = {"source_tags": {"Weapon.Ranged.Assault"}, "target_tags": set(),
+                   "active_abilities": set(), "weapon_present": True}
+        self.assert_no_supported_credit(
+            self.mechanic_profile(source=("Weapon.Melee.Edged.Scythe",)), assault
+        )
+        self.assert_no_supported_credit(
+            self.mechanic_profile(source=("Weapon.Ranged.Shotgun",)), assault
+        )
+        melee = {**assault, "source_tags": {"Weapon.Melee.Edged.Sword"}}
+        self.assert_no_supported_credit(
+            self.mechanic_profile(source=("Weapon.Ranged",)), melee
+        )
+
+    def test_adversarial_ability_element_and_status_requirements(self) -> None:
+        context = {"source_tags": {"Weapon.Ranged.Assault", "Weapon.Element.Nature"},
+                   "target_tags": set(), "active_abilities": {"TEDDY"},
+                   "weapon_present": True}
+        self.assert_no_supported_credit(self.mechanic_profile(
+            source=("Asset.AbilityEffect.Outlander.PhaseShift.PassThrough",)
+        ), context)
+        self.assert_no_supported_credit(self.mechanic_profile(
+            source=("Weapon.Element.Fire",)
+        ), context)
+        self.assert_no_supported_credit(self.mechanic_profile(
+            target=("Gameplay.Status.Snare",)
+        ), context)
+
+    def test_ability_damage_is_not_credited_as_weapon_dps(self) -> None:
+        context = {"source_tags": set(), "target_tags": set(),
+                   "active_abilities": {"Goin Commando"}, "weapon_present": True}
+        profile = self.mechanic_profile(
+            source=("Asset.AbilityGroup.Hero.Commando.GoinCommando",),
+            attribute="OutgoingAbilityDamage",
+        )
+        scores, traces, _ = _applicability_trace(profile, context)
+        self.assertTrue(traces[0]["applicable"])
+        self.assertEqual([], traces[0]["objective_mapping"])
+        self.assertEqual({}, scores)
+        weapon_profile = self.mechanic_profile(
+            source=("Weapon.Ranged.Assault",), attribute="OutgoingAbilityDamage"
+        )
+        weapon_scores, weapon_traces, _ = _applicability_trace(
+            weapon_profile,
+            {**context, "source_tags": {"Weapon.Ranged.Assault"}},
+        )
+        self.assertEqual(["burst_damage", "sustained_damage"],
+                         weapon_traces[0]["objective_mapping"])
+        self.assertEqual(2.0, weapon_scores["sustained_damage"])
+
+    def test_adversarial_elimination_and_unresolved_mechanics_receive_no_credit(self) -> None:
+        trigger = {"mechanic_type": "trigger", "interpretation_status": "supported",
+                   "value_json": "Event.Enemy.Eliminated", "conditions_json": "{}"}
+        context = {"source_tags": set(), "target_tags": set(),
+                   "active_abilities": set(), "weapon_present": True,
+                   "excluded_events": {"elimination_trigger"}}
+        self.assert_no_supported_credit(
+            self.mechanic_profile(mechanics=(trigger,)), context
+        )
+        interact = {"mechanic_type": "trigger", "interpretation_status": "supported",
+                    "value_json": "Event.Interact.Completed", "conditions_json": "{}"}
+        self.assert_no_supported_credit(
+            self.mechanic_profile(mechanics=(interact,)),
+            {**context, "excluded_events": set()},
+        )
+        incompatible = self.mechanic_profile(source=("Weapon.Ranged.Assault",))
+        incompatible["evidence"]["modifiers"][0]["source_ignored_tags_json"] = json.dumps(
+            ["Weapon.Element.Nature"]
+        )
+        self.assert_no_supported_credit(
+            incompatible,
+            {**context, "source_tags": {"Weapon.Ranged.Assault", "Weapon.Element.Nature"}},
+        )
+        self.assert_no_supported_credit(
+            self.mechanic_profile(status="partial", literal=99), context
+        )
+        opaque = {"display_name": "Opaque stun words", "semantic_status": "opaque",
+                  "evidence": {"modifiers": [], "tags": [], "mechanics": [{
+                      "mechanic_type": "stun", "interpretation_status": "opaque",
+                      "conditions_json": "{}", "value_json": "{\"literal\":999}"
+                  }]}}
+        self.assert_no_supported_credit(opaque, context)
+
+    def test_objective_score_is_not_batch_min_max_or_trivially_one_hundred(self) -> None:
+        candidates = [
+            {"raw_supported_components": {"crowd_control": 2.0},
+             "applicability_trace": []},
+            {"raw_supported_components": {"crowd_control": 1.0},
+             "applicability_trace": []},
+        ]
+        _normalize_and_rank(candidates, {"crowd_control": 1.0})
+        first = candidates[0]["supported_score_components"]["crowd_control"]
+        self.assertNotEqual(100.0, first["comparison_score"])
+        self.assertEqual("asinh_supported_units", first["score_scale"])
+        original = first["comparison_score"]
+        candidates.append({"raw_supported_components": {"crowd_control": 999.0},
+                           "applicability_trace": []})
+        _normalize_and_rank(candidates, {"crowd_control": 1.0})
+        self.assertEqual(
+            original,
+            candidates[0]["supported_score_components"]["crowd_control"]["comparison_score"],
+        )
+
     def test_hero_beam_never_reuses_commander_or_support_identity(self) -> None:
         def hero(index: int, role: str) -> dict:
             return {"hero_key": f"hero-{index}", "display_name": f"Hero {index}",
@@ -116,6 +244,7 @@ class OptimizerTests(unittest.TestCase):
             MissionContext("Ride the Lightning", four_player=True),
             (("burst_damage", 1.0),), combat_scenario=CombatScenario(window_mode="burst"),
             support_slots=0, gadget_slots=0, beam_width=8, max_results=3,
+            diagnostics=True,
         )
         result = optimize_loadouts(self.connection, request, self.snapshot)
         self.assertGreater(result["search_space"]["weapon_configurations"], 0)
@@ -126,6 +255,16 @@ class OptimizerTests(unittest.TestCase):
         self.assertEqual("HuskGeneric", result["scenario_resolution"]["resolved_target"]["display_name"])
         self.assertEqual("supported", top["supported_score_components"]["burst_damage"]["status"])
         self.assertTrue(top["combat_evaluation"]["contributions"])
+        self.assertEqual(
+            "asinh_supported_units; independent of current search batch",
+            top["selection_diagnostics"]["score_scale"],
+        )
+        self.assertTrue(top["selection_diagnostics"]["slots"])
+        commander_diagnostic = next(
+            item for item in top["selection_diagnostics"]["slots"]
+            if item["slot"] == "commander"
+        )
+        self.assertGreater(commander_diagnostic["supported_weighted_contribution"], 0)
         self.assertTrue(all(item.get("content_sha256") for item in top["provenance"] if "relative_path" in item))
 
     def test_combat_kernel_applies_supported_team_and_gadget_subeffects(self) -> None:

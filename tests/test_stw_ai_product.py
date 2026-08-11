@@ -152,8 +152,12 @@ class AiProductTests(unittest.TestCase):
         clarification = self.manager.wait(self.manager.submit({
             "request": "Make me something fun",
             "intent": {"schema_version": INTENT_SCHEMA_VERSION,
-                       "target_enemy": "HuskGeneric",
-                       "objective_weights": {"sustained_damage": 1}},
+                       "objective_weights": {"sustained_damage": 1},
+                       "dimension_states": {
+                           "target_enemy": "required_clarification"
+                       },
+                       "explicit_dimensions": ["target_enemy"],
+                       "support_slots": 0, "gadget_slots": 0},
         })["id"])
         self.assertEqual("needs_clarification", clarification["result"]["status"])
         broken = AiJobManager(self.app_db, Path(self.temporary.name) / "missing.sqlite3")

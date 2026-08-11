@@ -50,7 +50,8 @@ TOOL_SCHEMA_VERSION = "stw.ai-tools.v1"
 PROMPT_VERSION = "stw.reasoning.v1"
 REASONING_POLICY = """Interpret user intent and select supplied evidence IDs only.
 Never provide Fortnite mechanics, values, legality judgments, rankings, or claims from
-model memory. Ask for clarification when a material structured input is missing. Keep
+model memory. Default unspecified build choices to optimization and ask for
+clarification only when comparison would be materially undefined or misleading. Keep
 supported, partial, and opaque evidence distinct; unknown contributions are not zero."""
 BUILD_INTENT_FIELDS = {
     "schema_version", "user_request", "mode", "weapon", "target_enemy",
@@ -61,7 +62,36 @@ BUILD_INTENT_FIELDS = {
     "locked_team_perk", "owned_team_perks", "locked_gadgets", "owned_gadgets",
     "locked_weapon_perks", "avoid_conditions", "allow_partial", "allow_opaque",
     "requested_alternatives", "support_slots", "gadget_slots", "beam_width",
-    "current_loadout", "comparison_loadouts",
+    "current_loadout", "comparison_loadouts", "dimension_states",
+    "explicit_dimensions",
+}
+
+DIMENSION_STATES = ("locked", "optimize", "required_clarification")
+BUILD_DIMENSIONS = (
+    "weapon", "weapon_category", "weapon_perks", "commander",
+    "support_heroes", "team_perk", "gadgets", "target_enemy",
+    "target_element", "mission", "power_level", "four_player",
+    "elemental_storm", "mission_modifiers",
+)
+DIMENSION_FIELDS = {
+    "weapon": ("weapon",), "weapon_perks": ("locked_weapon_perks",),
+    "commander": ("locked_commander",), "support_heroes": ("locked_supports",),
+    "team_perk": ("locked_team_perk",), "gadgets": ("locked_gadgets",),
+    "target_enemy": ("target_enemy",), "target_element": ("target_element",),
+    "mission": ("mission",), "power_level": ("power_level",),
+    "four_player": ("four_player",), "elemental_storm": ("elemental_storm",),
+    "mission_modifiers": ("mission_modifiers",),
+    "weapon_category": (),
+}
+CLARIFICATION_QUESTIONS = {
+    "weapon": "Which weapon or schematic must the build use?",
+    "weapon_category": "Which weapon category must the build use?",
+    "target_enemy": "Which enemy context must it be evaluated against?",
+    "target_element": "Which target element must it be evaluated against?",
+    "mission": "Which mission must it be evaluated for?",
+    "power_level": "Which mission power level must it use?",
+    "four_player": "Should this use four-player mission scaling?",
+    "elemental_storm": "Which elemental storm must it use?",
 }
 
 OBJECTIVE_LANGUAGE = {
@@ -180,6 +210,11 @@ class BuildIntent:
     beam_width: int = 64
     current_loadout: SpecifiedLoadout | None = None
     comparison_loadouts: tuple[SpecifiedLoadout, ...] = ()
+    dimension_states: tuple[tuple[str, str], ...] = ()
+    explicit_dimensions: tuple[str, ...] = ()
+
+    def dimension_state(self, name: str) -> str:
+        return dict(self.dimension_states).get(name, "optimize")
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any], user_request: str = "") -> "BuildIntent":
@@ -234,6 +269,23 @@ class BuildIntent:
             raise ValueError("comparison_loadouts must be a list")
         if not all(isinstance(item, Mapping) for item in raw_comparisons):
             raise ValueError("each comparison loadout must be an object")
+        raw_states = value.get("dimension_states") or {}
+        if not isinstance(raw_states, Mapping):
+            raise ValueError("dimension_states must be an object")
+        if set(raw_states) - set(BUILD_DIMENSIONS):
+            raise ValueError("dimension_states contains an unknown dimension")
+        if any(state not in DIMENSION_STATES for state in raw_states.values()):
+            raise ValueError(f"dimension state must be one of {DIMENSION_STATES}")
+        explicit_dimensions = _tuple_strings(
+            value.get("explicit_dimensions"), "explicit_dimensions"
+        )
+        if set(explicit_dimensions) - set(BUILD_DIMENSIONS):
+            raise ValueError("explicit_dimensions contains an unknown dimension")
+        states = {name: "optimize" for name in BUILD_DIMENSIONS}
+        for dimension, fields in DIMENSION_FIELDS.items():
+            if any(value.get(field) not in (None, (), [], {}) for field in fields):
+                states[dimension] = "locked"
+        states.update({str(name): str(state) for name, state in raw_states.items()})
         return cls(
             user_request=user_request or str(value.get("user_request", "")), mode=mode,
             weapon=value.get("weapon"), target_enemy=value.get("target_enemy"),
@@ -265,6 +317,8 @@ class BuildIntent:
             comparison_loadouts=tuple(
                 SpecifiedLoadout.from_dict(item) for item in raw_comparisons
             ),
+            dimension_states=tuple((name, states[name]) for name in BUILD_DIMENSIONS),
+            explicit_dimensions=explicit_dimensions,
         )
 
 
@@ -310,6 +364,24 @@ class DeterministicReasoningProvider:
         if re.search(r"\b(?:don't|dont|do not) own\b", text):
             unavailable = [str(row["display_name"]) for row in by_kind.get("hero", [])]
         power = re.search(r"\b(?:pl\s*)?(\d{2,3})s?\b", text)
+        delegated = any(phrase in text for phrase in (
+            "doesn't matter", "doesnt matter", "does not matter", "whatever is best",
+            "whatever category is best", "you choose", "choose everything",
+            "choose the weapon", "any weapon", "no preference",
+            "whatever maximizes",
+        ))
+        explicit_dimensions = []
+        dimension_states = {}
+        if first("weapon"):
+            explicit_dimensions.append("weapon"); dimension_states["weapon"] = "locked"
+        elif delegated and any(term in text for term in (
+            "weapon", "category", "everything", "whatever", "you choose", "no preference"
+        )):
+            explicit_dimensions.extend(("weapon", "weapon_category"))
+            dimension_states.update({"weapon": "optimize", "weapon_category": "optimize"})
+        if "choose everything" in text or "you choose everything" in text:
+            explicit_dimensions = list(BUILD_DIMENSIONS)
+            dimension_states = {name: "optimize" for name in BUILD_DIMENSIONS}
         return {
             "schema_version": INTENT_SCHEMA_VERSION,
             "mode": "analyze" if "my current loadout" in text or "what sucks" in text else "recommend",
@@ -325,6 +397,8 @@ class DeterministicReasoningProvider:
             ) else [],
             "allow_partial": True, "allow_opaque": True,
             "requested_alternatives": 3,
+            "dimension_states": dimension_states,
+            "explicit_dimensions": explicit_dimensions,
         }
 
     def select_evidence(self, intent: BuildIntent, evidence: Sequence[Mapping[str, Any]]) -> Sequence[str]:
@@ -348,7 +422,10 @@ class StwAiTools:
             "reasoning_policy": REASONING_POLICY,
             "build_intent": {"schema_version": INTENT_SCHEMA_VERSION,
                              "allowed_fields": sorted(BUILD_INTENT_FIELDS),
-                             "objective_names": list(OBJECTIVES)},
+                             "objective_names": list(OBJECTIVES),
+                             "dimensions": list(BUILD_DIMENSIONS),
+                             "dimension_states": list(DIMENSION_STATES),
+                             "default_dimension_state": "optimize"},
             "tools": {
                 "catalog.search": {"required": ["kind", "query"], "limit": "1..25"},
                 "catalog.inspect": {"required": ["kind", "key_or_name"]},
@@ -601,15 +678,13 @@ class StwAiTools:
         return {"legality": legality, "evaluation": evaluation.as_dict()}
 
     def optimization_request(self, intent: BuildIntent) -> OptimizationRequest:
-        if not intent.weapon:
-            raise ValueError("a weapon preference is required for deterministic optimization")
         if not intent.target_enemy:
             raise ValueError("an enemy context is required for deterministic optimization")
-        if intent.owned_weapons and intent.weapon.casefold() not in {
+        if intent.weapon and intent.owned_weapons and intent.weapon.casefold() not in {
             item.casefold() for item in intent.owned_weapons
         }:
             raise ValueError("requested weapon is not present in owned_weapons")
-        if intent.weapon.casefold() in {
+        if intent.weapon and intent.weapon.casefold() in {
             item.casefold() for item in intent.unavailable_weapons
         }:
             raise ValueError("requested weapon is listed in unavailable_weapons")
@@ -626,11 +701,20 @@ class StwAiTools:
             support_slots=intent.support_slots, gadget_slots=intent.gadget_slots,
             beam_width=intent.beam_width,
             constraints=OptimizationConstraints(
-                intent.owned_heroes, intent.unavailable_heroes, intent.locked_commander,
-                intent.locked_supports, intent.locked_team_perk, intent.owned_team_perks,
-                intent.locked_gadgets, intent.owned_gadgets,
-                intent.allow_partial, intent.allow_opaque, intent.avoid_conditions,
-                intent.locked_weapon_perks,
+                owned_heroes=intent.owned_heroes,
+                unavailable_heroes=intent.unavailable_heroes,
+                locked_commander=intent.locked_commander,
+                locked_supports=intent.locked_supports,
+                locked_team_perk=intent.locked_team_perk,
+                owned_team_perks=intent.owned_team_perks,
+                locked_gadgets=intent.locked_gadgets,
+                owned_gadgets=intent.owned_gadgets,
+                allow_partial=intent.allow_partial,
+                allow_opaque=intent.allow_opaque,
+                avoid_mechanics=intent.avoid_conditions,
+                locked_weapon_perks=intent.locked_weapon_perks,
+                owned_weapons=intent.owned_weapons,
+                unavailable_weapons=intent.unavailable_weapons,
             ),
         )
 
@@ -676,7 +760,7 @@ def _evidence_for_recommendation(recommendation: Mapping[str, Any]) -> list[dict
         add("selection", f"Team perk: {recommendation['team_perk']['display_name']}")
     for objective, component in recommendation.get("supported_score_components", {}).items():
         if component.get("status") == "supported":
-            add("score", f"{objective} has supported normalized score {component['normalized_score']:.1f}")
+            add("score", f"{objective} has supported comparison score {component['comparison_score']:.3f}")
     for item in recommendation.get("partial_components", [])[:4]:
         add("uncertainty", f"Partial contribution from {item.get('owner') or 'unknown source'} remains unquantified", "partial")
     for item in recommendation.get("opaque_components", [])[:4]:
@@ -722,6 +806,8 @@ def build_intent_payload(intent: BuildIntent) -> dict[str, Any]:
     value = asdict(intent)
     value["schema_version"] = INTENT_SCHEMA_VERSION
     value["objective_weights"] = dict(intent.objective_weights)
+    value["dimension_states"] = dict(intent.dimension_states)
+    value["explicit_dimensions"] = list(intent.explicit_dimensions)
     def loadout_payload(loadout: SpecifiedLoadout | None) -> dict[str, Any] | None:
         if loadout is None: return None
         result = asdict(loadout)
@@ -745,12 +831,30 @@ def _merge_followup_intent(
     merged = dict(previous)
     union_fields = {"unavailable_heroes", "unavailable_weapons", "avoid_conditions"}
     for key, value in patch.items():
-        if key in {"schema_version", "user_request"}: continue
+        if key in {"schema_version", "user_request", "dimension_states",
+                   "explicit_dimensions"}: continue
         if value is None or value == [] or value == () or value == {}: continue
         if key in union_fields:
             merged[key] = list(dict.fromkeys([*merged.get(key, []), *value]))
         else:
             merged[key] = value
+    previous_states = dict(previous.get("dimension_states") or {})
+    patch_states = dict(patch.get("dimension_states") or {})
+    explicit = set(patch.get("explicit_dimensions") or ())
+    for dimension in explicit:
+        state = patch_states.get(dimension, "optimize")
+        previous_states[dimension] = state
+        if state == "optimize":
+            for field in DIMENSION_FIELDS[dimension]:
+                merged[field] = None if field not in {
+                    "locked_supports", "locked_gadgets", "locked_weapon_perks",
+                    "mission_modifiers",
+                } else []
+            if dimension == "weapon":
+                merged["locked_weapon_perks"] = []
+                previous_states["weapon_perks"] = "optimize"
+    merged["dimension_states"] = previous_states
+    merged["explicit_dimensions"] = sorted(explicit)
     merged["schema_version"] = INTENT_SCHEMA_VERSION
     return merged
 
@@ -849,6 +953,20 @@ class AiOrchestrator:
         if intent_patch:
             raw_intent = {**raw_intent, **intent_patch,
                           "schema_version": INTENT_SCHEMA_VERSION}
+            states = dict(raw_intent.get("dimension_states") or {})
+            explicit = set(raw_intent.get("explicit_dimensions") or ())
+            for dimension, fields in DIMENSION_FIELDS.items():
+                touched = [field for field in fields if field in intent_patch]
+                if touched:
+                    explicit.add(dimension)
+                    states[dimension] = (
+                        "locked" if any(intent_patch.get(field) not in (None, (), [], {})
+                                        for field in touched) else "optimize"
+                    )
+            states.update(dict(intent_patch.get("dimension_states") or {}))
+            explicit.update(intent_patch.get("explicit_dimensions") or ())
+            raw_intent["dimension_states"] = states
+            raw_intent["explicit_dimensions"] = sorted(explicit)
         if raw_intent.get("target_enemy"):
             resolved_target = self.tools.resolve_enemy_input(
                 str(raw_intent["target_enemy"])
@@ -858,6 +976,20 @@ class AiOrchestrator:
         intent = BuildIntent.from_dict(raw_intent, user_text)
         emit("resolving_constraints", "Validating inventory, locks, mission, and target")
         assumptions = []
+        if intent.mode == "recommend":
+            required = [
+                name for name, state in intent.dimension_states
+                if state == "required_clarification"
+            ]
+            questions = [
+                CLARIFICATION_QUESTIONS.get(
+                    name, f"Please specify the required {name.replace('_', ' ')}."
+                ) for name in required
+            ]
+            if questions:
+                return self._clarification(
+                    intent, grounding, questions, conversation=conversation
+                )
         if intent.mode == "recommend" and not intent.target_enemy:
             baseline = self.tools.baseline_enemy()
             if baseline:
@@ -866,9 +998,17 @@ class AiOrchestrator:
                     f"No enemy was specified; used catalog baseline {baseline['display_name']} "
                     f"({baseline['enemy_key']})."
                 )
+        if intent.mode == "recommend" and not intent.weapon:
+            assumptions.append(
+                "No weapon was locked; optimized across all legal catalog weapon candidates."
+            )
         if intent.mode == "analyze":
             if not intent.current_loadout:
-                return self._clarification(intent, grounding, ["Provide current_loadout with at least a weapon."])
+                return self._clarification(
+                    intent, grounding,
+                    ["Provide current_loadout with at least a weapon."],
+                    conversation=conversation,
+                )
             emit("evaluating_candidates", "Evaluating the supplied loadout")
             analysis = analyze_existing_loadout(self.tools, intent)
             emit("preparing_recommendation", "Preparing the evidence-backed analysis")
@@ -878,7 +1018,8 @@ class AiOrchestrator:
         if intent.mode == "compare":
             if len(intent.comparison_loadouts) < 2:
                 return self._clarification(
-                    intent, grounding, ["Provide at least two complete comparison_loadouts."]
+                    intent, grounding, ["Provide at least two complete comparison_loadouts."],
+                    conversation=conversation,
                 )
             emit("evaluating_candidates", "Comparing builds under one scenario")
             comparison = self.tools.compare(
@@ -891,14 +1032,13 @@ class AiOrchestrator:
                     "safeguards": {"same_scenario_required": True,
                                    "definitive": comparison["definitive"]},
                     "elapsed_ms": (time.perf_counter() - started) * 1000.0}
-        missing = []
-        if not intent.weapon: missing.append("Which weapon or schematic should the build use?")
-        if not intent.target_enemy: missing.append("Which enemy context should it be evaluated against?")
-        if missing: return self._clarification(intent, grounding, missing)
         optimization = self.tools.optimize(intent, emit)
         recommendations = optimization["definitive_rankings"] or optimization["uncertainty_aware_recommendations"]
         if not recommendations:
-            return self._clarification(intent, grounding, ["No candidate satisfies all supplied constraints."])
+            return self._clarification(
+                intent, grounding, ["No candidate satisfies all supplied constraints."],
+                conversation=conversation,
+            )
         top = recommendations[0]
         evidence = _evidence_for_recommendation(top)
         selected = self.provider.select_evidence(intent, evidence)
@@ -920,10 +1060,25 @@ class AiOrchestrator:
             "elapsed_ms": (time.perf_counter() - started) * 1000.0,
         }
 
-    def _clarification(self, intent: BuildIntent, grounding: Sequence[Mapping[str, Any]], questions: Sequence[str]) -> dict[str, Any]:
+    def _clarification(
+        self, intent: BuildIntent, grounding: Sequence[Mapping[str, Any]],
+        questions: Sequence[str], *,
+        conversation: Sequence[Mapping[str, Any]] = (),
+    ) -> dict[str, Any]:
+        previously_asked = {
+            str(question)
+            for message in conversation
+            for question in (message.get("response") or {}).get("questions", [])
+        }
+        fresh = [question for question in questions if question not in previously_asked]
+        repeated = [question for question in questions if question in previously_asked]
         return {"schema_version": "stw.ai-response.v1", "provider": self.provider.provider_id,
                 "prompt_version": PROMPT_VERSION, "status": "needs_clarification",
-                "intent": build_intent_payload(intent), "grounding": list(grounding), "questions": list(questions)}
+                "intent": build_intent_payload(intent), "grounding": list(grounding),
+                "questions": fresh,
+                "blocking_reasons": ([
+                    "A required clarification remains unanswered; the same question was not repeated."
+                ] if repeated else [])}
 
 
 def main(argv: Iterable[str] | None = None) -> int:

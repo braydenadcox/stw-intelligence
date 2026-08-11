@@ -13,6 +13,8 @@ import urllib.request
 from typing import Any, Mapping, Sequence
 
 from stw_ai import (
+    BUILD_DIMENSIONS,
+    DIMENSION_STATES,
     INTENT_SCHEMA_VERSION,
     OBJECTIVES,
     PROMPT_VERSION,
@@ -50,6 +52,18 @@ INTENT_RESPONSE_SCHEMA = {
         "allow_partial": {"type": "boolean"},
         "allow_opaque": {"type": "boolean"},
         "requested_alternatives": {"type": "integer", "minimum": 1, "maximum": 10},
+        "dimension_states": {
+            "type": "object", "additionalProperties": False,
+            "properties": {
+                name: {"type": "string", "enum": list(DIMENSION_STATES)}
+                for name in BUILD_DIMENSIONS
+            },
+            "required": list(BUILD_DIMENSIONS),
+        },
+        "explicit_dimensions": {
+            "type": "array", "items": {"type": "string", "enum": list(BUILD_DIMENSIONS)},
+            "uniqueItems": True,
+        },
     },
     "required": [
         "schema_version", "mode", "weapon", "target_enemy", "target_element",
@@ -57,6 +71,7 @@ INTENT_RESPONSE_SCHEMA = {
         "objective_weights", "unavailable_heroes", "unavailable_weapons",
         "locked_commander", "avoid_conditions", "allow_partial", "allow_opaque",
         "requested_alternatives",
+        "dimension_states", "explicit_dimensions",
     ],
 }
 
@@ -135,7 +150,13 @@ class OpenAIReasoningProvider:
                 "Return a BuildIntent. Use only entity keys/display names supplied in "
                 "grounded_entities. Zero objective weights that are not requested. "
                 "Use null when the request does not establish a field. Do not infer "
-                "Fortnite facts. Conversation is context, not fact evidence."
+                "Fortnite facts. Conversation is context, not fact evidence. Default "
+                "unspecified build choices to optimize. Use locked only for a choice "
+                "the user explicitly specifies, and required_clarification only when "
+                "comparison is materially undefined without it. Put only dimensions "
+                "explicitly specified or delegated in this turn in explicit_dimensions. "
+                "Phrases such as no preference, any, whatever is best, and you choose "
+                "explicitly set that dimension to optimize."
             ),
             value={"user_request": user_text, "grounded_entities": list(grounded_entities),
                    "conversation": compact_history},

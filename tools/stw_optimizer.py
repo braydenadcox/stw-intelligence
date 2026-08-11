@@ -7,6 +7,7 @@ import argparse
 import itertools
 import json
 import math
+import re
 import sqlite3
 import time
 from collections import Counter
@@ -76,11 +77,13 @@ class OptimizationConstraints:
     allow_opaque: bool = True
     avoid_mechanics: tuple[str, ...] = ()
     locked_weapon_perks: tuple[tuple[int, str], ...] = ()
+    owned_weapons: tuple[str, ...] = ()
+    unavailable_weapons: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
 class OptimizationRequest:
-    weapon: str
+    weapon: str | None
     target: TargetContext
     mission: MissionContext
     objective_weights: tuple[tuple[str, float], ...]
@@ -92,6 +95,7 @@ class OptimizationRequest:
     max_results: int = 10
     item_level: int | None = None
     constraints: OptimizationConstraints = OptimizationConstraints()
+    diagnostics: bool = False
 
     def weights(self) -> dict[str, float]:
         weights = dict(self.objective_weights)
@@ -143,8 +147,203 @@ def _objective_scores(value: Any) -> dict[str, float]:
 
 
 def _weighted(profile: Mapping[str, Any], weights: Mapping[str, float]) -> float:
-    scores = profile.get("objective_scores", {})
+    scores = profile.get("supported_potential_scores", {})
     return sum(weights.get(key, 0.0) * float(scores.get(key, 0.0)) for key in weights)
+
+
+ATTRIBUTE_OBJECTIVES = {
+    "stuntime": ("crowd_control",),
+    "outgoingbaseimpactdamage": ("crowd_control",),
+    "knockbackmagnitude": ("crowd_control",),
+    "movement": ("crowd_control",),
+    "movementspeed": ("crowd_control",),
+    "health": ("survivability",),
+    "shield": ("survivability",),
+    "armor": ("survivability",),
+    "damageresistance": ("survivability",),
+    "healing": ("healing_sustain",),
+    "healthregen": ("healing_sustain",),
+    "shieldregen": ("healing_sustain",),
+    "abilitycooldown": ("ability_uptime",),
+    "cooldown": ("ability_uptime",),
+    "weaponreloadspeed": ("weapon_uptime",),
+    "weaponammoclipsize": ("weapon_uptime",),
+    "weaponrateoffire": ("weapon_uptime", "sustained_damage"),
+    "outgoingweapondamage": ("burst_damage", "sustained_damage"),
+    # Ability damage is not interchangeable with weapon burst/sustained DPS.
+    # Keep it visible as evidence until an ability evaluator can produce its
+    # own scenario-bound metric; never feed it into the weapon evaluator.
+    "outgoingabilitydamage": (),
+}
+
+
+def _tag_matches(actual: str, required: str) -> bool:
+    left, right = actual.casefold(), required.casefold()
+    return left == right or left.startswith(right + ".")
+
+
+def _has_requirement(tags: Iterable[str], required: str) -> bool:
+    return any(_tag_matches(tag, required) for tag in tags)
+
+
+def _ability_requirement(required: str) -> bool:
+    folded = required.casefold()
+    return "abilitygroup" in folded or "abilityeffect" in folded
+
+
+def _ability_matches(abilities: Iterable[str], required: str) -> bool:
+    folded = re.sub(r"[^a-z0-9]", "", required.casefold())
+    ignored = {"asset", "ability", "abilitygroup", "abilityeffect", "hero", "damage"}
+    segments = [
+        segment for segment in re.split(r"[^a-z0-9]+", required.casefold())
+        if len(segment) >= 5 and segment not in ignored
+    ]
+    normalized = [re.sub(r"[^a-z0-9]", "", item.casefold()) for item in abilities]
+    return any(segment in ability or ability in folded for segment in segments for ability in normalized)
+
+
+def _event_applies(event: str, context: Mapping[str, Any]) -> tuple[bool, str]:
+    folded = event.casefold()
+    excluded = {str(item).casefold().replace("_", " ") for item in context.get("excluded_events", ())}
+    if any(term in folded for term in ("kill", "death", "eliminat")):
+        allowed = not any("elimination" in item or "kill" in item for item in excluded)
+        return allowed, "eliminations permitted" if allowed else "eliminations excluded"
+    if "event.weapons." in folded:
+        return bool(context.get("weapon_present")), "selected weapon"
+    if "abilit" in folded:
+        abilities = context.get("active_abilities", ())
+        if ".hero.activate" in folded:
+            return bool(abilities), "commander has active abilities"
+        applies = _ability_matches(abilities, event)
+        return applies, "matching commander ability" if applies else "no matching commander ability"
+    if _has_requirement(context.get("source_tags", ()), event):
+        return True, "event explicitly established by candidate/scenario"
+    return False, "event is not established by candidate/scenario"
+
+
+def _profile_evidence(profile: Mapping[str, Any]) -> Mapping[str, Any]:
+    evidence = profile.get("evidence")
+    if isinstance(evidence, Mapping): return evidence
+    semantics = profile.get("semantic_facts", {}).get("semantics")
+    return semantics if isinstance(semantics, Mapping) else {}
+
+
+def _supported_potential_scores(evidence: Mapping[str, Any]) -> dict[str, float]:
+    scores: Counter[str] = Counter()
+    for modifier in evidence.get("modifiers", ()):
+        if modifier.get("interpretation_status") != "supported": continue
+        raw = _modifier_value(modifier)
+        if raw is None: continue
+        for objective in _modifier_objectives(modifier):
+            scores[objective] += raw
+    return dict(scores)
+
+
+def _modifier_value(modifier: Mapping[str, Any]) -> float | None:
+    if modifier.get("curve_row_name") or "curve" in str(
+        modifier.get("magnitude_kind") or ""
+    ).casefold():
+        return None
+    literal = modifier.get("literal_value")
+    if literal is None: return None
+    value = float(literal)
+    if modifier.get("modifier_operation") == "EGameplayModOp::Multiplicitive":
+        return abs(value - 1.0)
+    return abs(value)
+
+
+def _modifier_objectives(modifier: Mapping[str, Any]) -> tuple[str, ...]:
+    attribute = str(modifier.get("attribute_name") or "").casefold()
+    if attribute != "outgoingabilitydamage":
+        return ATTRIBUTE_OBJECTIVES.get(attribute, ())
+    # Fortnite uses this shared attribute for multiple damage domains. The
+    # required gameplay tags establish whether this particular modifier is a
+    # weapon modifier. Ability-bound and unscoped instances cannot be folded
+    # into weapon DPS without a separate runtime calculation.
+    required = [
+        *map(str, _json(modifier.get("source_required_tags_json"), [])),
+        *map(str, _json(modifier.get("target_required_tags_json"), [])),
+    ]
+    if any(tag.casefold().startswith("weapon.") for tag in required):
+        return ("burst_damage", "sustained_damage")
+    return ()
+
+
+def _applicability_trace(
+    profile: Mapping[str, Any], context: Mapping[str, Any],
+) -> tuple[dict[str, float], list[dict[str, Any]], list[dict[str, Any]]]:
+    """Return supported numeric potential, audit rows, and unresolved mechanics."""
+    evidence = _profile_evidence(profile)
+    source_tags = set(context.get("source_tags", ()))
+    target_tags = set(context.get("target_tags", ()))
+    abilities = set(context.get("active_abilities", ()))
+    mechanics = list(evidence.get("mechanics", ()))
+    triggers = []
+    unresolved = []
+    for mechanic in mechanics:
+        if mechanic.get("interpretation_status") != "supported":
+            unresolved.append({
+                "source": profile.get("display_name") or profile.get("perk_family"),
+                "mechanic": mechanic.get("mechanic_type"), "status": mechanic.get("interpretation_status"),
+                "reason": "mechanic is not fully interpreted", "numeric_credit": 0.0,
+            })
+            continue
+        if mechanic.get("mechanic_type") == "trigger":
+            triggers.extend(re.findall(r"Event\.[A-Za-z0-9_.]+", str(mechanic.get("value_json") or "")))
+    event_results = [_event_applies(event, context) for event in triggers]
+    event_blocked = any(not applies for applies, _ in event_results)
+    scores: Counter[str] = Counter()
+    traces = []
+    for modifier in evidence.get("modifiers", ()):
+        attribute = str(modifier.get("attribute_name") or "")
+        objectives = _modifier_objectives(modifier)
+        required_source = _json(modifier.get("source_required_tags_json"), [])
+        ignored_source = _json(modifier.get("source_ignored_tags_json"), [])
+        required_target = _json(modifier.get("target_required_tags_json"), [])
+        ignored_target = _json(modifier.get("target_ignored_tags_json"), [])
+        requirements = [
+            *({"kind": "source_tag", "value": value} for value in required_source),
+            *({"kind": "target_tag", "value": value} for value in required_target),
+            *({"kind": "event", "value": value} for value in triggers),
+        ]
+        satisfied_by = [reason for applies, reason in event_results if applies]
+        applicable = not event_blocked
+        for requirement in required_source:
+            if _has_requirement(source_tags, requirement):
+                satisfied_by.append(requirement)
+            elif _ability_requirement(requirement) and _ability_matches(abilities, requirement):
+                satisfied_by.append(f"commander ability matching {requirement}")
+            else:
+                applicable = False
+        for requirement in required_target:
+            if _has_requirement(target_tags, requirement): satisfied_by.append(requirement)
+            else: applicable = False
+        if any(_has_requirement(source_tags, value) for value in ignored_source): applicable = False
+        if any(_has_requirement(target_tags, value) for value in ignored_target): applicable = False
+        status = str(modifier.get("interpretation_status") or "partial")
+        raw = _modifier_value(modifier) if status == "supported" and applicable else None
+        if not objectives: raw = None
+        trace = {
+            "source": profile.get("display_name") or profile.get("alteration_key") or profile.get("perk_family"),
+            "mechanic": attribute or "unclassified modifier",
+            "requirement": requirements,
+            "requirement_satisfied_by": satisfied_by,
+            "applicable": applicable,
+            "raw_value": raw,
+            "objective_mapping": list(objectives),
+            "semantic_status": status,
+            "weighted_score_contribution": 0.0,
+            "credited": False,
+        }
+        traces.append(trace)
+        if raw is not None:
+            for objective in objectives: scores[objective] += raw
+        elif status != "supported" or (applicable and objectives):
+            unresolved.append(trace | {
+                "reason": "unsupported or unresolved magnitude; no numeric credit",
+                "numeric_credit": 0.0,
+            })
+    return dict(scores), traces, unresolved
 
 
 def _source_for_object(connection: sqlite3.Connection, object_id: int) -> dict[str, Any]:
@@ -183,7 +382,10 @@ def _kit_profile(connection: sqlite3.Connection, snapshot_id: int,
     modifiers = [dict(row) for row in connection.execute(f"""
         SELECT modifier.attribute_name, modifier.modifier_operation,
                modifier.interpretation_status, effect.source_object_id,
-               modifier.source_required_tags_json, modifier.target_required_tags_json
+               modifier.literal_value, modifier.magnitude_kind,
+               modifier.curve_row_name, modifier.evaluation_channel,
+               modifier.source_required_tags_json, modifier.source_ignored_tags_json,
+               modifier.target_required_tags_json, modifier.target_ignored_tags_json
         FROM catalog_effect_modifiers modifier
         JOIN catalog_gameplay_effects effect ON effect.id=modifier.gameplay_effect_id
         WHERE effect.snapshot_id=? AND effect.source_object_id IN ({placeholders})
@@ -203,6 +405,7 @@ def _kit_profile(connection: sqlite3.Connection, snapshot_id: int,
     sources = [_source_for_object(connection, object_id) for object_id in sorted(source_ids)]
     value = {"mechanics": mechanics, "modifiers": modifiers, "tags": tags}
     return {"semantic_status": status, "objective_scores": _objective_scores(value),
+            "supported_potential_scores": _supported_potential_scores(value),
             "evidence": value, "sources": sources, "unresolved_grants": unresolved,
             "opaque_count": opaque_count}
 
@@ -238,6 +441,7 @@ def _hero_profiles(connection: sqlite3.Connection, snapshot_id: int) -> tuple[li
         tags = sorted(set(source_tags.get(row["source_object_id"], [])) | {
             f"Hero.Class.{row['hero_class']}"})
         result[role].append({
+            "profile_kind": "hero_perk",
             "hero_key": row["hero_key"], "display_name": row["display_name"],
             "hero_class": row["hero_class"], "perk_tier": row["perk_tier"],
             "role": role, "perk_family": row["perk_family"],
@@ -246,34 +450,52 @@ def _hero_profiles(connection: sqlite3.Connection, snapshot_id: int) -> tuple[li
             "reasons": (["direct perk graph contains unresolved/opaque mechanics"]
                         if profile["semantic_status"] != "supported" else []),
             "objective_scores": profile["objective_scores"], "tags": tags,
+            "supported_potential_scores": profile["supported_potential_scores"],
             "evidence": profile["evidence"],
             "source": _source_for_object(connection, row["source_object_id"]),
         })
     return result["commander"], result["support"]
 
 
-def _resolve_weapon_variants(connection: sqlite3.Connection, snapshot_id: int, query: str) -> list[sqlite3.Row]:
+def _resolve_weapon_variants(
+    connection: sqlite3.Connection, snapshot_id: int, query: str | None,
+    owned: Sequence[str] = (), unavailable: Sequence[str] = (),
+) -> list[sqlite3.Row]:
     rows = connection.execute("""
         SELECT variant.*, identity.display_name, identity.weapon_kind,
                stat.base_level AS weapon_base_level
         FROM catalog_weapon_variants variant
         JOIN catalog_weapon_identities identity ON identity.id=variant.identity_id
         LEFT JOIN catalog_weapon_stats stat ON stat.weapon_variant_id=variant.id
-        WHERE variant.snapshot_id=? AND variant.slot_loadout_id IS NOT NULL AND
-          (lower(variant.variant_key)=lower(?) OR lower(identity.display_name)=lower(?)
-           OR lower(identity.display_name) LIKE lower(?))
+        WHERE variant.snapshot_id=? AND variant.slot_loadout_id IS NOT NULL
         ORDER BY COALESCE(stat.base_level,0) DESC, variant.variant_key
-    """, (snapshot_id, query, query, f"%{query}%")).fetchall()
+    """, (snapshot_id,)).fetchall()
+    if query:
+        rows = [row for row in rows if (
+            row["variant_key"].casefold() == query.casefold()
+            or str(row["display_name"] or "").casefold() == query.casefold()
+            or query.casefold() in str(row["display_name"] or "").casefold()
+        )]
+    def matches(row: sqlite3.Row, choice: str) -> bool:
+        wanted = choice.casefold()
+        return wanted in {
+            row["variant_key"].casefold(), str(row["display_name"] or "").casefold()
+        }
+    if owned:
+        rows = [row for row in rows if any(matches(row, choice) for choice in owned)]
+    if unavailable:
+        rows = [row for row in rows if not any(matches(row, choice) for choice in unavailable)]
     if not rows:
-        raise ValueError(f"weapon preference resolved no catalog variants: {query!r}")
-    exact = [row for row in rows if row["variant_key"].casefold() == query.casefold()]
+        detail = f"weapon preference {query!r}" if query else "open weapon constraints"
+        raise ValueError(f"{detail} resolved no catalog variants")
+    exact = [row for row in rows if query and row["variant_key"].casefold() == query.casefold()]
     if exact: return exact
     tiers = [TIER_ORDER.get(str(row["tier"]).split("::")[-1], 0) for row in rows]
-    if tiers:
+    if query and tiers:
         maximum = max(tiers)
         rows = [row for row in rows
                 if TIER_ORDER.get(str(row["tier"]).split("::")[-1], 0) == maximum]
-    return rows[:12]
+    return rows[:12] if query else rows
 
 
 def _weapon_option_profiles(connection: sqlite3.Connection, slot_loadout_id: int) -> list[list[dict[str, Any]]]:
@@ -291,6 +513,7 @@ def _weapon_option_profiles(connection: sqlite3.Connection, slot_loadout_id: int
             WHERE option.weapon_slot_id=? ORDER BY option.option_ordinal
         """, (slot["id"],)):
             value = {"slot_ordinal": slot["slot_ordinal"], "alteration_key": row["alteration_key"],
+                     "profile_kind": "weapon_perk",
                      "primary_name": row["alteration_primary_asset_name"],
                      "exclusions": _json(row["exclusion_names_json"], []),
                      "semantic_status": row["semantic_status"],
@@ -319,12 +542,13 @@ def _weapon_configurations(connection: sqlite3.Connection, variants: Sequence[sq
                            item_level: int | None) -> tuple[list[dict[str, Any]], int, int]:
     configurations: list[dict[str, Any]] = []
     theoretical = pruned = 0
-    seen_loadouts: set[int] = set()
+    seen_loadouts: set[tuple[int, int]] = set()
     for variant in variants:
         # Variants sharing one slot loadout have identical legal perk configurations;
         # retain only the highest-level representative for search.
-        if variant["slot_loadout_id"] in seen_loadouts: continue
-        seen_loadouts.add(variant["slot_loadout_id"])
+        identity_loadout = (variant["identity_id"], variant["slot_loadout_id"])
+        if identity_loadout in seen_loadouts: continue
+        seen_loadouts.add(identity_loadout)
         slots = _weapon_option_profiles(connection, variant["slot_loadout_id"])
         theoretical += math.prod(len(slot) for slot in slots) if slots else 1
         beam: list[tuple[list[dict[str, Any]], float]] = [([], 0.0)]
@@ -345,7 +569,8 @@ def _weapon_configurations(connection: sqlite3.Connection, variants: Sequence[sq
                     tuple(WeaponPerkSelection(item["slot_ordinal"], item["alteration_key"])
                           for item in selected), item_level),
                 "variant": {"variant_key": variant["variant_key"], "display_name": variant["display_name"],
-                            "weapon_kind": variant["weapon_kind"]},
+                            "weapon_kind": variant["weapon_kind"],
+                            "tags": _json(variant["tags_json"], [])},
                 "profiles": selected, "heuristic": score,
             })
     configurations.sort(key=lambda item: (-item["heuristic"], item["configuration"].variant_key))
@@ -355,24 +580,31 @@ def _weapon_configurations(connection: sqlite3.Connection, variants: Sequence[sq
 def _hero_beam(commanders: Sequence[dict[str, Any]], supports: Sequence[dict[str, Any]],
                weights: Mapping[str, float], support_slots: int, beam_width: int,
                stats: SearchStats,
-               locked_supports: Sequence[dict[str, Any]] = ()) -> list[dict[str, Any]]:
-    ranked_commanders = sorted(commanders, key=lambda item: (-_weighted(item, weights), item["hero_key"]))[:max(24, beam_width // 2)]
-    ranked_supports = sorted(supports, key=lambda item: (-_weighted(item, weights), item["hero_key"]))[:max(48, beam_width)]
+               locked_supports: Sequence[dict[str, Any]] = (),
+               profile_score: Any = None) -> list[dict[str, Any]]:
+    score = profile_score or (lambda profile, _commander: _weighted(profile, weights))
+    ranked_commanders = sorted(
+        commanders, key=lambda item: (-score(item, item), item["hero_key"])
+    )[:max(24, beam_width // 2)]
     locked_keys = {hero["hero_key"] for hero in locked_supports}
     beam = [{"commander": commander, "supports": list(locked_supports),
              "used": {commander["hero_key"], *locked_keys},
-             "heuristic": _weighted(commander, weights) +
-                sum(_weighted(hero, weights) for hero in locked_supports)}
+             "heuristic": score(commander, commander) +
+                sum(score(hero, commander) for hero in locked_supports)}
             for commander in ranked_commanders if commander["hero_key"] not in locked_keys]
     for _ in range(support_slots - len(locked_supports)):
         expanded = []
         for state in beam:
+            ranked_supports = sorted(
+                supports,
+                key=lambda item: (-score(item, state["commander"]), item["hero_key"]),
+            )[:max(48, beam_width)]
             for support in ranked_supports:
                 if support["hero_key"] in state["used"]: continue
                 expanded.append({"commander": state["commander"],
                     "supports": state["supports"] + [support],
                     "used": state["used"] | {support["hero_key"]},
-                    "heuristic": state["heuristic"] + _weighted(support, weights)})
+                    "heuristic": state["heuristic"] + score(support, state["commander"])})
         expanded.sort(key=lambda item: (-item["heuristic"], item["commander"]["hero_key"],
                                         tuple(x["hero_key"] for x in item["supports"])))
         # Preserve commander diversity at every depth. A plain global beam quickly
@@ -506,9 +738,10 @@ def _interaction_profiles(connection: sqlite3.Connection, snapshot_id: int) -> t
         direct_status = row["semantic_status"]
         status = "opaque" if "opaque" in {direct_status, semantics["semantic_status"]} else (
             "partial" if "partial" in {direct_status, semantics["semantic_status"]} else "supported")
-        team.append({"key": row["team_perk_key"], "display_name": row["display_name"],
+        team.append({"profile_kind": "team_perk", "key": row["team_perk_key"], "display_name": row["display_name"],
                      "semantic_status": status,
                      "objective_scores": _objective_scores(value), "report": report,
+                     "supported_potential_scores": semantics["supported_potential_scores"],
                      "semantic_facts": value,
                      "source": _source_for_object(connection, row["source_object_id"])})
     gadgets = []
@@ -522,9 +755,10 @@ def _interaction_profiles(connection: sqlite3.Connection, snapshot_id: int) -> t
         direct_status = row["semantic_status"]
         status = "opaque" if "opaque" in {direct_status, semantics["semantic_status"]} else (
             "partial" if "partial" in {direct_status, semantics["semantic_status"]} else "supported")
-        gadgets.append({"key": row["gadget_key"], "display_name": row["display_name"],
+        gadgets.append({"profile_kind": "gadget", "key": row["gadget_key"], "display_name": row["display_name"],
                         "semantic_status": status,
                         "objective_scores": _objective_scores(value),
+                        "supported_potential_scores": semantics["supported_potential_scores"],
                         "semantic_facts": value,
                         "source": _source_for_object(connection, row["source_object_id"])})
     return team, gadgets
@@ -558,33 +792,171 @@ def _candidate_key(candidate: Mapping[str, Any]) -> tuple[Any, ...]:
             candidate["weapon"]["configuration"])
 
 
-def _profile_components(candidate: Mapping[str, Any], weights: Mapping[str, float]) -> tuple[dict[str, float], list[dict[str, Any]], list[dict[str, Any]]]:
+def _collect_tag_strings(value: Any) -> set[str]:
+    result = set()
+    if isinstance(value, str):
+        if "." in value and " " not in value: result.add(value)
+    elif isinstance(value, Mapping):
+        for item in value.values(): result.update(_collect_tag_strings(item))
+    elif isinstance(value, (list, tuple, set)):
+        for item in value: result.update(_collect_tag_strings(item))
+    return result
+
+
+def _candidate_applicability_context(
+    candidate: Mapping[str, Any], abilities: Sequence[Mapping[str, Any]],
+    request: OptimizationRequest, resolved_context: Mapping[str, Any],
+) -> dict[str, Any]:
+    source_tags = _collect_tag_strings(candidate["weapon"]["variant"].get("tags", ()))
+    source_tags.update(request.combat_scenario.active_source_tags)
+    for perk in candidate["weapon"]["profiles"]:
+        source_tags.update(_collect_tag_strings(perk.get("semantic_facts", {})))
+    target_tags = set(request.combat_scenario.target_tags) | set(
+        resolved_context.get("effective_target_tags", ())
+    )
+    target_tags.update(request.target.status_tags)
+    if request.combat_scenario.target_afflicted:
+        target_tags.add("Gameplay.Status.Afflicted")
+    active_abilities = {
+        str(value)
+        for ability in abilities
+        for value in (ability["identity"]["active_ability_key"],
+                      ability["identity"]["display_name"])
+    }
+    return {
+        "source_tags": source_tags,
+        "target_tags": target_tags,
+        "active_abilities": active_abilities,
+        "excluded_events": request.constraints.avoid_mechanics,
+        "health_fraction": request.combat_scenario.health_fraction,
+        "shield_fraction": request.combat_scenario.shield_fraction,
+        "weapon_present": True,
+        "weapon_kind": candidate["weapon"]["variant"].get("weapon_kind"),
+    }
+
+
+def _context_for_profile(
+    profile: Mapping[str, Any], applicability_context: Mapping[str, Any]
+) -> dict[str, Any]:
+    result = dict(applicability_context)
+    granted_tags = {
+        tag for tag in _collect_tag_strings(_profile_evidence(profile).get("tags", ()))
+        if tag.casefold().startswith("granted.perk")
+    }
+    tier = str(profile.get("perk_tier") or "").casefold()
+    if tier and tier != "unknown":
+        granted_tags = {tag for tag in granted_tags if tag.casefold().endswith("." + tier)}
+    result["source_tags"] = set(applicability_context.get("source_tags", ())) | granted_tags
+    return result
+
+
+def _applicable_profile_weight(
+    profile: Mapping[str, Any], applicability_context: Mapping[str, Any],
+    weights: Mapping[str, float],
+) -> float:
+    if profile.get("profile_kind") == "gadget":
+        return 0.0
+    scores, traces, _ = _applicability_trace(
+        profile, _context_for_profile(profile, applicability_context)
+    )
+    for trace in traces:
+        if not trace["applicable"] or trace["semantic_status"] != "supported": continue
+        if trace["raw_value"] is not None:
+            potential = float(trace["raw_value"])
+        else:
+            tier_match = re.search(r"(\d+)$", str(profile.get("perk_tier") or ""))
+            potential = float(int(tier_match.group(1)) if tier_match else 1)
+        for objective in trace["objective_mapping"]:
+            scores[objective] = max(float(scores.get(objective, 0.0)), potential)
+    return sum(
+        weights.get(objective, 0.0) * value
+        for objective, value in scores.items()
+    )
+
+
+def _profile_components(
+    candidate: Mapping[str, Any], weights: Mapping[str, float],
+    applicability_context: Mapping[str, Any],
+) -> tuple[dict[str, float], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     profiles = [candidate["commander"], *candidate["supports"], *candidate["weapon"]["profiles"]]
     if candidate.get("team_perk"): profiles.append(candidate["team_perk"])
     profiles.extend(candidate["gadgets"])
     supported = Counter()
-    partial, opaque = [], []
+    partial, opaque, traces = [], [], []
     for profile in profiles:
-        for objective in weights:
-            score = float(profile.get("objective_scores", {}).get(objective, 0.0))
-            if score <= 0: continue
-            status = profile.get("semantic_status", "partial")
-            item = {"objective": objective, "owner": profile.get("display_name") or profile.get("alteration_key") or profile.get("perk_family"),
-                    "evidence_units": score, "semantic_status": status}
-            if status == "supported": supported[objective] += score
-            elif status == "opaque": opaque.append(item | {"unquantified": True})
-            else: partial.append(item | {"unquantified": True})
-    return dict(supported), partial, opaque
+        profile_context = _context_for_profile(profile, applicability_context)
+        scores, profile_traces, unresolved = _applicability_trace(
+            profile, profile_context
+        )
+        if profile.get("profile_kind") == "gadget":
+            scores = {}
+            for trace in profile_traces:
+                trace["raw_value"] = None
+                trace["weighted_score_contribution"] = 0.0
+        traces.extend(profile_traces)
+        # Atomic profiles guide candidate generation, but final numeric credit comes
+        # only from the deterministic evaluator after all candidate conditions apply.
+        for item in unresolved:
+            relevant = any(
+                _objective_scores(item).get(objective, 0) for objective in weights
+            ) or any(objective in weights for objective in item.get("objective_mapping", ()))
+            if not relevant: continue
+            status = item.get("semantic_status") or profile.get("semantic_status", "partial")
+            (opaque if status == "opaque" else partial).append(
+                item | {"unquantified": True}
+            )
+    return dict(supported), partial, opaque, traces
 
 
 def _render_candidate(connection: sqlite3.Connection, snapshot_id: int, candidate: dict[str, Any],
                       request: OptimizationRequest, context: dict[str, Any],
                       evaluation_cache: dict[Any, Any], stats: SearchStats) -> dict[str, Any]:
+    abilities = _active_abilities(connection, snapshot_id, candidate["commander"]["hero_key"])
+    applicability_context = _candidate_applicability_context(
+        candidate, abilities, request, context
+    )
+    _, partial, opaque, applicability_trace = _profile_components(
+        candidate, request.weights(), applicability_context
+    )
+    weighted_objectives = set(request.weights())
+
+    def numerically_applicable(profile: Mapping[str, Any]) -> bool:
+        _, traces, _ = _applicability_trace(
+            profile, _context_for_profile(profile, applicability_context)
+        )
+        return any(
+            trace["applicable"] and trace["semantic_status"] == "supported"
+            and weighted_objectives.intersection(trace["objective_mapping"])
+            for trace in traces
+        )
+
+    numeric_commander = (
+        candidate["commander"]["hero_key"]
+        if numerically_applicable(candidate["commander"]) else None
+    )
+    numeric_supports = tuple(
+        hero["hero_key"] for hero in candidate["supports"]
+        if numerically_applicable(hero)
+    )
+    numeric_team = (
+        candidate["team_perk"]["key"]
+        if candidate.get("team_perk") and numerically_applicable(candidate["team_perk"])
+        else None
+    )
+    ability_source_tags = {
+        requirement["value"]
+        for trace in applicability_trace if trace["applicable"]
+        for requirement in trace.get("requirement", ())
+        if requirement.get("kind") == "source_tag"
+        and _ability_requirement(requirement["value"])
+        and any("commander ability" in item for item in trace["requirement_satisfied_by"])
+    }
     loadout = LoadoutContext(
-        commander=candidate["commander"]["hero_key"],
-        support_heroes=tuple(hero["hero_key"] for hero in candidate["supports"]),
-        team_perk=candidate["team_perk"]["key"] if candidate.get("team_perk") else None,
-        gadgets=tuple(gadget["key"] for gadget in candidate["gadgets"]),
+        commander=numeric_commander,
+        support_heroes=numeric_supports,
+        source_tags=tuple(sorted(ability_source_tags)),
+        team_perk=numeric_team,
+        gadgets=(),
     )
     combat = replace(request.combat_scenario,
         target_element=request.target.element,
@@ -597,10 +969,74 @@ def _render_candidate(connection: sqlite3.Connection, snapshot_id: int, candidat
         stats.evaluator_cache_misses += 1
         evaluation = evaluate_combat(connection, candidate["weapon"]["configuration"], loadout, combat, snapshot_id)
         evaluation_cache[cache_key] = evaluation
-    semantic, partial, opaque = _profile_components(candidate, request.weights())
-    raw_components = dict(semantic)
-    if evaluation.metrics.get("burst_dps") is not None: raw_components["burst_damage"] = evaluation.metrics["burst_dps"]
-    if evaluation.metrics.get("sustained_dps") is not None: raw_components["sustained_damage"] = evaluation.metrics["sustained_dps"]
+    raw_components: dict[str, float] = {}
+    for contribution in evaluation.contributions:
+        if not contribution.get("active") or contribution.get("magnitude") is None:
+            continue
+        objectives = ATTRIBUTE_OBJECTIVES.get(
+            str(contribution.get("attribute") or "").casefold(), ()
+        )
+        raw = abs(float(contribution["magnitude"]) - 1.0) if (
+            contribution.get("operation") == "EGameplayModOp::Multiplicitive"
+        ) else abs(float(contribution["magnitude"]))
+        mapped_objectives = [
+            objective for objective in objectives
+            if objective in weighted_objectives
+        ]
+        credited_objectives = [objective for objective in mapped_objectives
+                               if objective not in {"burst_damage", "sustained_damage",
+                                                    "weapon_uptime"}]
+        for objective in credited_objectives:
+            raw_components[objective] = raw_components.get(objective, 0.0) + raw
+        if mapped_objectives:
+            applicability_trace.append({
+                "source": contribution.get("origin_name"),
+                "mechanic": contribution.get("attribute"),
+                "requirement": contribution.get("conditions", {}),
+                "requirement_satisfied_by": ["deterministic combat evaluator"],
+                "applicable": True, "raw_value": raw,
+                "objective_mapping": mapped_objectives,
+                "semantic_status": "supported",
+                "credited": bool(credited_objectives),
+                "weighted_score_contribution": 0.0,
+            })
+    if evaluation.metrics.get("burst_dps") is not None:
+        raw_components["burst_damage"] = evaluation.metrics["burst_dps"]
+        applicability_trace.append({
+            "source": evaluation.weapon.get("display_name") or evaluation.weapon.get("variant_key"),
+            "mechanic": "evaluated burst DPS", "requirement": [],
+            "requirement_satisfied_by": ["deterministic combat evaluator"],
+            "applicable": True, "raw_value": evaluation.metrics["burst_dps"],
+            "objective_mapping": ["burst_damage"], "semantic_status": "supported",
+            "weighted_score_contribution": 0.0, "metric": True, "credited": True,
+        })
+    if evaluation.metrics.get("sustained_dps") is not None:
+        raw_components["sustained_damage"] = evaluation.metrics["sustained_dps"]
+        applicability_trace.append({
+            "source": evaluation.weapon.get("display_name") or evaluation.weapon.get("variant_key"),
+            "mechanic": "evaluated sustained DPS", "requirement": [],
+            "requirement_satisfied_by": ["deterministic combat evaluator"],
+            "applicable": True, "raw_value": evaluation.metrics["sustained_dps"],
+            "objective_mapping": ["sustained_damage"], "semantic_status": "supported",
+            "weighted_score_contribution": 0.0, "metric": True, "credited": True,
+        })
+    target_text = " ".join((
+        request.target.enemy,
+        *map(str, context.get("effective_target_tags", ())),
+    )).casefold()
+    if ("mist_monster_boss" in weighted_objectives
+            and any(term in target_text for term in ("mist", "smasher", "boss", "miniboss"))
+            and evaluation.metrics.get("burst_dps") is not None):
+        raw_components["mist_monster_boss"] = evaluation.metrics["burst_dps"]
+        applicability_trace.append({
+            "source": evaluation.weapon.get("display_name") or evaluation.weapon.get("variant_key"),
+            "mechanic": "evaluated burst DPS against resolved boss/mist target",
+            "requirement": [{"kind": "target_archetype", "value": request.target.enemy}],
+            "requirement_satisfied_by": ["resolved enemy classification"],
+            "applicable": True, "raw_value": evaluation.metrics["burst_dps"],
+            "objective_mapping": ["mist_monster_boss"], "semantic_status": "supported",
+            "weighted_score_contribution": 0.0, "metric": True, "credited": True,
+        })
     if evaluation.metrics.get("burst_dps") and evaluation.metrics.get("sustained_dps") is not None:
         raw_components["weapon_uptime"] = evaluation.metrics["sustained_dps"] / evaluation.metrics["burst_dps"]
     relevant_issue_codes = {
@@ -612,7 +1048,6 @@ def _render_candidate(connection: sqlite3.Connection, snapshot_id: int, candidat
         if issue.code in relevant_issue_codes:
             partial.append({"owner": issue.origin, "issue": issue.message,
                             "severity": issue.severity, "unquantified": True})
-    abilities = _active_abilities(connection, snapshot_id, candidate["commander"]["hero_key"])
     if request.weights().get("ability_uptime"):
         for ability in abilities:
             status = ability["semantics"]["status"]
@@ -638,6 +1073,13 @@ def _render_candidate(connection: sqlite3.Connection, snapshot_id: int, candidat
                               "semantic_status": ability["semantics"]["status"]} for ability in abilities],
         "scenario": {"target": asdict(request.target), "mission": asdict(request.mission), "combat": asdict(combat)},
         "objective_weights": request.weights(), "raw_supported_components": raw_components,
+        "applicability_trace": applicability_trace,
+        "numeric_applicability": {
+            "commander": numeric_commander,
+            "support_heroes": list(numeric_supports),
+            "team_perk": numeric_team,
+            "gadgets": [],
+        },
         "partial_components": partial, "opaque_components": opaque,
         "comparison_class": "definitive" if not partial and not opaque else "uncertainty_aware",
         "confidence": "high" if not partial and not opaque else "low" if opaque else "medium",
@@ -648,27 +1090,38 @@ def _render_candidate(connection: sqlite3.Connection, snapshot_id: int, candidat
 
 
 def _normalize_and_rank(candidates: list[dict[str, Any]], weights: Mapping[str, float]) -> None:
-    bounds = {}
-    for objective in weights:
-        values = [item["raw_supported_components"].get(objective) for item in candidates]
-        values = [float(value) for value in values if value is not None]
-        bounds[objective] = (min(values), max(values)) if values else None
     for item in candidates:
         components = {}
         total = 0.0
         for objective, weight in weights.items():
             value = item["raw_supported_components"].get(objective)
-            bound = bounds[objective]
-            if value is None or bound is None:
+            if value is None:
                 components[objective] = {"status": "unavailable", "weight": weight}
                 continue
-            low, high = bound
-            normalized = 100.0 if math.isclose(low, high) else 100.0 * (float(value) - low) / (high - low)
-            weighted = normalized * weight
+            comparison_score = math.asinh(float(value))
+            weighted = comparison_score * weight
             components[objective] = {"status": "supported", "raw_value": value,
-                                     "normalized_score": normalized, "weight": weight,
-                                     "weighted_score": weighted}
+                                     "normalized_score": comparison_score,
+                                     "comparison_score": comparison_score,
+                                     "score_scale": "asinh_supported_units",
+                                     "weight": weight, "weighted_score": weighted}
             total += weighted
+        for trace in item.get("applicability_trace", ()):
+            raw = trace.get("raw_value")
+            contributions = {}
+            if raw is not None and trace.get("credited"):
+                for objective in trace.get("objective_mapping", ()):
+                    component = components.get(objective)
+                    objective_total = item["raw_supported_components"].get(objective)
+                    if (component and component.get("status") == "supported"
+                            and objective_total and (
+                                objective not in {"burst_damage", "sustained_damage"}
+                                or trace.get("metric")
+                            )):
+                        contributions[objective] = (
+                            component["weighted_score"] * float(raw) / float(objective_total)
+                        )
+            trace["weighted_score_contribution"] = contributions
         item["supported_score_components"] = components
         item["supported_weighted_score"] = total
 
@@ -694,6 +1147,130 @@ def _mark_pareto(candidates: list[dict[str, Any]], weights: Mapping[str, float])
     return dominated_count
 
 
+def _diagnostic_slots(
+    connection: sqlite3.Connection, snapshot_id: int,
+    selected: dict[str, Any], raw: dict[str, Any], request: OptimizationRequest,
+    resolved_context: dict[str, Any], cache: dict[Any, Any], stats: SearchStats,
+    commanders: Sequence[dict[str, Any]], supports: Sequence[dict[str, Any]],
+    teams: Sequence[dict[str, Any]], gadgets: Sequence[dict[str, Any]],
+    weapons: Sequence[dict[str, Any]],
+) -> dict[str, Any]:
+    weights = request.weights()
+
+    def legal(candidate: Mapping[str, Any]) -> bool:
+        hero_keys = [candidate["commander"]["hero_key"], *(
+            hero["hero_key"] for hero in candidate["supports"]
+        )]
+        if len(hero_keys) != len(set(hero_keys)): return False
+        team = candidate.get("team_perk")
+        if team:
+            eligible, _, _ = _team_perk_eligible(
+                team["report"], candidate["supports"], request.hero_progression
+            )
+            if not eligible: return False
+        gadget_keys = [item["key"] for item in candidate["gadgets"]]
+        return len(gadget_keys) == len(set(gadget_keys))
+
+    def evaluate(candidate: dict[str, Any]) -> dict[str, Any] | None:
+        if not legal(candidate): return None
+        try:
+            rendered = _render_candidate(
+                connection, snapshot_id, candidate, request, resolved_context,
+                cache, stats,
+            )
+            _normalize_and_rank([rendered], weights)
+            return rendered
+        except ValueError:
+            return None
+
+    alternatives: dict[str, list[tuple[str, dict[str, Any]]]] = {}
+    selected_hero_keys = {
+        raw["commander"]["hero_key"], *(hero["hero_key"] for hero in raw["supports"])
+    }
+    alternatives["commander"] = [
+        (item["display_name"], raw | {"commander": item})
+        for item in commanders if item["hero_key"] not in selected_hero_keys
+    ]
+    for index, chosen in enumerate(raw["supports"]):
+        others = selected_hero_keys - {chosen["hero_key"]}
+        alternatives[f"support_{index + 1}"] = [
+            (item["display_name"], raw | {
+                "supports": [*raw["supports"][:index], item, *raw["supports"][index + 1:]]
+            }) for item in supports
+            if item["hero_key"] not in others and item["hero_key"] != chosen["hero_key"]
+        ]
+    alternatives["team_perk"] = [
+        (item["display_name"], raw | {"team_perk": item})
+        for item in teams if not raw.get("team_perk") or item["key"] != raw["team_perk"]["key"]
+    ]
+    for index, chosen in enumerate(raw["gadgets"]):
+        others = {item["key"] for item in raw["gadgets"]} - {chosen["key"]}
+        alternatives[f"gadget_{index + 1}"] = [
+            (item["display_name"], raw | {
+                "gadgets": [*raw["gadgets"][:index], item, *raw["gadgets"][index + 1:]]
+            }) for item in gadgets
+            if item["key"] not in others and item["key"] != chosen["key"]
+    ]
+    alternatives["weapon"] = [
+        ("{} [{}]".format(
+            item["variant"]["display_name"],
+            ", ".join(perk.alteration_key for perk in item["configuration"].perks)
+            or "no selected perks",
+        ), raw | {"weapon": item})
+        for item in weapons
+        if item["configuration"] != raw["weapon"]["configuration"]
+    ]
+    selected_names = {
+        "commander": selected["commander"]["display_name"],
+        **{f"support_{index + 1}": item["display_name"]
+           for index, item in enumerate(selected["support_heroes"])},
+        "team_perk": (selected["team_perk"] or {}).get("display_name"),
+        **{f"gadget_{index + 1}": item["display_name"]
+           for index, item in enumerate(selected["gadgets"])},
+        "weapon": selected["weapon"].get("display_name") or selected["weapon"].get("variant_key"),
+    }
+    result = []
+    for slot, choices in alternatives.items():
+        scored = []
+        for name, candidate in choices:
+            rendered = evaluate(candidate)
+            if rendered is None: continue
+            scored.append({
+                "selection": name,
+                "comparison_class": rendered["comparison_class"],
+                "supported_weighted_score": rendered["supported_weighted_score"],
+                "score_delta": rendered["supported_weighted_score"]
+                               - selected["supported_weighted_score"],
+            })
+        scored.sort(key=lambda item: (-item["supported_weighted_score"], item["selection"]))
+        owner = selected_names.get(slot)
+        traces = [
+            trace for trace in selected.get("applicability_trace", ())
+            if owner and (
+                str(trace.get("source") or "").casefold() == owner.casefold()
+                or str(trace.get("source") or "").casefold().startswith(
+                    owner.casefold() + " ("
+                )
+            )
+        ]
+        best_alternative = max(
+            (item["supported_weighted_score"] for item in scored), default=0.0
+        )
+        result.append({
+            "slot": slot, "selected": owner,
+            "selection_trace": traces,
+            "supported_weighted_contribution": max(
+                0.0, selected["supported_weighted_score"] - best_alternative
+            ),
+            "marginal_method": "controlled one-slot replacement against best legal alternative",
+            "top_rejected_alternatives": scored[:3],
+        })
+    return {
+        "score_scale": "asinh_supported_units; independent of current search batch",
+        "slots": result,
+    }
+
+
 def optimize_loadouts(connection: sqlite3.Connection, request: OptimizationRequest,
                       snapshot_id: int | None = None, progress: Any = None) -> dict[str, Any]:
     started = time.perf_counter()
@@ -706,7 +1283,10 @@ def optimize_loadouts(connection: sqlite3.Connection, request: OptimizationReque
     stats = SearchStats()
     constraints = request.constraints
     emit("generating_legal_builds", "Generating legal weapons, heroes, team perks, and gadgets")
-    variants = _resolve_weapon_variants(connection, snapshot_id, request.weapon)
+    variants = _resolve_weapon_variants(
+        connection, snapshot_id, request.weapon,
+        constraints.owned_weapons, constraints.unavailable_weapons,
+    )
     weapon_configs, theoretical_weapons, weapon_pruned = _weapon_configurations(
         connection, variants, weights, request.beam_width, request.item_level)
     if constraints.avoid_mechanics:
@@ -752,10 +1332,35 @@ def optimize_loadouts(connection: sqlite3.Connection, request: OptimizationReque
     stats.theoretical_hero_loadouts = len(commanders) * (
         math.comb(max(0, len(supports) - 1), request.support_slots)
         if len(supports) - 1 >= request.support_slots else 0)
-    hero_states = _hero_beam(
-        commanders, supports, weights, request.support_slots,
-        request.beam_width, stats, locked_supports,
-    )
+    context = scenario_report(connection, snapshot_id, request.target, request.mission)
+    ability_cache = {
+        commander["hero_key"]: _active_abilities(
+            connection, snapshot_id, commander["hero_key"]
+        ) for commander in commanders
+    }
+    hero_states = []
+    per_weapon = max(1, min(8, request.beam_width // max(1, len(weapon_configs))))
+    for weapon in weapon_configs:
+        def score_profile(profile: Mapping[str, Any], commander: Mapping[str, Any]) -> float:
+            candidate_context = _candidate_applicability_context(
+                {"weapon": weapon}, ability_cache[commander["hero_key"]],
+                request, context,
+            )
+            return _applicable_profile_weight(
+                profile, candidate_context, weights
+            )
+        weapon_heroes = _hero_beam(
+            commanders, supports, weights, request.support_slots,
+            max(8, per_weapon * 4), stats, locked_supports, score_profile,
+        )
+        hero_states.extend(
+            state | {"weapon": weapon,
+                     "heuristic": state["heuristic"] + weapon["heuristic"]}
+            for state in weapon_heroes[:per_weapon]
+        )
+    hero_states.sort(key=lambda item: -item["heuristic"])
+    stats.pruned_by_beam += max(0, len(hero_states) - request.beam_width)
+    hero_states = hero_states[:request.beam_width]
     if not hero_states:
         raise ValueError("constraints leave no legal commander/support combinations")
     team_profiles, gadget_profiles = _interaction_profiles(connection, snapshot_id)
@@ -780,6 +1385,9 @@ def optimize_loadouts(connection: sqlite3.Connection, request: OptimizationReque
             expanded.append(state | {"team_perk": None})
             continue
         eligible = []
+        state_context = _candidate_applicability_context(
+            state, ability_cache[state["commander"]["hero_key"]], request, context
+        )
         for team in team_profiles:
             stats.team_perk_checks += 1
             legal, eligibility_status, reasons = _team_perk_eligible(
@@ -789,9 +1397,12 @@ def optimize_loadouts(connection: sqlite3.Connection, request: OptimizationReque
                 eligible.append(team | {"eligibility_status": eligibility_status,
                                         "eligibility_reasons": reasons})
         choice_count = max(1, min(4, request.beam_width // max(1, len(hero_states))))
-        for team in sorted(eligible, key=lambda item: (-_weighted(item, weights), item["key"]))[:choice_count]:
+        for team in sorted(eligible, key=lambda item: (
+            -_applicable_profile_weight(item, state_context, weights), item["key"]
+        ))[:choice_count]:
+            team_score = _applicable_profile_weight(team, state_context, weights)
             expanded.append(state | {"team_perk": team,
-                "heuristic": state["heuristic"] + _weighted(team, weights)})
+                "heuristic": state["heuristic"] + team_score})
     expanded.sort(key=lambda item: -item["heuristic"])
     stats.pruned_by_beam += max(0, len(expanded) - request.beam_width)
     expanded = expanded[:request.beam_width]
@@ -809,21 +1420,28 @@ def optimize_loadouts(connection: sqlite3.Connection, request: OptimizationReque
     stats.gadget_combinations = len(gadget_sets)
     with_gadgets = []
     gadget_choice_count = max(1, min(8, request.beam_width // max(1, len(expanded))))
-    ranked_gadgets = sorted(gadget_sets, key=lambda group: -sum(_weighted(item, weights) for item in group))[:gadget_choice_count]
     for state in expanded:
+        state_context = _candidate_applicability_context(
+            state, ability_cache[state["commander"]["hero_key"]], request, context
+        )
+        ranked_gadgets = sorted(
+            gadget_sets,
+            key=lambda group: -sum(
+                _applicable_profile_weight(item, state_context, weights)
+                for item in group
+            ),
+        )[:gadget_choice_count]
         for gadgets in ranked_gadgets:
+            gadget_score = sum(
+                _applicable_profile_weight(item, state_context, weights)
+                for item in gadgets
+            )
             with_gadgets.append(state | {"gadgets": list(gadgets),
-                "heuristic": state["heuristic"] + sum(_weighted(item, weights) for item in gadgets)})
+                "heuristic": state["heuristic"] + gadget_score})
     with_gadgets.sort(key=lambda item: -item["heuristic"])
     stats.pruned_by_beam += max(0, len(with_gadgets) - request.beam_width)
     with_gadgets = with_gadgets[:request.beam_width]
-    combined = []
-    weapon_choice_count = max(1, request.beam_width // max(1, len(with_gadgets)))
-    for state in with_gadgets:
-        for weapon in weapon_configs[:weapon_choice_count]:
-            combined.append(state | {"weapon": weapon,
-                "heuristic": state["heuristic"] + weapon["heuristic"]})
-    combined.sort(key=lambda item: -item["heuristic"])
+    combined = with_gadgets
     stats.heuristic_candidates = len(combined)
     stats.pruned_by_beam += max(0, len(combined) - request.beam_width)
     deduplicated = []
@@ -834,11 +1452,13 @@ def optimize_loadouts(connection: sqlite3.Connection, request: OptimizationReque
             stats.deduplicated_candidates += 1; continue
         seen.add(key); deduplicated.append(candidate)
         if len(deduplicated) >= request.beam_width: break
-    context = scenario_report(connection, snapshot_id, request.target, request.mission)
     cache: dict[Any, Any] = {}
     emit("evaluating_candidates", f"Evaluating {len(deduplicated)} candidate builds")
     rendered = [_render_candidate(connection, snapshot_id, candidate, request, context, cache, stats)
                 for candidate in deduplicated]
+    raw_by_rendered = {id(rendered_item): raw_item for rendered_item, raw_item in zip(
+        rendered, deduplicated
+    )}
     if not constraints.allow_opaque:
         rendered = [item for item in rendered if not item["opaque_components"]]
     if not constraints.allow_partial:
@@ -852,6 +1472,14 @@ def optimize_loadouts(connection: sqlite3.Connection, request: OptimizationReque
                         key=lambda item: (item["pareto_dominated"], -item["supported_weighted_score"]))
     uncertain = sorted((item for item in rendered if item["comparison_class"] != "definitive"),
                        key=lambda item: (item["pareto_dominated"], -item["supported_weighted_score"]))
+    if request.diagnostics:
+        diagnostic_targets = (definitive or uncertain)[:1]
+        for selected in diagnostic_targets:
+            selected["selection_diagnostics"] = _diagnostic_slots(
+                connection, snapshot_id, selected, raw_by_rendered[id(selected)],
+                request, context, cache, stats, commanders, supports,
+                team_profiles, gadget_profiles, weapon_configs,
+            )
     semantic_statuses = Counter(
         "opaque" if item["opaque_components"] else "partial"
         if item["partial_components"] else "supported" for item in rendered
@@ -863,7 +1491,7 @@ def optimize_loadouts(connection: sqlite3.Connection, request: OptimizationReque
         "search_space": {**asdict(stats),
             "upper_bound_complete_combinations": stats.theoretical_hero_loadouts * max(1, theoretical_weapons)
                 * max(1, len(team_profiles)) * max(1, stats.gadget_combinations)},
-        "strategy": ["early exact weapon/slot legality filtering", "semantic objective compatibility profiles",
+        "strategy": ["early weapon/slot legality filtering", "semantic objective compatibility profiles",
                      "team-perk requirement pruning", "bounded hero/component beam search",
                      "candidate deduplication", "memoized combat evaluation", "status-partitioned ranking"],
         "definitive_rankings": definitive[:request.max_results],
@@ -899,6 +1527,8 @@ def main(argv: Iterable[str] | None = None) -> int:
     parser.add_argument("--beam-width", type=int, default=128)
     parser.add_argument("--max-results", type=int, default=10)
     parser.add_argument("--item-level", type=int)
+    parser.add_argument("--diagnostics", action="store_true",
+                        help="trace selected slots and one-slot rejected alternatives")
     args = parser.parse_args(argv)
     request = OptimizationRequest(
         weapon=args.weapon,
@@ -909,6 +1539,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         objective_weights=_weights(args.objective),
         combat_scenario=CombatScenario(range_band=args.range),
         beam_width=args.beam_width, max_results=args.max_results, item_level=args.item_level,
+        diagnostics=args.diagnostics,
     )
     connection = connect(args.db)
     try: print(json.dumps(optimize_loadouts(connection, request), indent=2, sort_keys=True))

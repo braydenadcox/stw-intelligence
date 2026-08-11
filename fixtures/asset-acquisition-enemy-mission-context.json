@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "scopes": [
+    {
+      "kind": "folder",
+      "path": "/SaveTheWorld/Characters/Enemies"
+    },
+    {
+      "kind": "folder",
+      "path": "/SaveTheWorld/Items/GameplayModifiers"
+    },
+    {
+      "kind": "folder",
+      "path": "/SaveTheWorld/Abilities/GameplayModifiers/Mutations"
+    },
+    {
+      "kind": "folder",
+      "path": "/SaveTheWorld/AIDirector/Encounters/DifficultyOptions"
+    },
+    {
+      "kind": "folder",
+      "path": "/SaveTheWorld/World/MissionGens"
+    },
+    {
+      "kind": "folder",
+      "path": "/SaveTheWorld/Balance/DataTables"
+    },
+    {
+      "kind": "package",
+      "path": "/Game/Characters/Enemies/DataTables/CharacterAttributesAI"
+    },
+    {
+      "kind": "folder",
+      "path": "/SaveTheWorld/Abilities/NPC"
+    }
+  ]
+}

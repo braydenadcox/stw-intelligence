@@ -8,6 +8,8 @@ data/live/
 data/backups/
 data/*.lock
 data/*.stop
+data/*.out
+data/*.err
 data/*asset-queue*.json
 .tools/
 **/bin/

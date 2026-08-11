@@ -1207,6 +1207,144 @@ MIGRATIONS = [
     CREATE INDEX catalog_status_identities_snapshot_idx
         ON catalog_status_identities(snapshot_id, status_family, display_name);
     CREATE INDEX catalog_status_tags_tag_idx ON catalog_status_tags(tag_id);
+    """,
+    """
+    CREATE TABLE catalog_enemy_archetypes (
+        id INTEGER PRIMARY KEY,
+        snapshot_id INTEGER NOT NULL REFERENCES asset_snapshots(id) ON DELETE CASCADE,
+        source_object_id INTEGER NOT NULL UNIQUE REFERENCES asset_objects(id),
+        enemy_key TEXT NOT NULL,
+        display_name TEXT NOT NULL,
+        package_path TEXT NOT NULL,
+        identity_evidence TEXT NOT NULL
+            CHECK (identity_evidence IN ('pawn_stat_handle', 'enemy_pawn_inheritance')),
+        pawn_stat_table_path TEXT,
+        pawn_stat_row_name TEXT,
+        pawn_stat_data_row_id INTEGER REFERENCES catalog_data_rows(id),
+        parent_enemy_id INTEGER REFERENCES catalog_enemy_archetypes(id),
+        character_family_tag TEXT,
+        classification_tags_json TEXT NOT NULL DEFAULT '[]',
+        attack_tags_json TEXT NOT NULL DEFAULT '[]',
+        movement_facts_json TEXT NOT NULL DEFAULT '{}',
+        semantic_status TEXT NOT NULL
+            CHECK (semantic_status IN ('supported', 'partial', 'opaque')),
+        UNIQUE (snapshot_id, enemy_key)
+    );
+    CREATE TABLE catalog_enemy_ability_sets (
+        id INTEGER PRIMARY KEY,
+        enemy_id INTEGER NOT NULL REFERENCES catalog_enemy_archetypes(id) ON DELETE CASCADE,
+        grant_ordinal INTEGER NOT NULL,
+        target_path TEXT NOT NULL,
+        ability_kit_id INTEGER REFERENCES catalog_ability_kits(id),
+        source_reference_id INTEGER REFERENCES asset_references(id),
+        resolution_status TEXT NOT NULL
+            CHECK (resolution_status IN ('resolved', 'unresolved', 'ambiguous')),
+        UNIQUE (enemy_id, grant_ordinal, target_path)
+    );
+    CREATE TABLE catalog_enemy_damage_zones (
+        id INTEGER PRIMARY KEY,
+        enemy_id INTEGER NOT NULL REFERENCES catalog_enemy_archetypes(id) ON DELETE CASCADE,
+        property_path TEXT NOT NULL,
+        bones_json TEXT NOT NULL DEFAULT '[]',
+        facts_json TEXT NOT NULL DEFAULT '{}',
+        interpretation_status TEXT NOT NULL
+            CHECK (interpretation_status IN ('supported', 'partial', 'opaque')),
+        UNIQUE (enemy_id, property_path)
+    );
+    CREATE TABLE catalog_mission_objectives (
+        id INTEGER PRIMARY KEY,
+        snapshot_id INTEGER NOT NULL REFERENCES asset_snapshots(id) ON DELETE CASCADE,
+        source_object_id INTEGER NOT NULL REFERENCES asset_objects(id),
+        objective_key TEXT NOT NULL,
+        display_name TEXT NOT NULL,
+        description TEXT,
+        primary_mission_path TEXT NOT NULL,
+        identity_evidence TEXT NOT NULL
+            CHECK (identity_evidence='primary_mission_reference'),
+        semantic_status TEXT NOT NULL
+            CHECK (semantic_status IN ('supported', 'partial', 'opaque')),
+        UNIQUE (snapshot_id, objective_key)
+    );
+    CREATE TABLE catalog_mission_variants (
+        id INTEGER PRIMARY KEY,
+        objective_id INTEGER NOT NULL REFERENCES catalog_mission_objectives(id) ON DELETE CASCADE,
+        source_object_id INTEGER NOT NULL UNIQUE REFERENCES asset_objects(id),
+        variant_key TEXT NOT NULL,
+        package_path TEXT NOT NULL,
+        generation_facts_json TEXT NOT NULL DEFAULT '{}',
+        interpretation_status TEXT NOT NULL
+            CHECK (interpretation_status IN ('supported', 'partial', 'opaque')),
+        UNIQUE (objective_id, variant_key)
+    );
+    CREATE TABLE catalog_context_modifiers (
+        id INTEGER PRIMARY KEY,
+        snapshot_id INTEGER NOT NULL REFERENCES asset_snapshots(id) ON DELETE CASCADE,
+        source_object_id INTEGER NOT NULL UNIQUE REFERENCES asset_objects(id),
+        modifier_key TEXT NOT NULL,
+        display_name TEXT NOT NULL,
+        description TEXT,
+        target_scope TEXT NOT NULL
+            CHECK (target_scope IN ('enemy', 'player', 'environment', 'mixed', 'mission', 'unknown')),
+        delivery_facts_json TEXT NOT NULL DEFAULT '{}',
+        semantic_status TEXT NOT NULL
+            CHECK (semantic_status IN ('supported', 'partial', 'opaque')),
+        UNIQUE (snapshot_id, modifier_key)
+    );
+    CREATE TABLE catalog_context_modifier_grants (
+        id INTEGER PRIMARY KEY,
+        context_modifier_id INTEGER NOT NULL
+            REFERENCES catalog_context_modifiers(id) ON DELETE CASCADE,
+        grant_ordinal INTEGER NOT NULL,
+        grant_kind TEXT NOT NULL
+            CHECK (grant_kind IN ('ability_kit', 'gameplay_effect', 'mutator')),
+        target_path TEXT NOT NULL,
+        ability_kit_id INTEGER REFERENCES catalog_ability_kits(id),
+        gameplay_effect_id INTEGER REFERENCES catalog_gameplay_effects(id),
+        source_reference_id INTEGER REFERENCES asset_references(id),
+        delivery_conditions_json TEXT NOT NULL DEFAULT '{}',
+        resolution_status TEXT NOT NULL
+            CHECK (resolution_status IN ('resolved', 'unresolved', 'ambiguous')),
+        UNIQUE (context_modifier_id, grant_ordinal, grant_kind, target_path)
+    );
+    CREATE TABLE catalog_encounter_option_sets (
+        id INTEGER PRIMARY KEY,
+        snapshot_id INTEGER NOT NULL REFERENCES asset_snapshots(id) ON DELETE CASCADE,
+        source_object_id INTEGER NOT NULL UNIQUE REFERENCES asset_objects(id),
+        option_set_key TEXT NOT NULL,
+        package_path TEXT NOT NULL,
+        option_facts_json TEXT NOT NULL DEFAULT '{}',
+        semantic_status TEXT NOT NULL
+            CHECK (semantic_status IN ('supported', 'partial', 'opaque')),
+        UNIQUE (snapshot_id, option_set_key)
+    );
+    CREATE TABLE catalog_encounter_modifiers (
+        id INTEGER PRIMARY KEY,
+        snapshot_id INTEGER NOT NULL REFERENCES asset_snapshots(id) ON DELETE CASCADE,
+        source_object_id INTEGER NOT NULL UNIQUE REFERENCES asset_objects(id),
+        encounter_modifier_key TEXT NOT NULL,
+        package_path TEXT NOT NULL,
+        modifier_tags_json TEXT NOT NULL DEFAULT '[]',
+        cost_table_path TEXT,
+        cost_row_name TEXT,
+        cost_data_row_id INTEGER REFERENCES catalog_data_rows(id),
+        semantic_status TEXT NOT NULL
+            CHECK (semantic_status IN ('supported', 'partial', 'opaque')),
+        UNIQUE (snapshot_id, encounter_modifier_key)
+    );
+    CREATE INDEX catalog_enemy_archetypes_snapshot_idx
+        ON catalog_enemy_archetypes(snapshot_id, character_family_tag, display_name);
+    CREATE INDEX catalog_enemy_ability_sets_enemy_idx ON catalog_enemy_ability_sets(enemy_id);
+    CREATE INDEX catalog_mission_objectives_snapshot_idx
+        ON catalog_mission_objectives(snapshot_id, display_name);
+    CREATE INDEX catalog_mission_variants_objective_idx ON catalog_mission_variants(objective_id);
+    CREATE INDEX catalog_context_modifiers_snapshot_idx
+        ON catalog_context_modifiers(snapshot_id, target_scope, display_name);
+    CREATE INDEX catalog_context_modifier_grants_modifier_idx
+        ON catalog_context_modifier_grants(context_modifier_id);
+    CREATE INDEX catalog_encounter_option_sets_snapshot_idx
+        ON catalog_encounter_option_sets(snapshot_id);
+    CREATE INDEX catalog_encounter_modifiers_snapshot_idx
+        ON catalog_encounter_modifiers(snapshot_id);
     """
 ]
 

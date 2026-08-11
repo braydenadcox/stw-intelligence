@@ -18,7 +18,7 @@ from stw_pipeline import connect
 
 
 PERK_KIT_RE = re.compile(r"^Kit_Perk_H_(?P<family>.+)_(?P<tier>T\d+)$")
-NORMALIZER_VERSION = "interaction-v7"
+NORMALIZER_VERSION = "interaction-v8"
 ROSTER_PLAN_VERSION = "phase2-roster-v1"
 
 RUNTIME_DATA_ROW_STRUCTS = {
@@ -447,6 +447,15 @@ def _clear_normalized_snapshot(
         "DELETE FROM catalog_status_tags WHERE status_id IN "
         "(SELECT id FROM catalog_status_identities WHERE snapshot_id=?)",
         "UPDATE catalog_status_identities SET parent_status_id=NULL WHERE snapshot_id=?",
+        "DELETE FROM catalog_enemy_ability_sets WHERE enemy_id IN "
+        "(SELECT id FROM catalog_enemy_archetypes WHERE snapshot_id=?)",
+        "DELETE FROM catalog_enemy_damage_zones WHERE enemy_id IN "
+        "(SELECT id FROM catalog_enemy_archetypes WHERE snapshot_id=?)",
+        "UPDATE catalog_enemy_archetypes SET parent_enemy_id=NULL WHERE snapshot_id=?",
+        "DELETE FROM catalog_mission_variants WHERE objective_id IN "
+        "(SELECT id FROM catalog_mission_objectives WHERE snapshot_id=?)",
+        "DELETE FROM catalog_context_modifier_grants WHERE context_modifier_id IN "
+        "(SELECT id FROM catalog_context_modifiers WHERE snapshot_id=?)",
     )
     for statement in leaf_deletes:
         connection.execute(statement, (snapshot_id,))
@@ -467,6 +476,11 @@ def _clear_normalized_snapshot(
         "catalog_signature_effects",
         "catalog_element_identities",
         "catalog_status_identities",
+        "catalog_enemy_archetypes",
+        "catalog_mission_objectives",
+        "catalog_context_modifiers",
+        "catalog_encounter_option_sets",
+        "catalog_encounter_modifiers",
         "catalog_heroes",
         "catalog_perks",
         "catalog_ability_kits",
@@ -590,6 +604,8 @@ def _normalize_snapshot(
         ("signature effects", _normalize_signature_effects, (connection, snapshot_id)),
         ("gameplay tags", _normalize_gameplay_tags, (connection, snapshot_id, payloads)),
         ("elements and statuses", _normalize_elements_and_statuses, (connection, snapshot_id)),
+        ("enemy and mission context", _normalize_enemy_mission_context,
+         (connection, snapshot_id, payloads)),
         ("modifier curves", _link_modifier_curves, (connection, snapshot_id)),
         ("magnitude curves", _link_magnitude_curves, (connection, snapshot_id)),
     )
@@ -3656,6 +3672,510 @@ def _normalize_elements_and_statuses(
         )
 
 
+def _reference_for_context_path(
+    connection: sqlite3.Connection,
+    source_object_id: int,
+    property_path: str,
+    target_package_path: str,
+) -> sqlite3.Row | None:
+    row = connection.execute(
+        """
+        SELECT * FROM asset_references
+        WHERE source_object_id=? AND property_path=? AND target_package_path=?
+        ORDER BY id LIMIT 1
+        """,
+        (source_object_id, property_path, target_package_path),
+    ).fetchone()
+    if row is not None:
+        return row
+    return connection.execute(
+        """
+        SELECT * FROM asset_references
+        WHERE source_object_id=? AND property_path LIKE ? AND target_package_path=?
+        ORDER BY id LIMIT 1
+        """,
+        (source_object_id, property_path + "%", target_package_path),
+    ).fetchone()
+
+
+def _enemy_context_tags(
+    connection: sqlite3.Connection, source_object_id: int
+) -> list[tuple[str, str]]:
+    return [
+        (row["tag_name"], row["semantic_role"])
+        for row in connection.execute(
+            """
+            SELECT tag.tag_name, occurrence.semantic_role
+            FROM catalog_gameplay_tag_occurrences occurrence
+            JOIN catalog_gameplay_tags tag ON tag.id=occurrence.tag_id
+            WHERE occurrence.source_object_id=?
+            ORDER BY tag.tag_name, occurrence.property_path
+            """,
+            (source_object_id,),
+        )
+    ]
+
+
+def _normalize_enemy_archetypes(
+    connection: sqlite3.Connection,
+    snapshot_id: int,
+    payloads: dict[int, dict[str, Any]],
+) -> None:
+    enemy_prefix = "/SaveTheWorld/Characters/Enemies/"
+    object_rows = {
+        row["id"]: row
+        for row in connection.execute(
+            """SELECT id, package_path, object_name, object_type
+               FROM asset_objects WHERE snapshot_id=? AND package_path LIKE ?""",
+            (snapshot_id, enemy_prefix + "%"),
+        )
+    }
+    candidates = {
+        object_id
+        for object_id, row in object_rows.items()
+        if str(row["object_name"]).startswith("Default__")
+        and isinstance((payloads.get(object_id) or {}).get("Properties"), dict)
+        and (
+            "PawnStatHandle" in payloads[object_id]["Properties"]
+            or "DefaultGameplayAbilitySets" in payloads[object_id]["Properties"]
+        )
+    }
+    parent_objects: dict[int, int] = {}
+    changed = True
+    while changed:
+        changed = False
+        for edge in connection.execute(
+            """
+            SELECT source_object_id, target_object_id
+            FROM catalog_inheritance_edges
+            WHERE snapshot_id=? AND target_object_id IS NOT NULL
+            """,
+            (snapshot_id,),
+        ):
+            source = edge["source_object_id"]
+            target = edge["target_object_id"]
+            if source in object_rows and target in candidates:
+                parent_objects[source] = target
+                if source not in candidates and str(object_rows[source]["object_name"]).startswith("Default__"):
+                    candidates.add(source)
+                    changed = True
+    inserted: dict[int, int] = {}
+    inherited_facts: dict[int, dict[str, Any]] = {}
+
+    def facts_for(object_id: int, visiting: set[int] | None = None) -> dict[str, Any]:
+        if object_id in inherited_facts:
+            return inherited_facts[object_id]
+        visiting = visiting or set()
+        if object_id in visiting:
+            return {}
+        visiting.add(object_id)
+        parent = parent_objects.get(object_id)
+        facts = dict(facts_for(parent, visiting)) if parent in candidates else {}
+        properties = (payloads.get(object_id) or {}).get("Properties") or {}
+        stat = properties.get("PawnStatHandle")
+        if isinstance(stat, dict):
+            table_path = _object_path(stat.get("DataTable"))
+            row_name = stat.get("RowName")
+            if table_path:
+                facts["pawn_stat_table_path"] = canonical_package_path(table_path)
+            if isinstance(row_name, str) and row_name not in {"", "None"}:
+                facts["pawn_stat_row_name"] = row_name
+        tags = _enemy_context_tags(connection, object_id)
+        # CharacterType tags on enemy pawn defaults are identity evidence even
+        # when FModel serializes the container under a generic GameplayTags
+        # property that the shared tag role classifier labels ``observed``.
+        granted_character_tags = sorted(
+            tag for tag, _role in tags if tag.startswith("NPC.CharacterType.")
+        )
+        if granted_character_tags:
+            facts["classification_tags"] = granted_character_tags
+            family_candidates = {
+                ".".join(tag.split(".")[:3])
+                for tag in granted_character_tags
+                if tag not in {"NPC.CharacterType.MiniBoss"}
+                and not tag.startswith("NPC.CharacterType.Boss.")
+            }
+            if len(family_candidates) == 1:
+                facts["character_family_tag"] = next(iter(family_candidates))
+        inherited_facts[object_id] = facts
+        visiting.remove(object_id)
+        return facts
+
+    for object_id in sorted(candidates):
+        row = object_rows[object_id]
+        export = payloads[object_id]
+        properties = export.get("Properties") or {}
+        facts = facts_for(object_id)
+        stat_row = facts.get("pawn_stat_row_name")
+        display_name = stat_row or str(row["object_name"]).removeprefix("Default__").removesuffix("_C")
+        direct_stat = isinstance(properties.get("PawnStatHandle"), dict) and bool(
+            (properties.get("PawnStatHandle") or {}).get("RowName")
+        )
+        all_tags = sorted({tag for tag, _ in _enemy_context_tags(connection, object_id)})
+        attack_tags = sorted(
+            tag for tag in all_tags
+            if ".Ability.Attack." in tag or ".Attack." in tag
+        )
+        movement_facts = {
+            key: _compact_value(value)
+            for key, value in properties.items()
+            if key.startswith("MovementStyles")
+            or key in {
+                "bCanFly", "bUseCrowdSimulation", "bCanCapsuleBeUsedForTargeting",
+                "DefaultLandMovementMode", "DefaultWaterMovementMode", "NavAgentProps",
+            }
+        }
+        stat_table = facts.get("pawn_stat_table_path")
+        data_row_id = _data_row_id(connection, snapshot_id, stat_table, stat_row)
+        status = "supported" if data_row_id is not None and attack_tags else "partial"
+        enemy_id = connection.execute(
+            """
+            INSERT INTO catalog_enemy_archetypes(
+                snapshot_id, source_object_id, enemy_key, display_name, package_path,
+                identity_evidence, pawn_stat_table_path, pawn_stat_row_name,
+                pawn_stat_data_row_id, character_family_tag,
+                classification_tags_json, attack_tags_json, movement_facts_json,
+                semantic_status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                snapshot_id, object_id, str(row["object_name"]).casefold(), display_name,
+                row["package_path"],
+                "pawn_stat_handle" if direct_stat else "enemy_pawn_inheritance",
+                stat_table, stat_row, data_row_id, facts.get("character_family_tag"),
+                json.dumps(facts.get("classification_tags", []), separators=(",", ":")),
+                json.dumps(attack_tags, separators=(",", ":")),
+                json.dumps(movement_facts, sort_keys=True, separators=(",", ":")), status,
+            ),
+        ).lastrowid
+        inserted[object_id] = enemy_id
+        grant_ordinal = 0
+        # Walk the complete export so property paths line up exactly with the
+        # reference graph's provenance paths (which begin at $.Properties).
+        for property_path, target_path in _walk_references(export):
+            if "defaultgameplayabilitysets" not in property_path.casefold():
+                continue
+            package = canonical_package_path(target_path)
+            if not package:
+                continue
+            reference = _reference_for_context_path(
+                connection, object_id, property_path, package
+            )
+            kit_id = _kit_id_for_path(connection, snapshot_id, package)
+            connection.execute(
+                """
+                INSERT INTO catalog_enemy_ability_sets(
+                    enemy_id, grant_ordinal, target_path, ability_kit_id,
+                    source_reference_id, resolution_status
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    enemy_id, grant_ordinal, target_path, kit_id,
+                    reference["id"] if reference else None,
+                    "resolved" if kit_id is not None else (
+                        reference["resolution_status"] if reference else "unresolved"
+                    ),
+                ),
+            )
+            grant_ordinal += 1
+        for key, value in properties.items():
+            if not key.startswith("DamageZones") or not isinstance(value, dict):
+                continue
+            bones = value.get("Bones") if isinstance(value.get("Bones"), list) else []
+            other = {name: child for name, child in value.items() if name != "Bones"}
+            connection.execute(
+                """
+                INSERT INTO catalog_enemy_damage_zones(
+                    enemy_id, property_path, bones_json, facts_json, interpretation_status
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    enemy_id, f"$.Properties.{key}",
+                    json.dumps(bones, separators=(",", ":")),
+                    json.dumps(_compact_value(other), sort_keys=True, separators=(",", ":")),
+                    "supported" if other else "partial",
+                ),
+            )
+    for object_id, enemy_id in inserted.items():
+        parent = parent_objects.get(object_id)
+        if parent in inserted:
+            connection.execute(
+                "UPDATE catalog_enemy_archetypes SET parent_enemy_id=? WHERE id=?",
+                (inserted[parent], enemy_id),
+            )
+
+
+def _normalize_mission_objectives(
+    connection: sqlite3.Connection,
+    snapshot_id: int,
+    payloads: dict[int, dict[str, Any]],
+) -> None:
+    grouped: dict[str, list[tuple[int, sqlite3.Row, dict[str, Any], str]]] = {}
+    for object_id, export in payloads.items():
+        properties = export.get("Properties")
+        if not isinstance(properties, dict) or "PrimaryMissionInfo" not in properties:
+            continue
+        row = connection.execute(
+            "SELECT package_path, object_name FROM asset_objects WHERE id=?",
+            (object_id,),
+        ).fetchone()
+        if not row or not row["package_path"].startswith("/SaveTheWorld/World/MissionGens/"):
+            continue
+        primary_path = _object_path(properties.get("PrimaryMissionInfo"))
+        primary_package = canonical_package_path(primary_path)
+        if not primary_package:
+            continue
+        grouped.setdefault(primary_package, []).append(
+            (object_id, row, properties, primary_path or primary_package)
+        )
+    for primary_package, variants in sorted(grouped.items()):
+        representative = next(
+            (item for item in variants if _localized_text(item[2].get("MissionName"))),
+            variants[0],
+        )
+        object_id, _, properties, primary_path = representative
+        display = _localized_text(properties.get("MissionName")) or primary_package.rsplit("/", 1)[-1]
+        reference = next(
+            (row for row in connection.execute(
+                "SELECT * FROM asset_references WHERE source_object_id=? AND target_package_path=?",
+                (object_id, primary_package),
+            )),
+            None,
+        )
+        objective_id = connection.execute(
+            """
+            INSERT INTO catalog_mission_objectives(
+                snapshot_id, source_object_id, objective_key, display_name,
+                description, primary_mission_path, identity_evidence, semantic_status
+            ) VALUES (?, ?, ?, ?, ?, ?, 'primary_mission_reference', ?)
+            """,
+            (
+                snapshot_id, object_id, primary_package.casefold(), display,
+                _localized_text(properties.get("MissionDescription")), primary_path,
+                "supported" if reference and reference["resolution_status"] == "resolved" else "partial",
+            ),
+        ).lastrowid
+        for variant_object_id, row, variant_properties, _ in variants:
+            generation_facts = {
+                key: _compact_value(value)
+                for key, value in variant_properties.items()
+                if key.startswith("MissionGenerationChance")
+                or key in {
+                    "Enabled", "MissionGenerationList", "SecondaryMissionList",
+                    "TertiaryMissionList", "SurvivorMissionList",
+                    "OverridePlayerSpawnPadPlacementData",
+                }
+            }
+            connection.execute(
+                """
+                INSERT INTO catalog_mission_variants(
+                    objective_id, source_object_id, variant_key, package_path,
+                    generation_facts_json, interpretation_status
+                ) VALUES (?, ?, ?, ?, ?, 'partial')
+                """,
+                (
+                    objective_id, variant_object_id, str(row["object_name"]).casefold(),
+                    row["package_path"],
+                    json.dumps(generation_facts, sort_keys=True, separators=(",", ":")),
+                ),
+            )
+
+
+def _modifier_delivery_entries(properties: dict[str, Any]) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    for collection in ("PersistentAbilitySets", "PersistentGameplayEffects"):
+        for ordinal, entry in enumerate(properties.get(collection) or []):
+            if isinstance(entry, dict):
+                result.append({
+                    "collection": collection,
+                    "ordinal": ordinal,
+                    "requirements": _compact_value(entry.get("DeliveryRequirements") or {}),
+                })
+    return result
+
+
+def _context_modifier_scope(properties: dict[str, Any]) -> str:
+    scopes: set[str] = set()
+    for entry in _modifier_delivery_entries(properties):
+        requirements = entry["requirements"]
+        if not isinstance(requirements, dict):
+            continue
+        team = str(requirements.get("ApplicableTeam") or "")
+        if "Monster" in team or requirements.get("bApplyToAIPawns"):
+            scopes.add("enemy")
+        if "HumanCampaign" in team or requirements.get("bApplyToPlayerPawns"):
+            scopes.add("player")
+        if requirements.get("bApplyToGlobalEnvironmentAbilityActor") or requirements.get("bApplyToBuildingActors"):
+            scopes.add("environment")
+    if properties.get("Mutators") and not scopes:
+        return "mission"
+    if len(scopes) > 1:
+        return "mixed"
+    return next(iter(scopes), "unknown")
+
+
+def _normalize_context_modifiers(
+    connection: sqlite3.Connection,
+    snapshot_id: int,
+    payloads: dict[int, dict[str, Any]],
+) -> None:
+    for object_id, export in payloads.items():
+        if export.get("Type") != "FortGameplayModifierItemDefinition":
+            continue
+        properties = export.get("Properties") or {}
+        row = connection.execute(
+            "SELECT package_path, object_name FROM asset_objects WHERE id=?",
+            (object_id,),
+        ).fetchone()
+        deliveries = _modifier_delivery_entries(properties)
+        grants: list[tuple[str, str, str, dict[str, Any]]] = []
+        for collection in ("PersistentAbilitySets", "PersistentGameplayEffects"):
+            grant_kind = "ability_kit" if collection == "PersistentAbilitySets" else "gameplay_effect"
+            value_key = "AbilitySets" if collection == "PersistentAbilitySets" else "GameplayEffects"
+            for entry_ordinal, entry in enumerate(properties.get(collection) or []):
+                if not isinstance(entry, dict):
+                    continue
+                conditions = entry.get("DeliveryRequirements") or {}
+                for value_ordinal, value in enumerate(entry.get(value_key) or []):
+                    target_value = value
+                    if grant_kind == "gameplay_effect" and isinstance(value, dict):
+                        target_value = value.get("GameplayEffect")
+                    target_path = _object_path(target_value)
+                    if target_path:
+                        property_path = f"$.Properties.{collection}[{entry_ordinal}].{value_key}[{value_ordinal}]"
+                        grants.append((grant_kind, property_path, target_path, conditions))
+        for ordinal, value in enumerate(properties.get("Mutators") or []):
+            target_path = _object_path(value)
+            if target_path:
+                grants.append(("mutator", f"$.Properties.Mutators[{ordinal}]", target_path, {}))
+        resolved_count = 0
+        opaque_count = 0
+        prepared = []
+        for grant_kind, property_path, target_path, conditions in grants:
+            package = canonical_package_path(target_path)
+            if not package:
+                continue
+            reference = _reference_for_context_path(connection, object_id, property_path, package)
+            kit_id = _kit_id_for_path(connection, snapshot_id, package) if grant_kind == "ability_kit" else None
+            effect_row = connection.execute(
+                "SELECT id FROM catalog_gameplay_effects WHERE snapshot_id=? AND package_path=? ORDER BY id LIMIT 1",
+                (snapshot_id, package),
+            ).fetchone() if grant_kind == "gameplay_effect" else None
+            effect_id = effect_row["id"] if effect_row else None
+            resolved = kit_id is not None or effect_id is not None or (
+                reference is not None and reference["resolution_status"] == "resolved"
+            )
+            resolved_count += int(resolved)
+            opaque_count += int(grant_kind == "mutator")
+            prepared.append((grant_kind, property_path, target_path, conditions, reference, kit_id, effect_id, resolved))
+        if prepared and resolved_count == len(prepared) and opaque_count == 0:
+            status = "supported"
+        elif prepared and resolved_count:
+            status = "partial"
+        else:
+            status = "opaque"
+        modifier_id = connection.execute(
+            """
+            INSERT INTO catalog_context_modifiers(
+                snapshot_id, source_object_id, modifier_key, display_name,
+                description, target_scope, delivery_facts_json, semantic_status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                snapshot_id, object_id, str(row["object_name"]).casefold(),
+                _localized_text(properties.get("ItemName")) or row["object_name"],
+                _localized_text(properties.get("ItemDescription")),
+                _context_modifier_scope(properties),
+                json.dumps(deliveries, sort_keys=True, separators=(",", ":")), status,
+            ),
+        ).lastrowid
+        for grant_ordinal, prepared_grant in enumerate(prepared):
+            grant_kind, _, target_path, conditions, reference, kit_id, effect_id, resolved = prepared_grant
+            connection.execute(
+                """
+                INSERT INTO catalog_context_modifier_grants(
+                    context_modifier_id, grant_ordinal, grant_kind, target_path,
+                    ability_kit_id, gameplay_effect_id, source_reference_id,
+                    delivery_conditions_json, resolution_status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    modifier_id, grant_ordinal, grant_kind, target_path, kit_id, effect_id,
+                    reference["id"] if reference else None,
+                    json.dumps(_compact_value(conditions), sort_keys=True, separators=(",", ":")),
+                    "resolved" if resolved else (
+                        reference["resolution_status"] if reference else "unresolved"
+                    ),
+                ),
+            )
+
+
+def _normalize_encounter_options(
+    connection: sqlite3.Connection,
+    snapshot_id: int,
+    payloads: dict[int, dict[str, Any]],
+) -> None:
+    modifier_prefix = "/SaveTheWorld/AIDirector/Encounters/DifficultyOptions/Modifiers/"
+    for object_id, export in payloads.items():
+        row = connection.execute(
+            "SELECT package_path, object_name FROM asset_objects WHERE id=?",
+            (object_id,),
+        ).fetchone()
+        properties = export.get("Properties")
+        if not row or not isinstance(properties, dict):
+            continue
+        if export.get("Type") == "FortDifficultyOptionSetEncounter":
+            connection.execute(
+                """
+                INSERT INTO catalog_encounter_option_sets(
+                    snapshot_id, source_object_id, option_set_key, package_path,
+                    option_facts_json, semantic_status
+                ) VALUES (?, ?, ?, ?, ?, 'partial')
+                """,
+                (
+                    snapshot_id, object_id, str(row["object_name"]).casefold(),
+                    row["package_path"],
+                    json.dumps(_compact_value(properties), sort_keys=True, separators=(",", ":")),
+                ),
+            )
+        if (
+            row["package_path"].startswith(modifier_prefix)
+            and str(row["object_name"]).startswith("Default__")
+            and isinstance(properties.get("ModifierTags"), list)
+        ):
+            cost = properties.get("CostAndAvailability") or {}
+            table_path = canonical_package_path(_object_path(cost.get("DataTable")))
+            row_name = cost.get("RowName")
+            data_row_id = _data_row_id(connection, snapshot_id, table_path, row_name)
+            connection.execute(
+                """
+                INSERT INTO catalog_encounter_modifiers(
+                    snapshot_id, source_object_id, encounter_modifier_key,
+                    package_path, modifier_tags_json, cost_table_path,
+                    cost_row_name, cost_data_row_id, semantic_status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    snapshot_id, object_id, str(row["object_name"]).casefold(),
+                    row["package_path"],
+                    json.dumps(properties["ModifierTags"], separators=(",", ":")),
+                    table_path, row_name, data_row_id,
+                    "supported" if data_row_id is not None else "partial",
+                ),
+            )
+
+
+def _normalize_enemy_mission_context(
+    connection: sqlite3.Connection,
+    snapshot_id: int,
+    payloads: dict[int, dict[str, Any]],
+) -> None:
+    _normalize_enemy_archetypes(connection, snapshot_id, payloads)
+    _normalize_mission_objectives(connection, snapshot_id, payloads)
+    _normalize_context_modifiers(connection, snapshot_id, payloads)
+    _normalize_encounter_options(connection, snapshot_id, payloads)
+
+
 def latest_asset_snapshot_id(connection: sqlite3.Connection) -> int | None:
     row = connection.execute(
         "SELECT id FROM asset_snapshots WHERE status='ready' ORDER BY id DESC LIMIT 1"
@@ -5961,9 +6481,20 @@ def _snapshot_summary(
             "catalog_signature_effects",
             "catalog_element_identities",
             "catalog_status_identities",
+            "catalog_enemy_archetypes",
+            "catalog_mission_objectives",
+            "catalog_context_modifiers",
+            "catalog_encounter_option_sets",
+            "catalog_encounter_modifiers",
             "catalog_weapon_slot_loadouts",
         )
     }
+    counts["catalog_mission_variants"] = connection.execute(
+        """SELECT COUNT(*) FROM catalog_mission_variants variant
+           JOIN catalog_mission_objectives objective ON objective.id=variant.objective_id
+           WHERE objective.snapshot_id=?""",
+        (snapshot_id,),
+    ).fetchone()[0]
     unresolved = unresolved_reference_report(connection, snapshot_id)
     normalization = connection.execute(
         """

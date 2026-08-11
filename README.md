@@ -240,6 +240,19 @@ python tools/stw_elements.py --db data/phase2-real-validation.sqlite3 element Wa
 python tools/stw_elements.py --db data/phase2-real-validation.sqlite3 status Afflicted
 ```
 
+Enemy archetypes, mission objectives, encounter options, and gameplay modifiers are
+available as auditable optimizer scenario inputs:
+
+```powershell
+python tools/stw_context.py --db data/phase2-real-validation.sqlite3 coverage
+python tools/stw_context.py --db data/phase2-real-validation.sqlite3 enemy default__huskpawn_c
+python tools/stw_context.py --db data/phase2-real-validation.sqlite3 mission /savetheworld/missions/primary/launchtheballoon/ridethestorm
+python tools/stw_context.py --db data/phase2-real-validation.sqlite3 modifier "Husk Heartiness (Major)"
+```
+
+See [enemy and mission context semantics](docs/enemy-mission-context-semantics.md) for
+the structural evidence rules and the native runtime boundaries.
+
 The catalog preserves the real Water/Ice and Nature/Lightning naming layers, proves
 conditional enemy `DamageResistance` and freeze-duration curve values, and leaves the
 native final-damage conversion explicitly unresolved. See
